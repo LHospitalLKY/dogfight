@@ -46,7 +46,7 @@ R73 = MissileSpec(
     gimbal_fov=math.radians(60.0), seeker_range=10000.0,
     lock_time=0.8, min_range=300.0, max_range=30000.0,
     thrust=14000.0, burn_time=5.0, burnout_mass=65.0,
-    cd0=0.9, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
+    cd0=0.9, cd0_wave=2.6, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -56,7 +56,7 @@ AIM9X = MissileSpec(
     gimbal_fov=math.radians(90.0), seeker_range=12000.0,
     lock_time=0.5, min_range=300.0, max_range=16000.0,
     thrust=12000.0, burn_time=4.0, burnout_mass=50.0,
-    cd0=0.9, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
+    cd0=0.9, cd0_wave=2.6, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -74,7 +74,7 @@ R77_1 = MissileSpec(
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.5, min_range=1500.0, max_range=80000.0,
     thrust=30000.0, burn_time=8.0, burnout_mass=100.0,
-    cd0=0.55, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
+    cd0=0.55, cd0_wave=2.6, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
     life=50.0, cooldown=3.0, pn_gain=4.0, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=20000.0,
 )
@@ -85,7 +85,7 @@ AIM120C = MissileSpec(
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.2, min_range=1500.0, max_range=75000.0,
     thrust=22000.0, burn_time=7.0, burnout_mass=80.0,
-    cd0=0.55, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
+    cd0=0.55, cd0_wave=2.6, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
     life=45.0, cooldown=3.0, pn_gain=4.2, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=18000.0,
 )
@@ -101,12 +101,21 @@ AIM120C = MissileSpec(
 SU57_SPEC = AircraftSpec(
     name="SU-57", mass=24500 + 4 * R73.mass + 2 * R77_1.mass,
     wing_area=78.8, cl_max=1.6, rcs=0.5,
-    n_struct=9.0, thrust_max=284000.0, cd0=0.040, aspect_ratio=3.0, oswald=0.80,
+    # 展弦比按真实机翼几何（翼展 14.1 m / 面积 78.8 m²）取 2.52，不再沿用 3.0；
+    # 升力线斜率同步抬到 3.85，否则失速迎角处凑不出 CLmax。
+    n_struct=9.0, thrust_max=284000.0, cd0=0.040, aspect_ratio=2.52, oswald=0.80,
+    cl_alpha=3.85,
     # AL-41F1：单台军用推力 93 kN、最大加力 142 kN，双发合计 186 / 284 kN。
     # 巡航速度取 M0.95（不开加力超巡则可达 M1.3），燃油按半箱 5500 kg 计。
     thrust_mil=186000.0, cruise_mach=0.95, fuel_capacity=5500.0,
+    # 推力衰减按公开升限/速度锚点标定：18 km 起推力悬崖，
+    # 使 Ps 在 20 km 附近穿过 0，25 km 仍能维持 M1.1 量级。
+    lapse_exp=0.65, ram_r0=0.15, ram_r1=0.20,
+    derate_z=18000.0, derate_H=6000.0, eta_install=0.95,
     hp_max=110.0, gun_range=1000.0, gun_dps=30.0, ammo_max=150.0,
     rounds_per_sec=25.0, length=20.1,
+    # 30 mm 机炮（GSh-30-1 量级）：初速 900 m/s，弹重 390 g。
+    muzzle_speed=900.0, bullet_mass=0.390, bullet_diameter=0.030, gun_spread=0.003,
     # AL-41F1 的 3D 矢量喷口：低速大迎角下补充舵面权限，
     # 可维持 55° 过失速迎角，对应眼镜蛇这类机动。
     # 喷流吹过机翼还带来约 0.30 的等效 CL 增量（按油门/加力开度缩放），
@@ -126,13 +135,22 @@ SU57_SPEC = AircraftSpec(
 # 挂载：翼尖导轨 2 × AIM-9X，翼下 2 × AIM-120C 中距弹 + 2 × AIM-9X，共 6 枚。
 # F-16V 没有隐身修形，前向 RCS 取 1.2 m²。
 F16V_SPEC = AircraftSpec(
-    name="F-16V", mass=11500 + 4 * AIM9X.mass + 2 * AIM120C.mass,
+    # 标定重量 11,429 kg = 半油 + 6 枚弹的作战重量。
+    name="F-16V", mass=10787.4 + 4 * AIM9X.mass + 2 * AIM120C.mass,
     wing_area=27.87, cl_max=1.5, rcs=1.2,
-    n_struct=9.0, thrust_max=129000.0, cd0=0.050, aspect_ratio=3.56, oswald=0.85,
-    # F110-GE-129：军用推力 76.3 kN、最大加力 129 kN；巡航 M0.8，半箱油 2400 kg。
-    thrust_mil=76300.0, cruise_mach=0.80, fuel_capacity=2400.0,
+    # cd0 由 0.050 下调到 0.039：旧值在 9 km/M0.9 把推力全吃掉，
+    # 既飞不到公开的 M1.6，也和“推力比 0.45–0.55”的锚点矛盾。
+    n_struct=9.0, thrust_max=129000.0, cd0=0.039, aspect_ratio=3.56, oswald=0.85,
+    # F110-GE-129：军用推力 76.3 kN、最大加力 129 kN；巡航 M0.8，半箱油 1,580 kg。
+    thrust_mil=76300.0, cruise_mach=0.80, fuel_capacity=1580.0,
+    # 推力衰减标定：13 km 起降额、尺度 9 km，
+    # 使 9 km Vmax ≈ M1.56、12 km ≈ M1.73、18 km ≈ M1.12、升限约 16.5 km。
+    lapse_exp=0.90, ram_r0=0.12, ram_r1=0.20,
+    derate_z=13000.0, derate_H=9000.0, eta_install=0.95,
     hp_max=100.0, gun_range=1000.0, gun_dps=40.0, ammo_max=511.0,
     rounds_per_sec=110.0, length=15.06,
+    # M61A1 20 mm：初速 1,030 m/s，弹重 102 g。
+    muzzle_speed=1030.0, bullet_mass=0.102, bullet_diameter=0.020, gun_spread=0.003,
     missile=AIM9X, missile_count=4,
     radar_missile=AIM120C, radar_missile_count=2,
     # F-16V Block 70 的 AN/ALE-47 投放器共 90 发双光谱弹，

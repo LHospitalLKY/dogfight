@@ -1101,20 +1101,25 @@ class TacticalAgent:
         )
 
     def _split_s(self, obs: Observation) -> Action:
-        """破S：向锁定方向压大坡度并推杆俯冲，用高度换回速度。"""
+        """半滚倒转：先滚成倒扣，再拉杆经垂直向下改出到反向航向。
+
+        旧实现只是“压坡度推杆俯冲”，航迹角永远越不过 −40°，本质上是一次
+        俯冲逃逸。现在倒扣后仍给正过载：倒飞时升力朝下，n>0 才能让航迹角
+        真正转过 −90° 并完成 180° 转向。
+        """
         sign = self._def_sign
         if self._phase == 0:
-            # 先压坡度进入俯冲姿态
-            if self._phase_t >= 0.7:
+            # 滚转到位（含符号），期间不拉杆以免把坡度带成爬升。
+            if abs(obs.own_bank) >= math.radians(150.0) or self._phase_t >= 1.2:
                 self._phase, self._phase_t = 1, 0.0
-            return Action(bank=sign, n=1.3, throttle=1.0, fire=False)
-        # 保持坡度俯冲：过载压到维持航迹角以下，让航迹角真正转负并加速。
-        return Action(
-            bank=sign,
-            n=min(1.0, self._level_cap(obs, 0.9)),
-            throttle=1.0,
-            fire=False,
-        )
+            return Action(bank=sign, n=1.0, throttle=1.0, fire=False)
+        n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
+        if self._phase == 1:
+            if obs.own_gamma <= math.radians(-55.0) or self._phase_t >= 3.0:
+                self._phase, self._phase_t = 2, 0.0
+            return Action(bank=sign, n=n, throttle=1.0, fire=False)
+        # 改出：过了垂直向下就把航迹拉回水平，坡度回到翼平。
+        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6, throttle=0.6)
 
     def _barrel(self, obs: Observation) -> Action:
         """防御性滚筒：滚转角在小幅范围内摆动，形成螺旋规避航迹。
@@ -1136,37 +1141,45 @@ class TacticalAgent:
         )
 
     def _immelmann(self, obs: Observation) -> Action:
-        """殷麦曼：先拉起，再在高处转向反向航向，边爬升边反向。"""
+        """殷麦曼：翼平拉起过顶，倒扣滚转 180°，再拉杆改平并反向。
+
+        旧实现只爬到 γ≈45° 就平转 150°，既没有过顶也没有真正的半滚，
+        在能量上等价于一次大坡度盘旋。现在按真实三段执行：拉起 → 顶部滚转
+        → 拉杆改出（倒扣时正过载会把机头压回水平）。
+        """
         sign = self._def_sign
         if self._phase == 0:
-            if obs.own_gamma >= math.radians(35.0) or self._phase_t >= 1.6:
+            if obs.own_gamma >= math.radians(70.0) or self._phase_t >= 2.2:
                 self._phase, self._phase_t = 1, 0.0
-            return aim_action(
-                obs, 0.0, math.radians(45.0) - obs.own_gamma, gain=2.0
-            )
-        # 顶部反向：保持一定爬升角的同时向背离威胁一侧转过大角度
-        return aim_action(
-            obs,
-            sign * math.radians(150.0),
-            math.radians(5.0) - obs.own_gamma,
-            gain=2.0,
-        )
+            n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
+            return Action(bank=0.0, n=n, throttle=1.0, fire=False)
+        if self._phase == 1:
+            # 顶部滚转：把机腹翻到上方，为随后的“拉杆改平”做准备。
+            if abs(obs.own_bank) >= math.radians(150.0) or self._phase_t >= 1.4:
+                self._phase, self._phase_t = 2, 0.0
+            return Action(bank=sign, n=1.2, throttle=1.0, fire=False)
+        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.8, throttle=0.8)
 
     def _loop(self, obs: Observation) -> Action:
-        """内筋斗：保持航向，拉起后俯冲，在垂直平面内形成回转。"""
+        """内筋斗：翼平持续拉杆，在垂直平面内完成 360° 回转。
+
+        旧实现分三段追目标航迹角（65° → −40° → 0），最多只画了半个圈就
+        退出。现在同向持续拉杆、不再用 _level_cap（它按 cos γ 收过载，正好
+        在过顶时把过载压成 0），航迹角依次越过 +90°、−90° 后改平。
+        """
         if self._phase == 0:
-            if obs.own_gamma >= math.radians(55.0) or self._phase_t >= 1.8:
+            if obs.own_gamma >= math.radians(75.0) or self._phase_t >= 2.5:
                 self._phase, self._phase_t = 1, 0.0
-            return aim_action(
-                obs, 0.0, math.radians(65.0) - obs.own_gamma, gain=2.2
-            )
-        if self._phase == 1:
-            if obs.own_gamma <= math.radians(-25.0) or self._phase_t >= 1.6:
+        elif self._phase == 1:
+            if obs.own_gamma <= math.radians(15.0) or self._phase_t >= 3.0:
                 self._phase, self._phase_t = 2, 0.0
-            return aim_action(
-                obs, 0.0, math.radians(-40.0) - obs.own_gamma, gain=2.0
-            )
-        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6)
+        elif self._phase == 2:
+            if obs.own_gamma <= math.radians(-70.0) or self._phase_t >= 3.0:
+                self._phase, self._phase_t = 3, 0.0
+        if self._phase == 3:
+            return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6)
+        n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
+        return Action(bank=0.0, n=n, throttle=1.0, fire=False)
 
     def _scissors(self, obs: Observation) -> Action:
         """滚转剪刀：周期性反向最大过载转弯，逼对手冲过头。"""

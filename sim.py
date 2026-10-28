@@ -24,9 +24,13 @@ import random
 from dataclasses import dataclass
 
 G = 9.81
-MAX_BANK = math.radians(80.0)      # 滚转角上限
-GAMMA_LIMIT = math.radians(80.0)   # 航迹倾角上限，避免 cos(gamma) -> 0
-N_MIN = -2.0                       # 允许推杆产生负过载，用于低速卸载改出
+MAX_BANK = math.radians(80.0)      # 常规滚转角刻度（Action.bank=1 对应的角度）
+# 战术层允许指令到倒扣：Action.bank 以 MAX_BANK 为单位，最大可到 ±180°。
+BANK_CMD_MAX = math.pi / MAX_BANK
+# 航迹角/俯仰角不再被人为夹断：筋斗与半滚倒转都必须能越过 ±90°。
+# 只在 3DOF 的 psi_dot 坐标奇点处给一个角速度上限，避免 cos(gamma)->0 时数值爆掉。
+PSI_DOT_LIMIT = math.radians(70.0)
+N_MIN = -3.0                       # 战斗机负过载极限约 -3 g
 MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴对准速度矢量的最大角速度
 
 # ---------- 跨声速/超声速波阻 ----------
@@ -185,16 +189,27 @@ def mach_number(v: float, z: float) -> float:
     return v / speed_of_sound(z)
 
 
-def thrust_lapse(z: float, mach: float = 0.0) -> float:
-    """涡扇推力：高度衰减 × 冲压恢复。
+def thrust_lapse(
+    z: float, mach: float = 0.0,
+    lapse_exp: float = 0.70, ram_r0: float = 0.30, ram_r1: float = 0.0,
+    derate_z: float = 1.0e9, derate_H: float = 1.0, eta_install: float = 1.0,
+) -> float:
+    """涡扇推力：密度衰减 × 冲压恢复 × 高空降额 × 安装损失。
 
-    只按密度衰减会在超声速段严重低估可用推力——真实进气道把来流
-    冲压回来，推力随马赫数缓慢上升，这正是 Su-57 能不开加力巡航
-    超过音速的来源。系数按“12 km、M2.0 满加力刚好配平”标定。
+    旧模型只有 ``(rho/rho0)^0.7 × (1+0.3M)``：指数小于 1 时推力比阻力掉得慢，
+    Ps 随高度不降反升，升限虚高到 25 km 以上。现在的三项各有物理含义：
+
+    - ``sigma**lapse_exp``：密度衰减。指数按机型标定，越接近 1 掉得越快；
+    - ``ram``：进气道冲压恢复，只在马赫数上增加，且高空（sigma 小）更强，
+      并设 1.55 的上限，避免高马赫时推力无限增长；
+    - ``derate``：高空推力悬崖。真实发动机在 12–18 km 之后推力迅速塌陷，
+      这一项让 Ps 在升限附近自然穿过 0，而不是靠“30 km 解体”兜底；
+    - ``eta_install``：进气道/喷口安装损失，典型 0.95–0.98。
     """
-    density = (air_density(z) / RHO0) ** 0.7
-    ram = 1.0 + 0.30 * clamp(mach, 0.0, 2.2)
-    return density * ram
+    sigma = clamp(air_density(z) / RHO0, 0.0, 1.0)
+    ram = min(1.0 + (ram_r0 + ram_r1 * (1.0 - sigma)) * clamp(mach, 0.0, 2.5), 1.55)
+    derate = 1.0 if z <= derate_z else math.exp(-(z - derate_z) / max(derate_H, 1.0))
+    return sigma ** lapse_exp * ram * derate * eta_install
 
 
 def drag_divergence(mach: float) -> float:
@@ -275,6 +290,10 @@ class MissileSpec:
     # 自动驾驶仪/舵机的一阶时间常数 s：横向过载指令不能瞬时建立。
     # 末段目标拉大过载时，这个滞后就是真实的脱靶来源。
     autopilot_tau: float = 0.18
+    # 跨声速/超声速波阻增量（相对 cd0），按 smoothstep(0.85,1.15) 打开。
+    # 导弹推重比高，峰值马赫几乎完全由这一项决定；旧模型没有它，
+    # 中距弹会冲到 M5 以上，比真实弹道快出一大截。
+    cd0_wave: float = 0.55
 
     @property
     def is_sarh(self) -> bool:
@@ -337,6 +356,19 @@ class AircraftSpec:
     thrust_mil: float = 0.0     # 军用推力 N；0 表示按 0.62×thrust_max 估算
     cruise_mach: float = 0.80   # 开局巡航马赫数（初始速度 = 当地声速 × 该值）
     fuel_capacity: float = 0.0  # 可消耗燃油 kg；0 表示不建模
+    # ---- 推力高度/马赫衰减（由 scripts/calibrate_thrust.py 拟合公开锚点） ----
+    lapse_exp: float = 0.70     # 密度衰减指数，越接近 1 高空掉推越快
+    ram_r0: float = 0.30        # 海平面冲压恢复斜率
+    ram_r1: float = 0.00        # 高空附加冲压（按 1-sigma 增强）
+    derate_z: float = 1.0e9     # 推力悬崖起始高度 m
+    derate_H: float = 1.0       # 悬崖衰减尺度 m
+    eta_install: float = 1.00   # 进气道/喷口安装损失
+
+    # ---- 机炮外弹道（P1-3） ----
+    muzzle_speed: float = 900.0      # 弹丸出膛速度 m/s
+    bullet_mass: float = 0.102       # 弹丸质量 kg（20 mm 约 0.102，30 mm 约 0.390）
+    bullet_diameter: float = 0.020   # 弹丸直径 m
+    gun_spread: float = 0.003        # 每发角度散布标准差 rad
 
     # ---- 6DOF 刚体参数（3DOF/2DOF 不使用） ----
     length: float = 15.0        # 机身长度 m，用于估算俯仰/偏航惯量
@@ -425,14 +457,24 @@ class AircraftSpec:
             2.0 * m * G / (air_density(z) * self.wing_area * self.cl_max)
         )
 
+    def lift_scale(self, mach: float) -> float:
+        """超声速升力损失：M1.6 以上只保留 70% 的 CLmax。
+
+        真实机翼在超声速段受激波/后掠影响升力曲线整体下移，可用过载因此
+        随马赫数下降。跨声速段用 smoothstep 过渡，避免 M1 附近跳变。
+        """
+        return 1.0 - 0.30 * _smoothstep(0.90, 1.60, mach)
+
+    def cl_max_at(self, mach: float) -> float:
+        return self.cl_max * self.lift_scale(mach)
+
     def n_lift(self, v: float, z: float = 0.0, mass: float | None = None) -> float:
         """升力能提供的过载。低翼载 + 高 CLmax + 高密度在这里体现优势。"""
         if v <= 0.0:
             return 0.0
         m = self.mass if mass is None else mass
-        return (
-            0.5 * air_density(z) * v * v * self.wing_area * self.cl_max / (m * G)
-        )
+        cl = self.cl_max_at(mach_number(v, z))
+        return 0.5 * air_density(z) * v * v * self.wing_area * cl / (m * G)
 
     def n_available(self, v: float, z: float = 0.0,
                     mass: float | None = None) -> float:
@@ -441,6 +483,13 @@ class AircraftSpec:
     def mil_thrust(self) -> float:
         """军用推力（不开加力）：缺省按最大加力的 62% 估算。"""
         return self.thrust_mil if self.thrust_mil > 0.0 else 0.62 * self.thrust_max
+
+    def lapse(self, z: float, mach: float) -> float:
+        """该机型的高度/马赫推力衰减系数。所有推力计算必须走这里。"""
+        return thrust_lapse(
+            z, mach, self.lapse_exp, self.ram_r0, self.ram_r1,
+            self.derate_z, self.derate_H, self.eta_install,
+        )
 
     def thrust_at(self, throttle: float, ab: float, z: float,
                   mach: float) -> float:
@@ -452,7 +501,7 @@ class AircraftSpec:
         mil = self.mil_thrust()
         dry = clamp(throttle, 0.0, 1.0) * mil
         wet = clamp(ab, 0.0, 1.0) * (self.thrust_max - mil)
-        return (dry + wet) * thrust_lapse(z, mach)
+        return (dry + wet) * self.lapse(z, mach)
 
     def n_sustain(self, v: float, z: float, throttle: float = 1.0,
                   mass: float | None = None, ab: float = 0.0) -> float:
@@ -658,8 +707,15 @@ class Aircraft:
     r: float = 0.0
     phi: float = 0.0
     theta: float = 0.0
+    # 姿态四元数 (w,x,y,z)，机体系→世界系。数值积分只更新四元数，
+    # phi/theta/psi 是每步由它反解的派生量（见 euler_from_quat）。
+    quat: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
     # 本物理步矢量喷口的实际偏转指令（rad，正=抬头方向），供观战与诊断使用。
     tvc_cmd: float = 0.0
+    # 机炮待发弹丸的累计余量：射速高于物理步频时，按帧补发而不是每帧固定一发。
+    gun_pending: float = 0.0
+    # 越过验证高度上限只记录一次事件，不再判定“解体”。
+    ceiling_warned: bool = False
 
     @property
     def energy(self) -> float:
@@ -750,6 +806,34 @@ class Countermeasure:
         return (self.x, self.y, self.z)
 
 
+@dataclass
+class Bullet:
+    """一发机炮外弹道弹丸。
+
+    旧实现是“炮口在视锥内就按秒伤扣血”，命中与飞行时间无关，也没有
+    提前量/下坠。现在弹丸按真实初速（载机速度 + 炮口速度）、高斯散布、
+    二次阻力与重力飞行，命中用线段-球判定，单发伤害 = gun_dps/射速。
+    """
+
+    owner: int
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+    mass: float
+    drag_k: float        # ρ·C_D·A/(2m)，二次阻力系数 1/m
+    damage: float        # 单发命中伤害
+    t: float = 0.0
+    life: float = 2.5
+    alive: bool = True
+
+    @property
+    def position(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
 def body_axes(psi: float, theta: float, phi: float):
     """机体轴（前/右/下）在世界系（东/北/上）中的方向余弦。"""
     sp, cp = math.sin(psi), math.cos(psi)
@@ -767,6 +851,72 @@ def body_axes(psi: float, theta: float, phi: float):
         -cf * ct,
     )
     return xb, yb, zb
+
+
+# ---------------------------------------------------------------------------
+# 四元数姿态（6DOF）
+# ---------------------------------------------------------------------------
+# 欧拉角在 theta=±90° 处有万向节锁，且旧实现直接把 theta 夹在 ±80°，
+# 筋斗/半滚倒转/垂直剪刀因此全部退化为“爬到 80° 再掉回来”。现在姿态用
+# 四元数积分，欧拉角只作为派生量输出给观测、武器与渲染，物理上不再夹断。
+#
+# 本项目的 psi 从 x 轴逆时针计量，机体系 z 轴朝下，因此零姿态对应的旋转
+# 是绕机体 x 轴 180°（R = Rx(pi)），欧拉合成顺序为 Rz(psi)·Ry(-theta)·Rx(pi+phi)。
+# ---------------------------------------------------------------------------
+
+def _quat_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _quat_axis(axis: str, angle: float):
+    half = 0.5 * angle
+    c, s = math.cos(half), math.sin(half)
+    if axis == "x":
+        return (c, s, 0.0, 0.0)
+    if axis == "y":
+        return (c, 0.0, s, 0.0)
+    return (c, 0.0, 0.0, s)
+
+
+def quat_from_euler(phi: float, theta: float, psi: float):
+    """按本项目欧拉约定合成四元数（机体系→世界系）。"""
+    q = _quat_mul(_quat_axis("z", psi), _quat_axis("y", -theta))
+    return _quat_mul(q, _quat_axis("x", math.pi + phi))
+
+
+def quat_to_matrix(q) -> tuple[tuple[float, float, float], ...]:
+    w, x, y, z = q
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)),
+        (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+        (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
+    )
+
+
+def euler_from_quat(q) -> tuple[float, float, float]:
+    """从四元数反解 (phi, theta, psi)。
+
+    theta 由 asin 给出，天然落在 [-90°, 90°]：过顶后 psi/phi 会接管方向，
+    机体轴仍连续。调用方应把 theta 当作显示量，而不是积分状态。
+    """
+    m = quat_to_matrix(q)
+    theta = math.asin(clamp(m[2][0], -1.0, 1.0))
+    ct = math.cos(theta)
+    if abs(ct) < 1e-6:
+        # 万向节锁：任选 psi，保证 phi 仍能把机头/机腹方向还原。
+        psi = math.atan2(m[0][1], m[1][1])
+        phi = math.atan2(-m[2][1], -m[2][2]) if abs(m[2][1]) > 1e-9 else 0.0
+    else:
+        psi = math.atan2(m[1][0], m[0][0])
+        phi = math.atan2(-m[2][1], -m[2][2])
+    return wrap_pi(phi), theta, wrap_pi(psi)
 
 
 def world_velocity(ac: Aircraft) -> tuple[float, float, float]:
@@ -795,21 +945,20 @@ def nose_direction(ac: Aircraft) -> tuple[float, float, float]:
     return (vx / n, vy / n, vz / n)
 
 
-MUZZLE_SPEED = 800.0   # 机炮初速 m/s，用于计算弹丸出膛方向
-
-
 def gun_direction(ac: Aircraft) -> tuple[float, float, float]:
     """炮线方向：弹丸速度 = 载机速度 + 炮口初速沿机头。
 
     点质量模型没有机体姿态，机头即速度方向，所以结果与 nose_direction 一致。
+    初速取机型参数（20 mm 约 1030 m/s、30 mm 约 900 m/s），不再是全局常数。
     """
     nx, ny, nz = nose_direction(ac)
     if not ac.rigid:
         return (nx, ny, nz)
     vx, vy, vz = world_velocity(ac)
-    gx = vx + MUZZLE_SPEED * nx
-    gy = vy + MUZZLE_SPEED * ny
-    gz = vz + MUZZLE_SPEED * nz
+    vm = ac.spec.muzzle_speed
+    gx = vx + vm * nx
+    gy = vy + vm * ny
+    gz = vz + vm * nz
     g = max(math.sqrt(gx * gx + gy * gy + gz * gz), 1e-6)
     return (gx / g, gy / g, gz / g)
 
@@ -831,8 +980,22 @@ def _cruise_throttle(spec: AircraftSpec, z: float, v: float) -> float:
     mach = mach_number(v, z)
     q = 0.5 * air_density(z) * v * v
     drag = q * cd0_at(mach, spec.cd0) * spec.wing_area
-    mil = spec.mil_thrust() * thrust_lapse(z, mach)
+    mil = spec.mil_thrust() * spec.lapse(z, mach)
     return clamp(drag / max(mil, 1e-6), 0.25, 0.95)
+
+
+def launch_envelope(ac: "Aircraft", mspec: MissileSpec,
+                    foe: "Aircraft") -> tuple[float, float]:
+    """统一的发射包线 (min_range, max_range)。
+
+    红外导引头只看目标的热信号，与雷达散射截面无关；雷达导引头按雷达方程
+    随 RCS 的四次方根缩放。此前观测、锁定、发射三处各写了一遍，出现
+    “观测说能打、锁定却打不出”的不一致，这里收成唯一入口。
+    """
+    reach = mspec.seeker_range
+    if mspec.is_radar:
+        reach *= rcs_scale(foe.spec.rcs)
+    return mspec.min_range, min(mspec.max_range, reach)
 
 
 class World:
@@ -875,6 +1038,8 @@ class World:
             "max_z": 0.0,
             "max_climb": 0.0,
             "rounds_fired": 0.0,
+            "bullets_fired": 0,
+            "bullet_hits": 0,
             "damage_dealt": [0.0, 0.0],
             "missiles_fired": 0.0,
             "missile_hits": 0,
@@ -883,6 +1048,8 @@ class World:
         }
         # 在飞格斗弹；命中/寿命结束后 alive=False，保留在身上供渲染层读数。
         self.missiles: list[Missile] = []
+        # 在飞机炮弹丸：按真实初速/散布/阻力飞行，线段-球判定命中。
+        self.bullets: list[Bullet] = []
         # 已投放的干扰物（箔条云 / 热诱弹），失效后保留到清理，供渲染层读数。
         self.counters: list[Countermeasure] = []
         # 干扰诱骗用的随机源固定种子，保证回放与实验可复现。
@@ -922,6 +1089,10 @@ class World:
         ]
         self.stats["min_z"] = start_z
         self.stats["max_z"] = start_z
+        # 6DOF 的姿态状态只有四元数：用初始欧拉角（含配平迎角）合成一次。
+        for ac in self.acs:
+            if ac.rigid:
+                ac.quat = quat_from_euler(ac.phi, ac.theta, ac.psi)
 
     # ---------- 对外接口 ----------
 
@@ -998,8 +1169,7 @@ class World:
         in_msl = False
         lock_progress = 0.0
         if mspec is not None and me.missiles > 0:
-            msl_max = min(mspec.max_range, mspec.seeker_range)
-            msl_min = mspec.min_range
+            msl_min, msl_max = launch_envelope(me, mspec, foe)
             nnx, nny, nnz = nose_direction(me)
             seeker_ang = math.acos(
                 clamp(ux * nnx + uy * nny + uz * nnz, -1.0, 1.0)
@@ -1034,9 +1204,7 @@ class World:
         radar_tracking = False
         if rspec is not None and (me.radar_missiles > 0 or radar_in_flight > 0):
             # 隐身机（RCS 小）被雷达截获的距离按四次方根缩短。
-            rcs_k = rcs_scale(foe.spec.rcs)
-            radar_max = min(rspec.max_range, rspec.seeker_range * rcs_k)
-            radar_min = rspec.min_range
+            radar_min, radar_max = launch_envelope(me, rspec, foe)
             nnx, nny, nnz = nose_direction(me)
             radar_ang = math.acos(
                 clamp(ux * nnx + uy * nny + uz * nnz, -1.0, 1.0)
@@ -1045,8 +1213,7 @@ class World:
                 radar_min <= dist <= radar_max and radar_ang <= rspec.seeker_fov
             )
             radar_tracking = (
-                dist <= rspec.seeker_range * rcs_k
-                and radar_ang <= SARH_ILLUM_FOV
+                dist <= radar_max and radar_ang <= SARH_ILLUM_FOV
             )
             radar_progress = clamp(
                 me.radar_lock_timer / max(rspec.lock_time, 1e-6), 0.0, 1.0
@@ -1207,6 +1374,7 @@ class World:
         self._integrate(actions)
         self._update_lock()
         self._weapons(actions)
+        self._integrate_bullets()
         self._update_countermeasures()
         self._update_missiles()
         self.t += self.dt
@@ -1243,7 +1411,7 @@ class World:
             ab = 0.0
         ac.ab = ab
         mil = spec.mil_thrust()
-        lapse = thrust_lapse(ac.z, mach)
+        lapse = spec.lapse(ac.z, mach)
         dry = ac.throttle * mil * lapse
         wet = ab * (spec.thrust_max - mil) * lapse
         thrust = dry + wet
@@ -1271,17 +1439,19 @@ class World:
         rho = air_density(ac.z)
         v_floor = max(35.0, 0.20 * spec.v_stall_at(ac.z, m))
         v = max(ac.v, v_floor)
-        gamma = clamp(ac.gamma, -GAMMA_LIMIT, GAMMA_LIMIT)
-        cg = max(math.cos(gamma), 0.20)
+        # 不再把 gamma 夹在 ±80°：筋斗/半滚倒转必须能越过 ±90°。
+        gamma = wrap_pi(ac.gamma)
+        cg = math.cos(gamma)
 
         n_avail = spec.n_available(v, ac.z, m)
         n_cmd = clamp(act.n, N_MIN, n_avail)
-        bank_cmd = clamp(act.bank, -1.0, 1.0) * MAX_BANK
+        bank_cmd = clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
 
         # 一阶惯性，近似滚转/拉杆的响应延迟。
         alpha = self.dt / (spec.turn_tau + self.dt)
         ac.n = clamp(ac.n + (n_cmd - ac.n) * alpha, N_MIN, n_avail)
-        ac.bank = clamp(ac.bank + (bank_cmd - ac.bank) * alpha, -MAX_BANK, MAX_BANK)
+        ac.bank = clamp(ac.bank + (bank_cmd - ac.bank) * alpha,
+                        -BANK_CMD_MAX * MAX_BANK, BANK_CMD_MAX * MAX_BANK)
         q = 0.5 * rho * v * v
         mach = mach_number(v, ac.z)
         a_thrust = self._apply_power(ac, act, mach) / m
@@ -1296,7 +1466,17 @@ class World:
         if self.dof == 3:
             v_dot = a_thrust - a_drag0 - a_induced - G * math.sin(gamma)
             gamma_dot = (G / v) * (ac.n * math.cos(ac.bank) - math.cos(gamma))
-            psi_dot = (G / (v * cg)) * ac.n * math.sin(ac.bank)
+            # psi_dot 在 |cos(gamma)| -> 0 处有坐标奇点（机头垂直向上/向下）。
+            # 纯垂直面内（bank≈0 或 π）时航向本就不该变；其余情况给有界极限，
+            # 避免 0/0 把航向瞬间甩出去。
+            sb = math.sin(ac.bank)
+            if abs(cg) > 0.05:
+                psi_dot = (G / (v * cg)) * ac.n * sb
+            elif abs(sb) < 0.05:
+                psi_dot = 0.0
+            else:
+                psi_dot = PSI_DOT_LIMIT if sb > 0.0 else -PSI_DOT_LIMIT
+            psi_dot = clamp(psi_dot, -PSI_DOT_LIMIT, PSI_DOT_LIMIT)
         else:
             # 2DOF：垂直自由度被移除，水平响应与 3DOF 完全一致。
             v_dot = a_thrust - a_drag0 - a_induced
@@ -1306,7 +1486,7 @@ class World:
         ac.v = max(v + v_dot * self.dt, v_floor)
         ac.psi = wrap_pi(ac.psi + psi_dot * self.dt)
         if self.dof == 3:
-            ac.gamma = clamp(gamma + gamma_dot * self.dt, -GAMMA_LIMIT, GAMMA_LIMIT)
+            ac.gamma = wrap_pi(gamma + gamma_dot * self.dt)
             cg_new = math.cos(ac.gamma)
             ac.x += ac.v * cg_new * math.cos(ac.psi) * self.dt
             ac.y += ac.v * cg_new * math.sin(ac.psi) * self.dt
@@ -1317,12 +1497,13 @@ class World:
             ac.y += ac.v * math.sin(ac.psi) * self.dt
 
     def _n_available_effective(self, ac: Aircraft) -> float:
-        """当前可用过载：计入矢量增升后的升力上限，再受结构过载限制。"""
+        """当前可用过载：升力上限（含超声速损失与矢量增升）与结构限制取小。"""
         spec = ac.spec
-        cl = self._cl_max_effective(ac)
         n_lift = spec.n_lift(ac.v, ac.z, ac.mass)
-        if cl != spec.cl_max:
-            n_lift *= cl / max(spec.cl_max, 1e-6)
+        boost = self._tvc_cl_boost(ac)
+        if boost > 0.0:
+            base = max(spec.cl_max_at(mach_number(ac.v, ac.z)), 1e-6)
+            n_lift *= (base + boost) / base
         return min(spec.n_struct, n_lift)
 
     def _tvc_cl_boost(self, ac: Aircraft) -> float:
@@ -1339,11 +1520,12 @@ class World:
         return spec.tvc_cl_bonus * power
 
     def _cl_max_effective(self, ac: Aircraft) -> float:
-        """计入矢量增升后的可用升力系数上限。"""
+        """计入超声速升力损失与矢量增升后的可用升力系数上限。"""
         spec = ac.spec
+        base = spec.cl_max_at(mach_number(ac.v, ac.z))
         boost = self._tvc_cl_boost(ac)
         if boost <= 0.0:
-            return spec.cl_max
+            return base
         return spec.cl0 + spec.cl_alpha * spec.alpha_stall + boost
 
     def _alpha_stall_effective(self, ac: Aircraft) -> float:
@@ -1363,8 +1545,9 @@ class World:
         """
         spec = ac.spec
         # 三层级联：姿态角误差 → 目标角速度 → 舵面，避免单环比例控制大过冲。
-        # 本层约定 bank>0 为左滚，而 phi>0 为右滚。
-        phi_cmd = -clamp(act.bank, -1.0, 1.0) * MAX_BANK
+        # 本层约定 bank>0 为左滚，而 phi>0 为右滚。bank 以 MAX_BANK 为单位，
+        # 最大允许指令到倒扣 ±180°（破 S / 半滚倒转需要）。
+        phi_cmd = -clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
         p_cmd = clamp(2.5 * wrap_pi(phi_cmd - ac.phi), -1.5, 1.5)
         da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
 
@@ -1427,9 +1610,14 @@ class World:
         a_abs = abs(alpha)
         alpha_stall = self._alpha_stall_effective(ac)
         if a_abs <= alpha_stall:
-            cl = spec.cl0 + spec.cl_alpha * alpha
+            # 线性段也要服从超声速升力损失：cl_alpha 按失速迎角处刚好达到
+            # cl_max 标定，M1.6 以上再整体乘 lift_scale。
+            cl_lin = spec.cl0 + spec.cl_alpha * alpha
+            cl_lim = spec.cl_max_at(mach)
+            cl = clamp(cl_lin, -cl_lim, cl_lim)
         else:
             cl_stall = spec.cl0 + spec.cl_alpha * alpha_stall
+            cl_stall = min(cl_stall, spec.cl_max_at(mach))
             decay_rate = 1.6 if spec.tvc <= 0.0 else 1.0
             floor = 0.35 if spec.tvc <= 0.0 else 0.55
             decay = max(floor, 1.0 - decay_rate * (a_abs - alpha_stall))
@@ -1491,25 +1679,26 @@ class World:
         ac.q = clamp(ac.q + q_dot * dt, -4.0, 4.0)
         ac.r = clamp(ac.r + r_dot * dt, -2.0, 2.0)
 
-        # 欧拉角运动学。本项目的 psi 从 x 轴逆时针计量，与标准航向相反，故取负号。
-        sf, cf = math.sin(ac.phi), math.cos(ac.phi)
-        theta_lim = math.radians(70.0)
-        ac.phi = wrap_pi(ac.phi + (
-            ac.p + math.tan(clamp(ac.theta, -theta_lim, theta_lim))
-            * (ac.q * sf + ac.r * cf)
-        ) * dt)
-        ac.theta = clamp(
-            ac.theta + (ac.q * cf - ac.r * sf) * dt, -GAMMA_LIMIT, GAMMA_LIMIT
+        # 姿态用四元数积分：q̇ = 0.5·q ⊗ (0, p, q, r)，再归一化。
+        # 欧拉角只作为派生量输出，theta 越过 ±90° 时不再被夹断——
+        # 筋斗、半滚倒转、垂直剪刀都需要机体连续过顶。
+        qw, qx, qy, qz = ac.quat
+        dq = _quat_mul((qw, qx, qy, qz), (0.0, ac.p, ac.q, ac.r))
+        qn = (
+            qw + 0.5 * dq[0] * dt,
+            qx + 0.5 * dq[1] * dt,
+            qy + 0.5 * dq[2] * dt,
+            qz + 0.5 * dq[3] * dt,
         )
-        ac.psi = wrap_pi(ac.psi - (
-            (ac.q * sf + ac.r * cf) / max(math.cos(ac.theta), 0.25)
-        ) * dt)
+        norm = math.sqrt(sum(c * c for c in qn)) or 1.0
+        ac.quat = tuple(c / norm for c in qn)
+        ac.phi, ac.theta, ac.psi = euler_from_quat(ac.quat)
 
         # 世界系速度与位置
-        xb, yb, zb = body_axes(ac.psi, ac.theta, ac.phi)
-        wx = xb[0] * ac.u + yb[0] * ac.vb + zb[0] * ac.wb
-        wy = xb[1] * ac.u + yb[1] * ac.vb + zb[1] * ac.wb
-        wz = xb[2] * ac.u + yb[2] * ac.vb + zb[2] * ac.wb
+        rot = quat_to_matrix(ac.quat)
+        wx = rot[0][0] * ac.u + rot[0][1] * ac.vb + rot[0][2] * ac.wb
+        wy = rot[1][0] * ac.u + rot[1][1] * ac.vb + rot[1][2] * ac.wb
+        wz = rot[2][0] * ac.u + rot[2][1] * ac.vb + rot[2][2] * ac.wb
         ac.x += wx * dt
         ac.y += wy * dt
         ac.z += wz * dt
@@ -1552,10 +1741,8 @@ class World:
                 ac.locked = False
                 ac.lock_timer = 0.0
             else:
-                inside = (
-                    mspec.min_range <= dist <= mspec.seeker_range
-                    and ang <= mspec.seeker_fov
-                )
+                lo, hi = launch_envelope(ac, mspec, foe)
+                inside = lo <= dist <= hi and ang <= mspec.seeker_fov
                 ac.lock_timer = (
                     min(ac.lock_timer + self.dt, mspec.lock_time) if inside else 0.0
                 )
@@ -1567,11 +1754,8 @@ class World:
                 ac.radar_lock_timer = 0.0
             else:
                 # 目标 RCS 越小，雷达截获距离越短（隐身机的核心收益）。
-                radar_range = rspec.seeker_range * rcs_scale(foe.spec.rcs)
-                inside = (
-                    rspec.min_range <= dist <= radar_range
-                    and ang <= rspec.seeker_fov
-                )
+                lo, hi = launch_envelope(ac, rspec, foe)
+                inside = lo <= dist <= hi and ang <= rspec.seeker_fov
                 ac.radar_lock_timer = (
                     min(ac.radar_lock_timer + self.dt, rspec.lock_time)
                     if inside else 0.0
@@ -1579,36 +1763,122 @@ class World:
                 ac.radar_locked = ac.radar_lock_timer >= rspec.lock_time
 
     def _weapons(self, actions: list[Action]) -> None:
+        """机炮按射速生成弹丸；命中由后续的外弹道积分判定。
+
+        旧实现是“目标在炮口视锥内就按秒伤扣血”：没有飞行时间、没有提前量、
+        没有下坠与散布，6DOF 下炮线偏置也被抹平。现在每次物理步按
+        rounds_per_sec·dt 累积发数，弹丸以“载机速度 + 炮口初速”出膛，
+        之后只受二次阻力与重力，命中用线段-球判定，单发伤害 = dps/射速。
+        """
         for i, (ac, act) in enumerate(zip(self.acs, actions)):
             # 记录扳机状态，渲染层据此画炮口焰与炮线特效。
             ac.firing = bool(ac.alive and act.fire and ac.ammo > 0.0)
             if not ac.firing:
+                ac.gun_pending = 0.0
                 continue
             spec = ac.spec
             foe = self.acs[1 - i]
             if not foe.alive:
                 ac.firing = False
+                ac.gun_pending = 0.0
                 continue
 
-            fired = spec.rounds_per_sec * self.dt
-            ac.ammo = max(0.0, ac.ammo - fired)
-            self.stats["rounds_fired"] += fired
-
-            dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
-            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if dist > spec.gun_range or dist < 1e-6:
+            ac.gun_pending += spec.rounds_per_sec * self.dt
+            n_new = int(ac.gun_pending)
+            ac.gun_pending -= n_new
+            n_new = min(n_new, 2, int(ac.ammo + 1e-9))
+            if n_new <= 0:
                 continue
+            ac.ammo = max(0.0, ac.ammo - n_new)
+            self.stats["rounds_fired"] += n_new
+            self.stats["bullets_fired"] += n_new
 
-            nx, ny, nz = gun_direction(ac)
-            cos_off = (dx * nx + dy * ny + dz * nz) / dist
-            if math.acos(clamp(cos_off, -1.0, 1.0)) > spec.gun_cone:
-                continue
+            nx, ny, nz = nose_direction(ac)
+            # 与机头垂直的两个基向量，用来把高斯散布叠加到炮线上。
+            rx, ry, rz = (0.0, 0.0, 1.0) if abs(nz) < 0.9 else (1.0, 0.0, 0.0)
+            ux = ny * rz - nz * ry
+            uy = nz * rx - nx * rz
+            uz = nx * ry - ny * rx
+            un = max(math.sqrt(ux * ux + uy * uy + uz * uz), 1e-9)
+            ux, uy, uz = ux / un, uy / un, uz / un
+            wx = ny * uz - nz * uy
+            wy = nz * ux - nx * uz
+            wz = nx * uy - ny * ux
 
-            damage = min(spec.gun_dps * self.dt, foe.hp)
-            foe.hp -= damage
-            self.stats["damage_dealt"][i] += damage
+            vx, vy, vz = world_velocity(ac)
+            area = math.pi * (0.5 * spec.bullet_diameter) ** 2
+            drag_k = air_density(ac.z) * 0.30 * area / (2.0 * spec.bullet_mass)
+            damage = spec.gun_dps / max(spec.rounds_per_sec, 1e-6)
+            muzzle = spec.muzzle_speed
+            for _ in range(n_new):
+                sx = self._rng.gauss(0.0, spec.gun_spread)
+                sy = self._rng.gauss(0.0, spec.gun_spread)
+                dx = nx + ux * sx + wx * sy
+                dy = ny + uy * sx + wy * sy
+                dz = nz + uz * sx + wz * sy
+                dn = max(math.sqrt(dx * dx + dy * dy + dz * dz), 1e-9)
+                dx, dy, dz = dx / dn, dy / dn, dz / dn
+                self.bullets.append(Bullet(
+                    owner=i,
+                    x=ac.x + nx * spec.length * 0.5,
+                    y=ac.y + ny * spec.length * 0.5,
+                    z=ac.z + nz * spec.length * 0.5,
+                    vx=vx + muzzle * dx,
+                    vy=vy + muzzle * dy,
+                    vz=vz + muzzle * dz,
+                    mass=spec.bullet_mass,
+                    drag_k=drag_k,
+                    damage=damage,
+                ))
 
         self._launch_missiles(actions)
+
+    def _integrate_bullets(self) -> None:
+        """弹丸外弹道：二次阻力 + 重力，线段-球命中判定。"""
+        dt = self.dt
+        for b in self.bullets:
+            if not b.alive:
+                continue
+            b.t += dt
+            sp = math.sqrt(b.vx * b.vx + b.vy * b.vy + b.vz * b.vz)
+            ax = -b.drag_k * sp * b.vx
+            ay = -b.drag_k * sp * b.vy
+            az = -b.drag_k * sp * b.vz - G
+            x0, y0, z0 = b.x, b.y, b.z
+            b.vx += ax * dt
+            b.vy += ay * dt
+            b.vz += az * dt
+            sx, sy, sz = b.vx * dt, b.vy * dt, b.vz * dt
+            b.x = x0 + sx
+            b.y = y0 + sy
+            b.z = z0 + sz
+
+            for j, ac in enumerate(self.acs):
+                if j == b.owner or not ac.alive:
+                    continue
+                r = max(3.0, 0.35 * ac.spec.length)
+                l2 = sx * sx + sy * sy + sz * sz
+                if l2 <= 1e-12:
+                    continue
+                t = clamp(((ac.x - x0) * sx + (ac.y - y0) * sy
+                           + (ac.z - z0) * sz) / l2, 0.0, 1.0)
+                dx = x0 + sx * t - ac.x
+                dy = y0 + sy * t - ac.y
+                dz = z0 + sz * t - ac.z
+                if dx * dx + dy * dy + dz * dz <= r * r:
+                    b.alive = False
+                    damage = min(b.damage, ac.hp)
+                    ac.hp -= damage
+                    self.stats["damage_dealt"][b.owner] += damage
+                    self.stats["bullet_hits"] += 1
+                    break
+
+            if b.alive and (b.t >= b.life or b.z <= self.z_floor):
+                b.alive = False
+
+        # 高射速下弹丸列表会快速膨胀，定期清掉已失效的弹丸（渲染只关心在飞的）。
+        if len(self.bullets) > 400:
+            self.bullets = [b for b in self.bullets if b.alive]
 
     def _launch_missiles(self, actions: list[Action]) -> None:
         """只有完成锁定、在发射包线内、还有余弹且冷却结束才能发射。"""
@@ -1634,10 +1904,8 @@ class World:
             return
         dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-        max_range = min(
-            mspec.max_range, mspec.seeker_range * rcs_scale(foe.spec.rcs)
-        )
-        if not (mspec.min_range <= dist <= max_range):
+        lo, hi = launch_envelope(ac, mspec, foe)
+        if not (lo <= dist <= hi):
             return
 
         nx, ny, nz = nose_direction(ac)
@@ -1976,7 +2244,9 @@ class World:
 
             lat = math.sqrt(gx * gx + gy * gy + gz * gz)
             cl_req = lat * m.mass / max(qbar * m.spec.ref_area, 1e-6)
-            cd = m.spec.cd0 + 0.15 * cl_req * cl_req
+            mach = m.speed / max(speed_of_sound(max(m.z, 0.0)), 1e-6)
+            wave = m.spec.cd0_wave * _smoothstep(0.85, 1.15, mach)
+            cd = m.spec.cd0 * (1.0 + wave) + 0.15 * cl_req * cl_req
             drag = qbar * m.spec.ref_area * cd
             a_drag = drag / m.mass
 
@@ -2101,9 +2371,16 @@ class World:
                     self._finish(1 - i, f"{ac.spec.name} 低于最低高度坠机", "boundary")
                     return
                 if ac.z >= self.z_ceiling:
-                    ac.alive = False
-                    self._finish(1 - i, f"{ac.spec.name} 超过高度上限解体", "boundary")
-                    return
+                    # 不再判定“解体”：ISA 只建模到 32 km，推力悬崖已经让飞机
+                    # 在升限附近自然失去剩余功率。这里只记录一次越界事件，
+                    # 保留诊断价值而不干扰对局结果。
+                    if not ac.ceiling_warned:
+                        ac.ceiling_warned = True
+                        self.events.append((
+                            self.t,
+                            f"{ac.spec.name} 超过验证高度上限 "
+                            f"{self.z_ceiling / 1000.0:.0f} km",
+                        ))
             if abs(ac.x) > self.arena / 2 or abs(ac.y) > self.arena / 2:
                 ac.alive = False
                 self._finish(1 - i, f"{ac.spec.name} 飞出交战空域", "boundary")

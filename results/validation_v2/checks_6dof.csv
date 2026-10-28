@@ -1,0 +1,3 @@
+spec,turn_rate_6dof_deg_s,turn_n_6dof,turn_alt_drift_m,peak_n_6dof,mach_180s_analytic,mach_240s_6dof,thrust_max_9km_M09_kN,drag_1g_9km_M09_kN
+SU-57,6.74379,3.4751,18.7422,8.64131,1.42727,1.49218,179.471,84.1844
+F-16V,6.57563,3.31347,23.9495,6.40638,1.37233,1.44523,62.6403,29.3103
