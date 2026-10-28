@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 模拟产物与日志
+out/
+*.mp4
+*.log
+
+# 3D 模型与贴图（体积大，本地自备，不入库）
+f_16c_model/
+I154-SU-57战机/
+Sukhoi_PAKFA.gif
+
+# IDE / 系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
