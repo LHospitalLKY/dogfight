@@ -40,13 +40,17 @@ HIGH_G_REL = 0.75
 #       离轴 ±90°，射程 16 km（Block II 更远）。
 # 推进段/阻力按量级取值，命中完全由导引头视场、舵面可用过载和能量决定。
 # 锁定距离仍按导引头性能单独设定，射程只限制发射后的最大飞行距离。
+# cd0_wave 取 1.2：早期用 2.6 是为了压低峰值马赫，但总阻力系数
+# （cd0×(1+wave)）因此达到 2.1–3.3，导弹飞到末段只剩亚声速，目标一个
+# 横转就能把它拖掉。真实导弹波阻远小于这个量级，改回 1.2 后 15 km 迎头
+# 末段存速从 M2.5 提到 M3.0；R-77-1 的推力同步下调到 26 kN，峰值仍保持 M4.1。
 R73 = MissileSpec(
     name="R-73", mass=105.0, length=2.90, diameter=0.17,
     max_g=40.0, seeker_fov=math.radians(45.0),
     gimbal_fov=math.radians(60.0), seeker_range=10000.0,
     lock_time=0.8, min_range=300.0, max_range=30000.0,
-    thrust=14000.0, burn_time=5.0, burnout_mass=65.0,
-    cd0=0.9, cd0_wave=2.6, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
+    thrust=12000.0, burn_time=5.0, burnout_mass=65.0,
+    cd0=0.9, cd0_wave=1.2, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -55,8 +59,8 @@ AIM9X = MissileSpec(
     max_g=50.0, seeker_fov=math.radians(90.0),
     gimbal_fov=math.radians(90.0), seeker_range=12000.0,
     lock_time=0.5, min_range=300.0, max_range=16000.0,
-    thrust=12000.0, burn_time=4.0, burnout_mass=50.0,
-    cd0=0.9, cd0_wave=2.6, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
+    thrust=10800.0, burn_time=4.0, burnout_mass=50.0,
+    cd0=0.9, cd0_wave=1.2, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -73,8 +77,8 @@ R77_1 = MissileSpec(
     max_g=40.0, seeker_fov=math.radians(60.0),
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.5, min_range=1500.0, max_range=80000.0,
-    thrust=30000.0, burn_time=8.0, burnout_mass=100.0,
-    cd0=0.55, cd0_wave=2.6, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
+    thrust=26000.0, burn_time=8.0, burnout_mass=100.0,
+    cd0=0.55, cd0_wave=1.2, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
     life=50.0, cooldown=3.0, pn_gain=4.0, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=20000.0,
 )
@@ -84,8 +88,8 @@ AIM120C = MissileSpec(
     max_g=40.0, seeker_fov=math.radians(60.0),
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.2, min_range=1500.0, max_range=75000.0,
-    thrust=22000.0, burn_time=7.0, burnout_mass=80.0,
-    cd0=0.55, cd0_wave=2.6, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
+    thrust=21000.0, burn_time=7.0, burnout_mass=80.0,
+    cd0=0.55, cd0_wave=1.2, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
     life=45.0, cooldown=3.0, pn_gain=4.2, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=18000.0,
 )
