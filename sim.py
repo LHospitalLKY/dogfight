@@ -626,6 +626,8 @@ class Observation:
     own_locked: bool = False
     own_lock_progress: float = 0.0   # 0..1，达到 1 即完成锁定
     in_missile_envelope: bool = False
+    missile_nez: bool = False         # 目标是否已在近距弹不可逃逸区
+    missile_pk_est: float = 0.0       # 现在发射近距弹的估计命中概率
     missile_min_range: float = 0.0
     missile_max_range: float = 0.0
     foe_missiles: int = 0
@@ -1179,6 +1181,25 @@ class World:
             )
             lock_progress = clamp(me.lock_timer / max(mspec.lock_time, 1e-6), 0.0, 1.0)
 
+        # 近距弹的不可逃逸区估计：和中距弹同一套口径（包线 × 系数，
+        # 目标逃逸时按 aspect 缩水），只是包线取导引头/射程的较小值。
+        msl_nez, msl_pk = False, 0.0
+        if mspec is not None and me.missiles > 0 and foe.alive and msl_max > 0.0:
+            msl_flee = clamp(
+                (fvx * ux + fvy * uy + fvz * uz) / max(foe.v, 1.0), -1.0, 1.0
+            )
+            msl_aspect = 0.5 * (1.0 + msl_flee)
+            msl_nez_rng = max(
+                NEZ_FRACTION * msl_max * (1.0 - NEZ_ASPECT_PENALTY * msl_aspect),
+                mspec.min_range,
+            )
+            msl_pk = 1.0 / (
+                1.0 + math.exp(
+                    (dist - msl_nez_rng) / max(PK_TRANSITION * msl_nez_rng, 1.0)
+                )
+            )
+            msl_nez = dist <= msl_nez_rng
+
         # 红外弹与中距弹是两条独立的发射通道：中距弹在飞时仍可补射近距弹，
         # 因此 in_flight 只统计红外弹，避免一条中距弹把整个发射架锁死。
         in_flight = sum(
@@ -1342,6 +1363,8 @@ class World:
             own_locked=me.locked,
             own_lock_progress=lock_progress,
             in_missile_envelope=in_msl,
+            missile_nez=msl_nez,
+            missile_pk_est=msl_pk,
             missile_min_range=msl_min,
             missile_max_range=msl_max,
             foe_missiles=foe.missiles,

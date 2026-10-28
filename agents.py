@@ -24,10 +24,6 @@ ZOOM_ALLOWANCE = math.radians(25.0)
 GAMMA_CAP = math.radians(55.0)
 GAMMA_FLOOR = math.radians(-60.0)
 
-# 不在不可逃逸区时，中距弹的估计命中概率要达到该门限才值得发射。
-# 低于门限只意味着“现在打大概率浪费一枚弹”，带着弹继续占位更划算。
-RADAR_PK_MIN = 0.80
-
 # ---------- 人体过载耐受模型 ----------
 # 飞行员在抗荷服 + 抗荷动作下可以长期承受约 6 g，短时（数秒）极限约 9 g；
 # 人体对负过载（-Gz，血液涌向头部）的耐受差得多：持续约 -1.5 g、短时约 -3 g。
@@ -190,16 +186,17 @@ class PurePursuit:
 
 
 def should_launch(obs: Observation) -> bool:
-    """有锁定、在发射包线内、且手上没有在飞弹时打一发。
+    """有锁定、在发射包线内、且目标已进入近距弹不可逃逸区时打一发。
 
-    对头也允许发射：锁定本身已经保证目标在导引头视场内，
-    不再额外限制离轴角。对头互射后靠后续的规避动作决出结果。
-    命中与否完全交给内核的导弹动力学。
+    只打 NEZ 内的目标：包线边缘发射虽然“能打出去”，但目标一转身就能把弹
+    拖到能量耗尽，等于白送一枚弹。对头也允许发射，命中与否交给内核的
+    导弹动力学。
     """
     return (
         obs.own_locked
         and obs.own_missiles > 0
         and obs.in_missile_envelope
+        and obs.missile_nez
         and obs.own_missiles_in_flight < 1
         and obs.own_speed_frac > 1.35
         and obs.dist > max(obs.missile_min_range, 600.0)
@@ -207,23 +204,20 @@ def should_launch(obs: Observation) -> bool:
 
 
 def should_launch_radar(obs: Observation) -> bool:
-    """雷达制导中距弹（主动弹）的发射条件。
+    """雷达制导中距弹（主动弹）的发射条件：只在不可逃逸区内发射。
 
     中距弹的价值在超视距，太近时不如留着红外弹；也不能一次把两发都打光，
     先打一发、等命中或丢锁后再补射。主动弹在中制导段仍需要载机雷达
     保持跟踪与数据链，末段自主截获后即可脱离，因此这里同样要求速度余量。
-
-    打不打还要看值不值：目标进了不可逃逸区就打；否则按弹道前推估计的
-    命中概率判断，低于门限就带着弹继续占位，避免远距乱射把对局提前打没。
     """
     return (
         obs.own_radar_locked
         and obs.own_radar_missiles > 0
         and obs.in_radar_envelope
+        and obs.radar_nez
         and obs.own_radar_in_flight < 1
         and obs.own_speed_frac > 1.35
         and obs.dist > max(obs.radar_min_range, 2500.0)
-        and (obs.radar_nez or obs.radar_pk_est >= RADAR_PK_MIN)
     )
 
 
