@@ -28,6 +28,20 @@ MAX_BANK = math.radians(80.0)      # 滚转角上限
 GAMMA_LIMIT = math.radians(80.0)   # 航迹倾角上限，避免 cos(gamma) -> 0
 N_MIN = -2.0                       # 允许推杆产生负过载，用于低速卸载改出
 MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴对准速度矢量的最大角速度
+
+# ---------- 跨声速/超声速波阻 ----------
+# 阻力发散不是阶跃：onset 用 smoothstep 从 0.78 平滑开到 0.95
+# （跨度太窄会让 dC_D0/dM 仍接近阶跃），高斯项给出 M1.05 附近的
+# 跨声速鼓包，超声速段保留持续波阻。
+DRAG_CRIT_MACH = 0.78
+DRAG_DD_MACH = 0.95
+DRAG_PEAK_MACH = 1.05
+DRAG_WIDTH = 0.34
+DRAG_BUMP = 0.62
+DRAG_SUP_START_MACH = 0.95
+DRAG_SUP_END_MACH = 1.35
+DRAG_SUPERSONIC = 0.18
+
 # 载机雷达对目标的照射/数据链锥：半主动弹全程需要，主动弹只在末段截获前需要。
 SARH_ILLUM_FOV = math.radians(60.0)
 
@@ -184,14 +198,33 @@ def thrust_lapse(z: float, mach: float = 0.0) -> float:
 
 
 def drag_divergence(mach: float) -> float:
-    """跨声速波阻增量（相对 cd0 的倍数）。
+    """跨声速/超声速波阻增量（相对 cd0 的倍数）。
 
-    M0.75 之后开始上升，M1.0 附近达到峰值，超声速段又缓慢回落：
-    峰值把极速压在 Mach 2 左右，回落段保证超声速巡航不是靠死限速。
+    真实跨声速阻力是连续但梯度很大的曲线，不是某个马赫数处的阶跃。
+    这里用 C1 连续的 smoothstep 控制阻力发散起点，再叠加一个高斯鼓包，
+    并在超声速段保留一个持续存在的波阻平台：
+
+    - M < 0.78：几乎没有波阻增量；
+    - 0.78–0.95：平滑进入阻力发散段（drag creep）；
+    - 1.05 附近：跨声速阻力鼓包峰值；
+    - 1.35 以上：保留约 0.18 的超声速波阻，不回落成亚声速水平。
+
+    这样在 M=0.75 附近不会出现人为跳变，也避免“M=2 波阻消失”的问题。
     """
-    if mach <= 0.75:
-        return 0.0
-    return 0.62 * math.exp(-((mach - 1.05) / 0.34) ** 2)
+    onset = _smoothstep(DRAG_CRIT_MACH, DRAG_DD_MACH, mach)
+    bump = DRAG_BUMP * onset * math.exp(
+        -((mach - DRAG_PEAK_MACH) / DRAG_WIDTH) ** 2
+    )
+    supersonic = DRAG_SUPERSONIC * _smoothstep(
+        DRAG_SUP_START_MACH, DRAG_SUP_END_MACH, mach
+    )
+    return bump + supersonic
+
+
+def _smoothstep(edge0: float, edge1: float, x: float) -> float:
+    """标准 C1 smoothstep；在两端函数值与一阶导数都连续。"""
+    t = clamp((x - edge0) / max(edge1 - edge0, 1e-9), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def cd0_at(mach: float, cd0: float) -> float:
