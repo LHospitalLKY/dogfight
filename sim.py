@@ -326,6 +326,9 @@ class AircraftSpec:
     # ---- 推力矢量喷口（仅 6DOF 使用） ----
     tvc: float = 0.0            # 最大偏转角 rad，0 = 无矢量喷口
     tvc_alpha_max: float = 0.0  # 矢量喷口能维持的过失速迎角 rad
+    # 矢量喷流吹过机翼/尾翼带来的等效增升（CL 增量，按发动机功率占比缩放）。
+    # 无矢量机型为 0；有矢量时失速迎角随功率右移，盘旋可用升力上限提高。
+    tvc_cl_bonus: float = 0.0
 
     # ---- 近距格斗弹挂载（满载计入整机质量） ----
     missile: MissileSpec | None = None
@@ -1094,7 +1097,7 @@ class World:
             own_alt=me.z,
             own_psi=me.psi,
             own_gamma=me.gamma,
-            own_n_avail=me.spec.n_available(me.v, me.z, me.mass),
+            own_n_avail=self._n_available_effective(me),
             own_n=me.n,
             own_n_sustain=me.spec.n_sustain(
                 me.v, me.z, throttle=me.throttle, mass=me.mass, ab=me.ab
@@ -1280,6 +1283,44 @@ class World:
             ac.x += ac.v * math.cos(ac.psi) * self.dt
             ac.y += ac.v * math.sin(ac.psi) * self.dt
 
+    def _n_available_effective(self, ac: Aircraft) -> float:
+        """当前可用过载：计入矢量增升后的升力上限，再受结构过载限制。"""
+        spec = ac.spec
+        cl = self._cl_max_effective(ac)
+        n_lift = spec.n_lift(ac.v, ac.z, ac.mass)
+        if cl != spec.cl_max:
+            n_lift *= cl / max(spec.cl_max, 1e-6)
+        return min(spec.n_struct, n_lift)
+
+    def _tvc_cl_boost(self, ac: Aircraft) -> float:
+        """矢量喷流当前的等效增升量（CL 增量）。
+
+        喷流增升取决于发动机功率：加力全开时喷流最强，收油门则迅速减弱，
+        因此按油门/加力开度缩放，而不是按随高度衰减的绝对推力缩放——
+        否则高空大迎角（矢量喷口真正有价值的包线）反而拿不到增升。
+        """
+        spec = ac.spec
+        if not ac.rigid or spec.tvc <= 0.0 or spec.tvc_cl_bonus <= 0.0:
+            return 0.0
+        power = clamp(max(ac.throttle, ac.ab), 0.0, 1.0)
+        return spec.tvc_cl_bonus * power
+
+    def _cl_max_effective(self, ac: Aircraft) -> float:
+        """计入矢量增升后的可用升力系数上限。"""
+        spec = ac.spec
+        boost = self._tvc_cl_boost(ac)
+        if boost <= 0.0:
+            return spec.cl_max
+        return spec.cl0 + spec.cl_alpha * spec.alpha_stall + boost
+
+    def _alpha_stall_effective(self, ac: Aircraft) -> float:
+        """矢量增升把失速迎角一并右移：CL 增量摊到升力线斜率上。"""
+        spec = ac.spec
+        boost = self._tvc_cl_boost(ac)
+        if boost <= 0.0:
+            return spec.alpha_stall
+        return spec.alpha_stall + boost / spec.cl_alpha
+
     def _surface_commands(self, ac: Aircraft, act: Action, V: float,
                           alpha: float, qbar: float) -> tuple[float, float, float, float]:
         """增稳内回路：把战术层的 (bank, n) 翻译成副翼/升降舵/方向舵偏度。
@@ -1296,9 +1337,12 @@ class World:
 
         # 俯仰：目标过载 → 目标升力系数 → 目标迎角 → 目标俯仰角速度 → 升降舵
         cl_req = act.n * ac.weight / max(qbar * spec.wing_area, 1e-6)
-        cl_req = clamp(cl_req, -spec.cl_max, spec.cl_max)
+        cl_req = clamp(cl_req, -self._cl_max_effective(ac), self._cl_max_effective(ac))
         # 矢量喷口能把迎角带到失速以后；无矢量机型仍限制在失速迎角内。
         alpha_lim = spec.alpha_stall + 0.35 * spec.tvc_alpha_max
+        # 矢量增升把“线性段可用迎角”一并抬高，否则 cl_req 提高了、
+        # 迎角指令却仍被压回原失速迎角，增升拿不到。
+        alpha_lim = max(alpha_lim, self._alpha_stall_effective(ac))
         alpha_cmd = clamp(
             (cl_req - spec.cl0) / spec.cl_alpha, -alpha_lim, alpha_lim
         )
@@ -1307,7 +1351,13 @@ class World:
             alpha_cmd = spec.tvc_alpha_max
         # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%，过载会偏小。
         de_trim = -(spec.cm_alpha * alpha_cmd) / spec.cm_de
-        q_cmd = clamp(3.0 * (alpha_cmd - alpha), -0.9, 0.9)
+        # 航迹旋转前馈：保持目标迎角时需要机头跟着航迹一起转（q ≈ gamma_dot），
+        # 否则纯比例环节会在 alpha_cmd - gamma_dot/3 处提前平衡，
+        # 稳态实际过载只有指令的 ~80%（高 G 机动拉不出 6 g 的根源）。
+        gamma_dot = G * (
+            ac.n * math.cos(ac.phi) - math.cos(ac.gamma)
+        ) / max(V, 1.0)
+        q_cmd = clamp(8.0 * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
         de = clamp(de_trim - 1.5 * (q_cmd - ac.q), -1.0, 1.0)
 
         # 航向：侧滑角 → 目标偏航角速度 → 方向舵（同时抑制侧滑与偏航振荡）
@@ -1339,14 +1389,17 @@ class World:
 
         # 升力曲线：失速后升力快速衰减；矢量喷口机型衰减更慢，
         # 因为喷流仍能把机头压在超大迎角上，机身也持续提供涡升力。
+        # 有矢量增升时，线性段一直延伸到新的失速迎角，之后才进入衰减，
+        # 相当于喷流把可用升力上限整体抬高。
         a_abs = abs(alpha)
-        if a_abs <= spec.alpha_stall:
+        alpha_stall = self._alpha_stall_effective(ac)
+        if a_abs <= alpha_stall:
             cl = spec.cl0 + spec.cl_alpha * alpha
         else:
-            cl_stall = spec.cl0 + spec.cl_alpha * spec.alpha_stall
+            cl_stall = spec.cl0 + spec.cl_alpha * alpha_stall
             decay_rate = 1.6 if spec.tvc <= 0.0 else 1.0
             floor = 0.35 if spec.tvc <= 0.0 else 0.55
-            decay = max(floor, 1.0 - decay_rate * (a_abs - spec.alpha_stall))
+            decay = max(floor, 1.0 - decay_rate * (a_abs - alpha_stall))
             cl = math.copysign(cl_stall * decay, alpha)
         k_ind = 1.0 / (math.pi * spec.aspect_ratio * spec.oswald)
         mach = mach_number(V, ac.z)
@@ -1357,7 +1410,9 @@ class World:
         lift = qs * cl
         drag = qs * cd
         side = qs * cy
-        thrust = ac.throttle * spec.thrust_max * thrust_lapse(ac.z, mach)
+        # 推力取 _apply_power 的结果：它已经把军推/加力分开、按燃油削减并
+        # 做了高度衰减。这里若再按 throttle×最大加力重算，加力开度会被忽略，
+        # 而且巡航油门会凭空多出约 1.5 倍推力，飞机会一路加速、盘旋也停不下来。
 
         # 机体系合力（标准气动方程）：阻力沿速度反方向，升力垂直于速度。
         # 注意升力在机体系 x 方向的分量是 +L sin(alpha)：迎角越大，升力越前倾。

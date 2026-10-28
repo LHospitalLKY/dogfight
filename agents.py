@@ -44,6 +44,13 @@ G_NEG_RECOVER_TAU = 10.0
 GLOC_TIME = 2.5          # 失控后无法有效操纵的时间 s
 # 高 G 机动的目标过载：实际还会被结构上限与人体耐受一起压住。
 HIGH_G_N = 8.0
+# 高 G 原语的准入条件：机体当前高度/速度下能拉出的最大过载低于该值时，
+# “高 G 机动”只会变成一次普通盘旋（12 km、200 m/s 时 Su-57 只能拉 3.4 g），
+# 既抢不到角度又把能量抽干。此时宁可维持普通追逐，等速度涨起来再拉。
+HIGH_G_MIN_AVAIL = 6.5
+# 防御转向反转的时间门槛：威胁持续位于反侧超过该时长才换向。
+# 否则每次重新进入防御原语都会按瞬时方位翻一次，形成“无收益的反向机动”。
+DEF_REVERSE_TIME = 1.5
 
 
 def aim_action(
@@ -77,12 +84,43 @@ def aim_action(
     b = v * cg * psi_dot / G                # 水平方向升力分量
     n = math.hypot(a, b)
     phi = math.atan2(b, a)
+    # 先滚转、后拉杆：大坡度转向时若一上来就拉满过载，滚入的一两秒里升力
+    # 仍主要在竖直方向，飞机会先被拉起来，等坡度到位再掉回去。追尾、脱离
+    # 这类动作里就表现为“莫名其妙抬升高度、同时又掉速”。
+    if abs(phi) - abs(obs.own_bank) > math.radians(30.0):
+        n = min(n, 1.6)
     return Action(
         bank=clamp(phi / MAX_BANK, -1.0, 1.0),
         n=n,
         throttle=throttle,
         fire=obs.in_gun_cone,
     )
+
+
+def pursuit_action(
+    obs: Observation,
+    az: float,
+    el: float,
+    gain: float = 1.2,
+    throttle: float = 1.0,
+) -> Action:
+    """追踪类原语（纯追踪/提前量/滞后追踪）：带阻尼的指向控制。
+
+    aim_action 用 atan2(b, a) 反解坡度，而 a = cosγ + v·γ̇/G 在高速下对俯仰
+    误差非常敏感（300 m/s 时 3° 误差就要 5 g），近距追尾于是变成“拉杆抬头、
+    再推杆掉头”的 1 s 周期摆振；反过来 a≈0 时，零点几度的方位误差又能把
+    坡度顶到 80° 以上，升力全转到水平，机头迅速下坠再反向压回来。
+    这里对俯仰误差限幅、总过载按可维持过载收口，并在需要大推杆时翼平。
+    """
+    el = clamp(el, -math.radians(4.0), math.radians(4.0))
+    act = aim_action(obs, az, el, gain=gain, throttle=throttle)
+    if act.n < 1.2 and abs(act.bank) > 0.6:
+        # 卸载/推杆时翼平：坡度没有意义，只会把残存升力甩到侧面。
+        act.bank = 0.0
+    cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.25, 2.0)), 1.0)
+    if act.n > cap:
+        act.n = cap
+    return act
 
 
 def lead_point(obs: Observation, t_scale: float) -> tuple[float, float]:
@@ -94,7 +132,16 @@ def lead_point(obs: Observation, t_scale: float) -> tuple[float, float]:
     fvy = obs.foe_speed * cg * math.sin(obs.foe_psi)
     fvz = obs.foe_speed * math.sin(obs.foe_gamma)
 
-    t_go = clamp(obs.dist / max(obs.own_speed, 60.0), 0.0, 3.0) * t_scale
+    # 前置量按“交汇时间”估计，而不是“距离/本机速度”：咬尾时目标同向逃跑，
+    # 后者会把交汇时间高估三四倍，在 1 km 内把机头按 30° 以上的前置角甩到
+    # 目标另一侧，表现为回旋追尾时莫名其妙地反向压坡度。
+    # 目标在拉开（接近率不足）时几乎不需要前置，退化成纯追踪。
+    closing = obs.closure
+    if closing > 25.0:
+        t_go = min(obs.dist / closing, 1.5)
+    else:
+        t_go = 0.2
+    t_go *= t_scale
     lx = ux * obs.dist + fvx * t_go
     ly = uy * obs.dist + fvy * t_go
     lz = uz * obs.dist + fvz * t_go
@@ -198,6 +245,9 @@ class TacticalAgent:
     """
 
     MIN_HOLD = 0.7       # 原语最短驻留时间，抑制抖动
+    # 垂直机动（高/低悠悠）要拉几秒才能把速度换成高度再压回来，
+    # 0.7 s 就被切掉等于白做完一个半程机动，反而白掉能量。
+    YOYO_HOLD = 2.0
     SCISSOR_PERIOD = 1.4
     LOW_ENERGY_FRAC = 1.55   # 速度低于 1.55 倍当地失速即进入能量保护
     N_MARGIN = 1.25          # 允许短时超出维持过载的倍数，其余能量透支被禁止
@@ -207,7 +257,10 @@ class TacticalAgent:
     COBRA_DIST = 1800.0          # 矢量喷口机型的过失速反制距离：来弹贴脸才用
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
     OPENING_DIST = 5000.0        # 开局占位阶段：距离大于该值时不直冲对头
-    MERGE_START = 5000.0         # 进入该距离开始领先转弯，抢交汇角度
+    MERGE_START = 5000.0     # 进入该距离开始领先转弯，抢交汇角度
+    # 交汇方案在贴身盘旋阶段的保持距离。取 2200 而不是 1800，
+    # 是为了让“保持方案”和停用的距离门限错开，避免在门限上每拍翻转转向侧。
+    MERGE_HOLD = 2200.0
     MERGE_TIMEOUT = 12.0         # 交汇抢位方案的保持时间 s
 
     # 导弹来袭时按顺序轮换的防御动作；被锁定（未射弹）时也有一套。
@@ -261,7 +314,13 @@ class TacticalAgent:
         self._scissor_sign = 1.0
         self._scissor_t = 0.0
         self._def_sign = 1.0
+        self._def_reverse_t = 0.0
+        self._def_engaged = False
         self._opening_done = False
+        # 开局爬升目标的当前值：以有限速率逼近 _open_climb，避免 Ps 在门限
+        # 附近抖动时把俯仰指令整档切换。
+        self._open_climb_cur = 0.0
+        self._far = False
 
         # 交汇抢位方案：转向侧、单环/双环、以及方案剩余保持时间。
         self._merge_sign = 1.0
@@ -280,6 +339,19 @@ class TacticalAgent:
 
     def act(self, obs: Observation) -> Action:
         self._update_g_tolerance(obs)
+        # 防御转向的连续性：威胁只在持续位于反侧时才换向，避免“一进防御就反转”。
+        if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+            az = obs.incoming_missile_az
+            if az * self._def_sign < 0.0 and abs(az) > math.radians(60.0):
+                self._def_reverse_t += self.dt
+            else:
+                self._def_reverse_t = 0.0
+            if self._def_reverse_t >= DEF_REVERSE_TIME:
+                self._def_sign = -self._def_sign
+                self._def_reverse_t = 0.0
+        else:
+            self._def_reverse_t = 0.0
+            self._def_engaged = False
         sit = self._assess(obs)
         self.situation = sit.name
         if obs.dist < self.OPENING_DIST:
@@ -287,16 +359,20 @@ class TacticalAgent:
 
         # 交汇抢位方案在接近到 MERGE_START 内时锁定，随后按方案执行。
         # 只在仍是迎头接近时重算，避免进入盘旋格斗后方案来回翻转。
+        # 贴身盘旋期间方案不过期：一旦按瞬时方位重排，转向侧就会跟着
+        # 方位角翻转，表现为“回旋追尾时突然反向、且很快又切回来”。
+        holding_merge = obs.dist < self.MERGE_HOLD and obs.aspect > math.radians(55.0)
         if self._plan_ttl > 0.0:
-            self._plan_ttl -= self.dt
+            if not holding_merge:
+                self._plan_ttl -= self.dt
         elif (
             obs.dist < self.MERGE_START
-            and obs.dist > 400.0
+            and obs.dist > 1500.0
             and obs.aspect > math.radians(120.0)
         ):
             self._make_merge_plan(obs)
 
-        want = self._choose(sit, obs)
+        want = self._sticky_defense(self._choose(sit, obs))
         # 安全与防御类原语可立即抢占，不受最短驻留时间限制。
         emergency = (
             "RECOVER", "POSITION", "BEAM", "BREAK", "SPLIT_S",
@@ -305,7 +381,8 @@ class TacticalAgent:
             "LEAD_TURN", "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
         )
         bypass = want in emergency or self.primitive in emergency
-        if want != self.primitive and (self._hold >= self.MIN_HOLD or bypass):
+        need = self.YOYO_HOLD if self.primitive in ("HIGH_YOYO", "LOW_YOYO") else self.MIN_HOLD
+        if want != self.primitive and (self._hold >= need or bypass):
             self._enter(want, obs)
 
         self._hold += self.dt
@@ -369,13 +446,29 @@ class TacticalAgent:
         else:
             name = "NEUTRAL"
 
+        # 阈值附近的态势会在相邻档位间来回跳（ang 100°↔99°），而防御类原语
+        # 又能立即抢占，结果就是 PURE/BREAK 每 0.1 s 互换一次。给“正在防御”
+        # 加一段粘滞：几何没有明显改善就继续按防御处理。
+        if (
+            self.situation == "DEFENSIVE"
+            and name in ("NEUTRAL", "OFFENSIVE")
+            and ang > math.radians(90.0)
+            and foe_off < math.radians(75.0)
+        ):
+            name = "DEFENSIVE"
+
+        # 1800 m 附近的“远/近”会在门限上每 0.1 s 翻转，进而让 PURE/LEAD
+        # 反复互换，看起来像无收益的策略抖动；这里加一段滞回。
+        far = obs.dist > (1600.0 if self._far else 2000.0)
+        self._far = far
+
         return _Situation(
             name=name,
             angle=ang,
             e_adv=obs.energy_diff,
             close=obs.dist < 600.0,
             overshoot=obs.closure > 60.0 and obs.dist < 600.0 and ang > math.radians(50.0),
-            far=obs.dist > 1800.0,
+            far=far,
         )
 
     # ---------- 第二层：原语选择 ----------
@@ -505,13 +598,15 @@ class TacticalAgent:
         if (
             self._plan_ttl > 0.0
             and self._merge_plan
-            and obs.dist < 1800.0
-            and obs.aspect > math.radians(70.0)
+            and obs.dist < self.MERGE_HOLD
+            and obs.aspect > math.radians(55.0)
         ):
             return "ONE_CIRCLE" if self._merge_plan == "ONE_CIRCLE" else "TWO_CIRCLE"
 
         if sit.name == "DEFENSIVE":
-            if sit.overshoot or (sit.close and self.aggression > 0.4):
+            # 只有对方真的冲过头（接近率为正、距离很近且机头已偏）才做剪刀；
+            # 仅仅“贴得近”就反复剪刀，会变成每 1.4 s 一次的无收益反向机动。
+            if sit.overshoot:
                 return "SCISSORS"
             return "BREAK"
 
@@ -521,7 +616,13 @@ class TacticalAgent:
             if sit.far:
                 return "PURE"
             # 角度还不够、速度与过载耐受都富余时用高 G 转弯抢角度。
-            if obs.own_speed_frac > 1.55 and self.n_pos_tol > 6.5:
+            # 机体本身拉不出 6.5 g 时（高空低速）换成普通追逐，等高 G 变得
+            # “名副其实”再拉，否则只是白白把能量抽干。
+            if (
+                obs.own_speed_frac > 1.55
+                and self.n_pos_tol > 6.5
+                and obs.own_n_avail >= HIGH_G_MIN_AVAIL
+            ):
                 return "HIGH_G_TURN"
             return "LEAD"
 
@@ -531,6 +632,7 @@ class TacticalAgent:
             and sit.angle > math.radians(40.0)
             and obs.own_speed_frac > 1.60
             and self.n_pos_tol > 6.5
+            and obs.own_n_avail >= HIGH_G_MIN_AVAIL
         ):
             return "HIGH_G_TURN"
 
@@ -656,7 +758,11 @@ class TacticalAgent:
         """防御原语的能量/高度/距离/过载耐受准入条件。"""
         if primitive.startswith("HIGH_G"):
             # 高 G 规避要同时有速度和过载余量；疲劳时拉不出高 G，不如老实横转。
-            ok = obs.own_speed_frac > 1.45 and self.n_pos_tol > 6.0
+            ok = (
+                obs.own_speed_frac > 1.45
+                and self.n_pos_tol > 6.0
+                and obs.own_n_avail >= HIGH_G_MIN_AVAIL
+            )
             if primitive in ("HIGH_G_SPLIT_S", "HIGH_G_BARREL"):
                 ok = ok and obs.z_margin_low > 600.0
             return ok
@@ -712,29 +818,41 @@ class TacticalAgent:
             return "NOTCH_DESC"
         return None
 
+    # BEAM 与 NOTCH_DESC 是同一套横转姿态的两档，分界点（威胁剩余时间 4.5 s）
+    # 附近会来回跳。保持当前动作，直到出现完全不同的威胁应对需求。
+    _NOTCH_FAMILY = frozenset(("BEAM", "NOTCH_DESC"))
+
+    def _sticky_defense(self, want: str) -> str:
+        if (
+            want != self.primitive
+            and self.primitive in self._NOTCH_FAMILY
+            and want in self._NOTCH_FAMILY
+        ):
+            return self.primitive
+        return want
+
     def _enter(self, primitive: str, obs: Observation) -> None:
         self.primitive = primitive
         self._hold = 0.0
         self._phase = 0
         self._phase_t = 0.0
-        # 防御转向只在进入原语时锁定一次。若每拍都按瞬时方位角重算，
-        # 对头接近时方位角在 0° 附近抖动会让坡度左右反复反转，
-        # 飞机实际只能原地拉杆爬升，既甩不掉弹又耗尽能量。
+        # 防御转向只在本次威胁的第一次防御动作时定一次侧：取威胁所在的一侧。
+        # 之后由 act() 的计时器统一维护，只在威胁持续位于反侧 1.5 s 才换向。
+        # 原来“每次进入防御都按瞬时方位重算”，在盘旋缠斗里方位角常年超过
+        # 60°，会导致每进一次防御就反向一次，且很快被下一拍策略替换。
         if primitive in (
             "BREAK", "BEAM", "SPLIT_S", "BARREL", "IMMELMANN", "LOOP",
             "CRANK", "NOTCH_DESC", "F_POLE",
             "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
-        ):
-            # 中距弹的告警距离更远，转向锁定时同样按弹的相对方位判断。
-            if primitive in ("CRANK", "NOTCH_DESC", "F_POLE"):
-                vs_missile = obs.incoming_missile_dist < self.SARH_EVADE_DIST
-            else:
-                vs_missile = obs.incoming_missile_dist < self.MISSILE_EVADE_DIST
-            az = obs.incoming_missile_az if vs_missile else obs.off_az
-            # 威胁已经明显换到另一侧才翻转，避免方位角在 0° 附近抖动时
-            # 每拍都换向，导致坡度反复反转、飞机原地拉杆爬升。
-            if az * self._def_sign < 0.0 and abs(az) > math.radians(60.0):
-                self._def_sign = -self._def_sign
+        ) and not self._def_engaged:
+            self._def_engaged = True
+            az = (
+                obs.incoming_missile_az
+                if obs.incoming_missile_dist < self.SARH_EVADE_DIST
+                else obs.off_az
+            )
+            self._def_sign = 1.0 if az >= 0.0 else -1.0
+            self._def_reverse_t = 0.0
         if primitive in (
             "LEAD_TURN", "ONE_CIRCLE", "TWO_CIRCLE", "HIGH_G_TURN",
         ):
@@ -797,13 +915,13 @@ class TacticalAgent:
         if primitive == "BEAM":
             return self._beam(obs)
         if primitive == "PURE":
-            return aim_action(obs, obs.off_az, obs.off_el)
+            return pursuit_action(obs, obs.off_az, obs.off_el)
         if primitive == "LEAD":
             az, el = lead_point(obs, 1.0)
-            return aim_action(obs, az, el)
+            return pursuit_action(obs, az, el)
         if primitive == "LAG":
             az, el = lead_point(obs, -0.6)
-            return aim_action(obs, az, el)
+            return pursuit_action(obs, az, el)
         if primitive == "BREAK":
             return self._break(obs)
         if primitive == "SPLIT_S":
@@ -863,13 +981,24 @@ class TacticalAgent:
         # 能量型只有 Ps 还为正时才爬升，否则先平飞把速度补回来。
         if self.energy_pref >= 0.5 and obs.own_ps_level <= 5.0:
             el_target = min(el_target, math.radians(2.0))
-        return aim_action(
+        # 爬升目标按 3°/s 平滑跟随：Ps 在门限附近每拍翻转时，原来会让俯仰
+        # 指令在 2° 与 12° 之间整档跳变，飞机会一直点头。
+        step = math.radians(3.0) * self.dt
+        self._open_climb_cur += clamp(
+            el_target - self._open_climb_cur, -step, step
+        )
+        act = aim_action(
             obs,
             obs.off_az + self._open_side * self._open_offset,
-            el_target - obs.own_gamma,
-            gain=1.8,
+            self._open_climb_cur - obs.own_gamma,
+            gain=1.2,
             throttle=self._open_throttle,
         )
+        # 占位只是“摆好接近角度”，不需要压大坡度、拉高过载。原来一开局就
+        # 8 g 拉起来再掉回去，观感上就是两架飞机不停抖姿态。
+        act.bank = clamp(act.bank, -0.35, 0.35)
+        act.n = clamp(act.n, 0.6, 2.2)
+        return act
 
     # ---------- 对头抢位与高 G 机动（任务1/2） ----------
 
@@ -916,7 +1045,11 @@ class TacticalAgent:
     def _high_g_turn(self, obs: Observation) -> Action:
         """高 G 转弯（进攻）：角点速度附近拉满瞬时过载抢角度。"""
         n = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
-        return turn_action(obs, self._turn_sign, n, el=math.radians(2.0))
+        act = turn_action(obs, self._turn_sign, n, el=math.radians(2.0))
+        # turn_action 的水平转弯率按 0.9×可用过载收敛；高 G 原语要真正拉满，
+        # 否则指令 8 g 实际只有 7 g 出头，HUD 上看起来仍是普通盘旋。
+        act.n = max(1.0, min(n, obs.own_n_avail))
+        return act
 
     def _high_g_break(self, obs: Observation) -> Action:
         """高 G 急转（防御）：最大瞬时过载拉满，略微下压保持速度。"""
@@ -1073,7 +1206,13 @@ class TacticalAgent:
     def _extend(self, obs: Observation) -> Action:
         """脱离：掉头背离对手，满油门拉开距离。"""
         away = wrap_pi(obs.los_az + math.pi - obs.own_psi)
-        return aim_action(obs, away, -0.6 * obs.own_gamma, gain=1.6)
+        act = aim_action(obs, away, math.radians(-5.0) - obs.own_gamma, gain=1.3)
+        # 脱离用能长期维持的过载，航迹角只压到略低于水平。原来不做限制，
+        # 大坡度掉头时会先拉 7 g 把速度换成高度，再挂着机头慢慢掉回来，
+        # 看起来就是“逃跑时不断爬升、同时掉速”。
+        cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.15, 2.0)), 1.0)
+        act.n = min(act.n, cap)
+        return act
 
     def _crank(self, obs: Observation) -> Action:
         """偏置（CRANK）：把目标压在机头约 40°，保持照射同时拉开横向距离。

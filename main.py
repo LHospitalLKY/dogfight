@@ -109,7 +109,11 @@ SU57_SPEC = AircraftSpec(
     rounds_per_sec=25.0, length=20.1,
     # AL-41F1 的 3D 矢量喷口：低速大迎角下补充舵面权限，
     # 可维持 55° 过失速迎角，对应眼镜蛇这类机动。
+    # 喷流吹过机翼还带来约 0.30 的等效 CL 增量（按油门/加力开度缩放），
+    # 使盘旋可用升力上限从 CL≈1.50 抬到 ≈1.80，最小回旋半径明显小于
+    # 同参数的常规喷口机型——这是矢量推进在近距格斗里的主要收益。
     tvc=math.radians(15.0), tvc_alpha_max=math.radians(55.0),
+    tvc_cl_bonus=0.30,
     missile=R73, missile_count=4,
     radar_missile=R77_1, radar_missile_count=2,
     # Su-57 的干扰物：3 组 UV-50-01 发射器（每组 14 发 50 mm 弹），
