@@ -23,6 +23,8 @@ MAX_GAMMA_DOT = math.radians(20.0)
 ZOOM_ALLOWANCE = math.radians(25.0)
 GAMMA_CAP = math.radians(55.0)
 GAMMA_FLOOR = math.radians(-60.0)
+# 倒扣滚转指令：Action.bank 以 MAX_BANK(80°) 为单位，倒扣需要 180°/80°。
+BANK_INVERT = math.pi / MAX_BANK
 
 # ---------- 人体过载耐受模型 ----------
 # 飞行员在抗荷服 + 抗荷动作下可以长期承受约 6 g，短时（数秒）极限约 9 g；
@@ -44,9 +46,26 @@ HIGH_G_N = 8.0
 # “高 G 机动”只会变成一次普通盘旋（12 km、200 m/s 时 Su-57 只能拉 3.4 g），
 # 既抢不到角度又把能量抽干。此时宁可维持普通追逐，等速度涨起来再拉。
 HIGH_G_MIN_AVAIL = 6.5
+# 筋斗/殷麦曼的过载上限：全程 7–8 g 会把动能抽干，末段只能挂在高迎角上
+# 慢慢掉头。按 6.5 g 左右做完，速度还能留在可用区间，动作也更像标准机动。
+VERTICAL_N = 6.5
 # 防御转向反转的时间门槛：威胁持续位于反侧超过该时长才换向。
 # 否则每次重新进入防御原语都会按瞬时方位翻一次，形成“无收益的反向机动”。
 DEF_REVERSE_TIME = 1.5
+# 垂直机动：需要连续数秒的滚转/拉杆才能完成，不能被最短驻留时间打断，
+# 否则画面里只会看到一次莫名其妙的摆翼，然后标签就被换掉。
+VERTICAL = frozenset((
+    "SPLIT_S", "HIGH_G_SPLIT_S", "IMMELMANN", "LOOP",
+    "BARREL", "HIGH_G_BARREL",
+))
+# 盘旋类原语：把机头拉到 80° 坡度需要约 1.5 s，最短驻留若只有 0.7 s，
+# 刚滚一半就被切走，下一次若转向侧相反又要反向滚 140°，画面里就成了
+# “回旋时一直在抖”。这类原语给更长的驻留时间，让每个转弯真正做出来。
+TURNING = frozenset((
+    "LEAD_TURN", "ONE_CIRCLE", "TWO_CIRCLE", "HIGH_G_TURN",
+    "BREAK", "HIGH_G_BREAK", "BEAM",
+))
+TURN_HOLD = 2.0
 
 
 def aim_action(
@@ -80,13 +99,19 @@ def aim_action(
     b = v * cg * psi_dot / G                # 水平方向升力分量
     n = math.hypot(a, b)
     phi = math.atan2(b, a)
+    # 坡度最多到 86°，与 level_turn 一致。Action.bank 的 ±1 只是 80°，而
+    # 8 g 的协调转弯本来就需要 acos(1/n)≈83°：若把坡度截在 80°，n·cosφ
+    # 会比竖直需求多出约 1.4 g，飞机在急转/横转里就会一路爬升，看上去
+    # 是“策略一转弯就莫名冲高”，到升限再被强制 UNLOAD。
+    phi = clamp(phi, -math.radians(86.0), math.radians(86.0))
     # 先滚转、后拉杆：大坡度转向时若一上来就拉满过载，滚入的一两秒里升力
     # 仍主要在竖直方向，飞机会先被拉起来，等坡度到位再掉回去。追尾、脱离
     # 这类动作里就表现为“莫名其妙抬升高度、同时又掉速”。
     if abs(phi) - abs(obs.own_bank) > math.radians(30.0):
         n = min(n, 1.6)
     return Action(
-        bank=clamp(phi / MAX_BANK, -1.0, 1.0),
+        bank=clamp(phi / MAX_BANK, -math.radians(86.0) / MAX_BANK,
+                   math.radians(86.0) / MAX_BANK),
         n=n,
         throttle=throttle,
         fire=obs.in_gun_cone,
@@ -168,6 +193,95 @@ def turn_action(
     return act
 
 
+def heading_turn(
+    obs: Observation,
+    heading_error: float,
+    gain: float = 0.35,
+    max_rate_deg: float = 3.0,
+    gamma_target: float = 0.0,
+    throttle: float = 1.0,
+) -> Action:
+    """按航向误差做“比例式”转弯：坡度随误差连续变化，过零时不跳变。
+
+    aim_action 用大方位误差把转弯率顶到当前可用上限，适合“尽快把机头转
+    过去”的抢位动作；但用于 CRANK / 三九下高 / F-pole 这类“保持某个偏置
+    航向”的动作时，它会以 16°/s 的最大角速度冲过目标偏置，误差反号后再
+    反向满坡度，物理上要 1.5 s 滚转才能跟上，于是形成周期 2–3 s 的左右
+    摆振（观感就是回旋时机体发抖）。
+
+    这里先对期望转弯率限幅（默认 3°/s），再由 tanφ = v·ψ̇/G 反解坡度：
+    绕速度矢量的协调转弯满足 n·sinφ = v·ψ̇·cosγ/G、n·cosφ = a，
+    因此坡度与转弯率一一对应，误差变小坡度就自动变小，不会过冲。
+    """
+    v = max(obs.own_speed, 40.0)
+    psi_dot = clamp(
+        heading_error * gain,
+        -math.radians(max_rate_deg), math.radians(max_rate_deg),
+    )
+    phi = math.atan2(v * psi_dot, G)
+    # γ 与目标不一致时，用欠载/过载把航迹角拉过去（下降时允许短暂卸载）。
+    gd = clamp((gamma_target - obs.own_gamma) * 1.2,
+               -math.radians(6.0), math.radians(6.0))
+    a = max(math.cos(obs.own_gamma) + v * gd / G, 0.15)
+    n = max(a / max(math.cos(phi), 0.15), 0.2)
+    # 先滚转、后拉杆：坡度还没到位时不要拉满过载，否则会先把飞机拽起来。
+    if abs(phi) - abs(obs.own_bank) > math.radians(25.0):
+        n = min(n, 1.6)
+    return Action(
+        bank=clamp(phi / MAX_BANK, -1.0, 1.0),
+        n=n,
+        throttle=throttle,
+        fire=obs.in_gun_cone,
+    )
+
+
+def level_turn(
+    obs: Observation,
+    sign: float,
+    n_level: float,
+    gamma_target: float = 0.0,
+    throttle: float = 1.0,
+) -> Action:
+    """以指定过载做协调转弯，同时保持目标航迹角。
+
+    aim_action 用 atan2(b, a) 反解坡度，其中 a = cosγ + v·γ̇/G 是“竖直方向
+    需要的升力分量”。盘旋时只想保持航迹角，a 会接近 0：坡度被推到 ±90°，
+    而且俯仰误差的符号一反转，a 就变号，坡度整档从 +80° 翻到 −80°——
+    这正是回旋时飞机左右摇摆、机体抖动的原因，也让“盘旋/急转”看起来
+    像在乱滚。这里改按几何关系直接求解坡度：绕速度矢量的协调转弯必须满足
+
+        n·cosφ = cosγ + v·γ̇/G
+
+    由此反解 φ，动作与原语名称就一一对应（急转就是稳定的最大过载盘旋）。
+    """
+    v = max(obs.own_speed, 40.0)
+    n_level = max(n_level, 1.0)
+    gd = clamp((gamma_target - obs.own_gamma) * 2.0,
+               -MAX_GAMMA_DOT, MAX_GAMMA_DOT)
+    vert = (math.cos(obs.own_gamma) + v * gd / G) / n_level
+    phi = math.acos(clamp(vert, -1.0, 1.0))
+    # 超过 86° 坡度基本等于倒扣，普通盘旋不需要，也避免指令越过倒扣边界。
+    phi = min(phi, math.radians(86.0))
+    # 坡度还没滚到位时先只给 1.6 g：此时升力主要仍指向上方，直接拉 8 g
+    # 会先把飞机整体拽起来，等坡度到位再落回去——观感就是盘旋时莫名爬升、
+    # 随后又掉头下压。先滚转、后拉杆，轨迹才是稳定高度上的圆。
+    n_cmd = n_level
+    bank_err = wrap_pi(-sign * phi - obs.own_bank)
+    # 坡度还没滚到位时按误差连续减小过载。原来用 25° 的硬门限整档切换
+    # 1.6 g / n_level，坡度贴着门限时每 0.1 s 来回跳，机体就一直在点头。
+    roll_in = clamp(
+        (math.radians(30.0) - abs(bank_err)) / math.radians(20.0), 0.0, 1.0
+    )
+    n_cmd = max(1.6, n_level * roll_in)
+    return Action(
+        bank=clamp(sign * phi / MAX_BANK, -math.radians(86.0) / MAX_BANK,
+                   math.radians(86.0) / MAX_BANK),
+        n=n_cmd,
+        throttle=throttle,
+        fire=obs.in_gun_cone,
+    )
+
+
 class PurePursuit:
     """M1 基线保留：机头死盯目标，作为战术层的对照。"""
 
@@ -242,7 +356,7 @@ class TacticalAgent:
     # 垂直机动（高/低悠悠）要拉几秒才能把速度换成高度再压回来，
     # 0.7 s 就被切掉等于白做完一个半程机动，反而白掉能量。
     YOYO_HOLD = 2.0
-    SCISSOR_PERIOD = 1.4
+    SCISSOR_PERIOD = 2.2
     LOW_ENERGY_FRAC = 1.55   # 速度低于 1.55 倍当地失速即进入能量保护
     N_MARGIN = 1.25          # 允许短时超出维持过载的倍数，其余能量透支被禁止
     MISSILE_EVADE_DIST = 9000.0  # 来袭格斗弹进入该距离就开始规避
@@ -250,7 +364,7 @@ class TacticalAgent:
     MISSILE_BREAK_DIST = 4500.0  # 更远时用能量友好的横转/俯冲拉长 F-pole
     COBRA_DIST = 1800.0          # 矢量喷口机型的过失速反制距离：来弹贴脸才用
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
-    OPENING_DIST = 5000.0        # 开局占位阶段：距离大于该值时不直冲对头
+    OPENING_DIST = 20000.0       # 开局占位阶段：距离大于该值时不直冲对头
     MERGE_START = 5000.0     # 进入该距离开始领先转弯，抢交汇角度
     # 交汇方案在贴身盘旋阶段的保持距离。取 2200 而不是 1800，
     # 是为了让“保持方案”和停用的距离门限错开，避免在门限上每拍翻转转向侧。
@@ -294,11 +408,15 @@ class TacticalAgent:
             self._open_offset = math.radians(self._rng.uniform(9.0, 18.0))
             self._open_climb = math.radians(self._rng.uniform(-5.0, 3.0))
             self._open_throttle = self._rng.uniform(0.95, 1.0)
+            # 占位段的净爬升预算：角度型几乎不爬，避免背着高度优势浪费动能。
+            self._open_climb_gain = self._rng.uniform(0.0, 300.0)
         else:
             # 能量型（Su-57）：偏置小、爬升存能量，留给交汇后的垂直机动。
             self._open_offset = math.radians(self._rng.uniform(5.0, 13.0))
             self._open_climb = math.radians(self._rng.uniform(0.0, 12.0))
             self._open_throttle = self._rng.uniform(0.85, 1.0)
+            # 48 km 的接近段最多只换取 0.5–1.2 km 高度。
+            self._open_climb_gain = self._rng.uniform(500.0, 1200.0)
 
         self.primitive = "PURE"
         self.situation = ""
@@ -314,13 +432,28 @@ class TacticalAgent:
         # 开局爬升目标的当前值：以有限速率逼近 _open_climb，避免 Ps 在门限
         # 附近抖动时把俯仰指令整档切换。
         self._open_climb_cur = 0.0
+        self._open_alt0: float | None = None
         self._far = False
+
+        # 垂直机动的分段标记：过顶/俯冲是否已经越过关键点，以及本次机动
+        # 是否已经做完（做完才允许被其它原语接管）。
+        self._dived = False
+        self._maneuver_done = True
+        # 高/低 Yo-Yo 做完后的冷却：旧实现每 2.2 s 循环一次且净爬升，
+        # 一路把飞机顶到能量升限，之后只能被强制 UNLOAD。
+        self._yoyo_cd = 0.0
+        # 本次 Yo-Yo 的抬升/俯冲目标与俯冲卸载量：进入时按当时的态势定一次，
+        # 之后不再随距离变化重算，否则边做边改目标会把动作做半截。
+        self._yoyo_goal: float | None = None
+        self._yoyo_t = 1.2      # 高 Yo-Yo 拉起到目标角的时间预算 s
+        self._yoyo_n = 0.35     # 低 Yo-Yo 俯冲段的卸载过载
 
         # 交汇抢位方案：转向侧、单环/双环、以及方案剩余保持时间。
         self._merge_sign = 1.0
         self._merge_plan = ""
         self._plan_ttl = 0.0
         self._turn_sign = 1.0
+        self._turn_locked = False
 
         # 人体过载耐受状态：0=完全恢复，1=到达耐受极限（G-LOC 边界）。
         self.g_load = 0.0
@@ -333,10 +466,17 @@ class TacticalAgent:
 
     def act(self, obs: Observation) -> Action:
         self._update_g_tolerance(obs)
+        self._yoyo_cd = max(self._yoyo_cd - self.dt, 0.0)
         # 防御转向的连续性：威胁只在持续位于反侧时才换向，避免“一进防御就反转”。
+        # 方位接近 ±180°（威胁正在正后方）时两侧完全等价，而 wrap 会让符号
+        # 在边界上每拍翻转——若把它也算进计时，防御动作会每 1.5 s 反向滚
+        # 140°，看上去就是在抖。这种情况直接保持当前转向侧。
         if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
             az = obs.incoming_missile_az
-            if az * self._def_sign < 0.0 and abs(az) > math.radians(60.0):
+            if (
+                az * self._def_sign < 0.0
+                and math.radians(60.0) < abs(az) < math.radians(150.0)
+            ):
                 self._def_reverse_t += self.dt
             else:
                 self._def_reverse_t = 0.0
@@ -367,15 +507,25 @@ class TacticalAgent:
             self._make_merge_plan(obs)
 
         want = self._sticky_defense(self._choose(sit, obs))
-        # 安全与防御类原语可立即抢占，不受最短驻留时间限制。
-        emergency = (
-            "RECOVER", "POSITION", "BEAM", "BREAK", "SPLIT_S",
-            "BARREL", "SCISSORS", "IMMELMANN", "LOOP",
-            "CRANK", "NOTCH_DESC", "F_POLE", "COBRA",
-            "LEAD_TURN", "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
+        # 垂直机动必须做完：破 S / 殷麦曼 / 筋斗 / 桶滚都依赖连续几秒的
+        # 滚转 + 拉杆，被 0.7 s 的最短驻留切走就只剩一次莫名其妙的摆翼。
+        # 只有边界/能量这类安全原语可以打断；超时兜底防止卡在某个分段。
+        if self.primitive in VERTICAL:
+            if self._phase_t >= 10.0:
+                self._maneuver_done = True
+            if not self._maneuver_done and want not in ("RECOVER", "UNLOAD"):
+                want = self.primitive
+        # 只有安全类（回场/卸载）与“转入防御”可以立即抢占。
+        # 旧实现把防御原语本身也放进可抢占集合，于是“防御→进攻→防御”
+        # 每 0.1 s 都能整档切换：破 S 只飞了两个决策周期就被换回平盘，
+        # 屏幕上标着破 S、实际却是平飞；盘旋类原语也会被反向滚 140° 打断。
+        emergency = ("RECOVER", "UNLOAD")
+        bypass = want in emergency or (
+            want in self.DEFENSE_SET and self.primitive not in self.DEFENSE_SET
         )
-        bypass = want in emergency or self.primitive in emergency
         need = self.YOYO_HOLD if self.primitive in ("HIGH_YOYO", "LOW_YOYO") else self.MIN_HOLD
+        if self.primitive in TURNING:
+            need = max(need, TURN_HOLD)
         if want != self.primitive and (self._hold >= need or bypass):
             self._enter(want, obs)
 
@@ -471,12 +621,17 @@ class TacticalAgent:
         # 安全优先：贴着边界或高度上下限时先回场。
         # 转弯半径随速度平方增长，所以边界余量按速度缩放，避免高速时来不及转回。
         edge_need = max(900.0, 8.0 * obs.own_speed)
-        if obs.edge_margin < edge_need or obs.z_margin_low < 600.0 or obs.z_margin_high < 600.0:
+        low_need = max(1200.0, 3.5 * obs.own_speed)
+        if (
+            obs.edge_margin < edge_need
+            or obs.z_margin_low < low_need
+            or obs.z_margin_high < 600.0
+        ):
             return "RECOVER"
         # 眼镜蛇是瞬态机动：机头拉到极限迎角后必须立刻改出，否则会变成
         # 挂在高迎角上持续爬升，速度被抽干、反而成了靶子。
         if self.primitive == "COBRA" and self._phase_t > 1.5:
-            return "SPLIT_S" if obs.z_margin_low > 1200.0 else "BREAK"
+            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
         # 规避过程中仍要守住能量：机头已经高高抬起、速度又不够时，
         # 继续压坡度拉过载只会变成爬升耗能，先俯冲把航迹角压下来。
         if (
@@ -484,7 +639,8 @@ class TacticalAgent:
             and obs.own_gamma > math.radians(25.0)
             and obs.own_speed_frac < 1.70
         ):
-            return "SPLIT_S"
+            # 破 S 会掉近 2 km 高度，低空时再做就是直接扎地。
+            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
         # 只有进入近距才用最大过载急转硬甩。
         # 雷达制导中距弹（含主动弹）在超视距阶段就要开始偏置/横转；
@@ -582,7 +738,11 @@ class TacticalAgent:
                 return "ONE_CIRCLE"
             if self._merge_plan == "TWO_CIRCLE":
                 return "TWO_CIRCLE"
-            if sit.e_adv > 0.0 and self.energy_pref >= 0.5:
+            if (
+                sit.e_adv > 0.0
+                and self.energy_pref >= 0.5
+                and self._yoyo_cd <= 0.0
+            ):
                 return "HIGH_YOYO"
             return "LEAD" if self.aggression > 0.6 else "BREAK"
 
@@ -634,9 +794,19 @@ class TacticalAgent:
         if sit.close:
             high_ok = obs.own_ps_level > 5.0 and obs.z_margin_high > 4000.0
             low_ok = obs.z_margin_low > 1200.0
-            if obs.own_speed_frac > 1.7 and self.energy_pref >= 0.5 and high_ok:
+            if (
+                obs.own_speed_frac > 1.7
+                and self.energy_pref >= 0.5
+                and high_ok
+                and self._yoyo_cd <= 0.0
+            ):
                 return "HIGH_YOYO"      # 太快：把多余速度换成高度
-            if obs.own_speed_frac < 1.5 and self.energy_pref < 0.5 and low_ok:
+            if (
+                obs.own_speed_frac < 1.5
+                and self.energy_pref < 0.5
+                and low_ok
+                and self._yoyo_cd <= 0.0
+            ):
                 return "LOW_YOYO"       # 太慢：俯冲增速再拉起
         if sit.angle < math.radians(25.0):
             return "LEAD" if not sit.far else "PURE"
@@ -732,7 +902,7 @@ class TacticalAgent:
         保持横转并做高 G 修正 → 近距才切硬甩。
         """
         if obs.own_speed_frac < self.LOW_ENERGY_FRAC:
-            return "SPLIT_S" if obs.z_margin_low > 1200.0 else "BREAK"
+            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
         if vs_missile:
             ttg = obs.incoming_missile_ttg
             if ttg > 7.0:
@@ -758,10 +928,11 @@ class TacticalAgent:
                 and obs.own_n_avail >= HIGH_G_MIN_AVAIL
             )
             if primitive in ("HIGH_G_SPLIT_S", "HIGH_G_BARREL"):
-                ok = ok and obs.z_margin_low > 600.0
+                # 高 G 破 S 同样要近 2 km 的掉高空间；
+                ok = ok and obs.z_margin_low > 2200.0
             return ok
         if primitive == "SPLIT_S":
-            return obs.z_margin_low > 1200.0 and obs.own_speed_frac > 1.35
+            return obs.z_margin_low > 2400.0 and obs.own_speed_frac > 1.35
         if primitive == "BARREL":
             return obs.own_speed_frac > 1.35
         if primitive == "SCISSORS":
@@ -830,6 +1001,11 @@ class TacticalAgent:
         self._hold = 0.0
         self._phase = 0
         self._phase_t = 0.0
+        # 分段状态每次进入都要重置，否则上一次破 S 的 _dived 会漏进来。
+        self._dived = False
+        self._maneuver_done = primitive not in VERTICAL
+        if primitive == "POSITION":
+            self._open_alt0 = None
         # 防御转向只在本次威胁的第一次防御动作时定一次侧：取威胁所在的一侧。
         # 之后由 act() 的计时器统一维护，只在威胁持续位于反侧 1.5 s 才换向。
         # 原来“每次进入防御都按瞬时方位重算”，在盘旋缠斗里方位角常年超过
@@ -840,25 +1016,33 @@ class TacticalAgent:
             "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
         ) and not self._def_engaged:
             self._def_engaged = True
-            az = (
-                obs.incoming_missile_az
-                if obs.incoming_missile_dist < self.SARH_EVADE_DIST
-                else obs.off_az
-            )
-            self._def_sign = 1.0 if az >= 0.0 else -1.0
+            if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+                self._def_sign = 1.0 if obs.incoming_missile_az >= 0.0 else -1.0
+            else:
+                # 没有来袭弹时（战斗机动/被锁定的横转），转向侧跟随本次
+                # 缠斗的既定转向侧。原来按瞬时方位重算，会和进攻盘旋的
+                # 转向侧相反，于是“盘旋一下、急转一下”每次都要反向滚
+                # 140°，画面里就是机体一直在左右摇摆。
+                self._def_sign = self._turn_sign
             self._def_reverse_t = 0.0
         if primitive in (
             "LEAD_TURN", "ONE_CIRCLE", "TWO_CIRCLE", "HIGH_G_TURN",
         ):
-            # 抢位转向在进入时锁定：交汇前方位角很小，直接用当前方位会抖动。
-            if abs(obs.off_az) < math.radians(20.0):
+            # 转侧只在第一次进入盘旋时定一次；之后由 act() 的换向计时器
+            # 维护（威胁/目标持续位于反侧 1.5 s 才换向）。交汇方案有效时
+            # 直接沿用方案侧，避免贴身盘旋里每换一次原语就反向滚一次。
+            if self._merge_plan and self._plan_ttl > 0.0:
                 self._turn_sign = self._merge_sign
-            else:
+                self._turn_locked = True
+            elif not self._turn_locked:
                 self._turn_sign = 1.0 if obs.off_az >= 0.0 else -1.0
+                self._turn_locked = True
         if primitive == "SCISSORS":
             # 初始剪刀方向跟着威胁走，之后周期性反转。
             self._scissor_sign = 1.0 if obs.off_az >= 0.0 else -1.0
             self._scissor_t = self.SCISSOR_PERIOD
+        if primitive in ("HIGH_YOYO", "LOW_YOYO"):
+            self._yoyo_goal = None
 
     # ---------- 第三层：原语执行 ----------
 
@@ -947,10 +1131,15 @@ class TacticalAgent:
         return aim_action(obs, obs.off_az, obs.off_el)
 
     def _recover(self, obs: Observation) -> Action:
-        """边界/高度安全优先：先转向空域中心，再修正高度。"""
+        """边界/高度安全优先：先转向空域中心，再修正高度。
+
+        低空大俯角时必须先把机头拉起来：只给一个 +12° 的目标航迹角，
+        在 −70° 俯冲里等于没救（飞机在 1 s 内就掉 250 m），会直接撞地。
+        """
         el_target = 0.0
-        if obs.z_margin_low < 600.0:
-            el_target = math.radians(12.0)
+        pull_out = obs.own_gamma < math.radians(-15.0)
+        if obs.z_margin_low < max(1200.0, 3.5 * obs.own_speed):
+            el_target = math.radians(25.0) if pull_out else math.radians(12.0)
         elif obs.z_margin_high < 600.0:
             el_target = math.radians(-12.0)
         return aim_action(
@@ -972,6 +1161,17 @@ class TacticalAgent:
         __init__），因此每次启动的开局几何都不相同，不会固定成一个模板。
         """
         el_target = self._open_climb
+        # 占位爬升要有“天花板”：48 km 的接近段若一直按 12° 爬升，会一路爬到
+        # 能量升限，之后只能被强制 UNLOAD。这里按剩余距离与剩余爬升预算
+        # （最多约 1.2 km）反解目标航迹角，越接近交汇越平，接近段自然改平。
+        if self._open_alt0 is None:
+            self._open_alt0 = obs.own_alt
+        gain_left = self._open_climb_gain - (obs.own_alt - self._open_alt0)
+        if gain_left <= 0.0 or obs.own_alt > 13500.0:
+            el_target = min(el_target, 0.0)
+        else:
+            dist_left = max(obs.dist - self.MERGE_START, 500.0)
+            el_target = min(el_target, math.atan2(gain_left, dist_left))
         # 能量型只有 Ps 还为正时才爬升，否则先平飞把速度补回来。
         if self.energy_pref >= 0.5 and obs.own_ps_level <= 5.0:
             el_target = min(el_target, math.radians(2.0))
@@ -991,7 +1191,12 @@ class TacticalAgent:
         # 占位只是“摆好接近角度”，不需要压大坡度、拉高过载。原来一开局就
         # 8 g 拉起来再掉回去，观感上就是两架飞机不停抖姿态。
         act.bank = clamp(act.bank, -0.35, 0.35)
-        act.n = clamp(act.n, 0.6, 2.2)
+        # 坡度被限幅后必须同步压低过载：aim_action 是按未限幅的坡度反解的，
+        # 直接沿用它的 n，n·cosφ（φ 已被截到 28°）会多出接近 1 g 的竖直分量，
+        # 飞机就会在占位段以 2°/s 一路爬升，几十秒后冲到升限被迫 UNLOAD。
+        phi_act = abs(act.bank) * MAX_BANK
+        n_hold = math.cos(self._open_climb_cur) / max(math.cos(phi_act), 0.2)
+        act.n = clamp(min(act.n, n_hold + 0.10), 0.6, 2.2)
         return act
 
     # ---------- 对头抢位与高 G 机动（任务1/2） ----------
@@ -1022,7 +1227,7 @@ class TacticalAgent:
         从而先于对手构成射击条件。转向侧在进入时已锁定。
         """
         n = min(obs.own_n_avail, self.n_pos_tol)
-        return turn_action(obs, self._turn_sign, n, el=0.0)
+        return level_turn(obs, self._turn_sign, n, gamma_target=0.0)
 
     def _circle(self, obs: Observation, plan: str) -> Action:
         """单环 / 双环的选择执行。
@@ -1032,43 +1237,29 @@ class TacticalAgent:
         """
         if plan == "ONE_CIRCLE":
             n = min(obs.own_n_avail, self.n_pos_tol)
-            return turn_action(obs, self._turn_sign, n, el=math.radians(3.0))
+            return level_turn(obs, self._turn_sign, n, gamma_target=0.0)
         n = min(max(obs.own_n_sustain * 1.10, 2.0), self.n_pos_tol, G_SUSTAIN)
-        return turn_action(obs, self._turn_sign, n, el=math.radians(-2.0))
+        return level_turn(obs, self._turn_sign, n, gamma_target=math.radians(-2.0))
 
     def _high_g_turn(self, obs: Observation) -> Action:
         """高 G 转弯（进攻）：角点速度附近拉满瞬时过载抢角度。"""
         n = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
-        act = turn_action(obs, self._turn_sign, n, el=math.radians(2.0))
-        # turn_action 的水平转弯率按 0.9×可用过载收敛；高 G 原语要真正拉满，
-        # 否则指令 8 g 实际只有 7 g 出头，HUD 上看起来仍是普通盘旋。
-        act.n = max(1.0, min(n, obs.own_n_avail))
-        return act
+        return level_turn(obs, self._turn_sign, n, gamma_target=0.0)
 
     def _high_g_break(self, obs: Observation) -> Action:
         """高 G 急转（防御）：最大瞬时过载拉满，略微下压保持速度。"""
         n = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
-        return turn_action(obs, self._def_sign, n, el=math.radians(-5.0))
+        return level_turn(obs, self._def_sign, n, gamma_target=math.radians(-4.0))
 
     def _high_g_split_s(self, obs: Observation) -> Action:
         """高 G 破 S：滚转倒扣后拉满过载俯冲，快速掉高度换速度并转向。"""
         n = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
-        if self._phase == 0:
-            if self._phase_t >= 0.5:
-                self._phase, self._phase_t = 1, 0.0
-            return Action(bank=self._def_sign, n=1.2, throttle=1.0, fire=False)
-        act = aim_action(
-            obs, self._def_sign * math.radians(120.0),
-            math.radians(-35.0) - obs.own_gamma, gain=3.0,
-        )
-        act.n = max(1.0, min(n, act.n))
-        return act
+        return self._split_s_impl(obs, n)
 
     def _high_g_barrel(self, obs: Observation) -> Action:
-        """高 G 载重滚转：拉满过载的同时滚转，形成高 G 螺旋下降。"""
+        """高 G 载重滚转：拉满过载的同时连续滚转，形成高 G 螺旋下降。"""
         n = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
-        bank = self._def_sign * 0.9 * math.sin(self._phase_t * 2.0 * math.pi / 2.0)
-        return Action(bank=bank, n=max(1.0, n * 0.9), throttle=1.0, fire=False)
+        return self._barrel_impl(n, period=3.2)
 
     def _level_cap(self, obs: Observation, frac: float = 1.0) -> float:
         """维持当前航迹角所需的过载上限。
@@ -1081,145 +1272,243 @@ class TacticalAgent:
 
     def _break(self, obs: Observation) -> Action:
         """最大过载急转，方向在进入时锁定，同时略微下压保持速度。"""
-        n = max(1.0, min(obs.own_n_avail, self._level_cap(obs, 0.95)))
-        return Action(bank=self._def_sign, n=n, throttle=1.0, fire=obs.in_gun_cone)
+        n = min(obs.own_n_avail, self.n_pos_tol)
+        return level_turn(obs, self._def_sign, n, gamma_target=math.radians(-4.0))
 
     def _beam(self, obs: Observation) -> Action:
         """被锁定后的横转：向锁定一侧压坡度，把对方甩到视场边缘。"""
-        n = max(1.0, min(obs.own_n_avail * 0.95, self._level_cap(obs, 0.90)))
-        return Action(
-            bank=self._def_sign,
-            n=n,
-            throttle=1.0,
-            fire=False,
-        )
+        n = min(obs.own_n_avail * 0.95, self.n_pos_tol)
+        return level_turn(obs, self._def_sign, n, gamma_target=math.radians(-2.0))
 
     def _split_s(self, obs: Observation) -> Action:
-        """半滚倒转：先滚成倒扣，再拉杆经垂直向下改出到反向航向。
+        """半滚倒转：先滚成倒扣，再拉杆经垂直向下改出到反向航向。"""
+        n = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK)
+        return self._split_s_impl(obs, n)
 
-        旧实现只是“压坡度推杆俯冲”，航迹角永远越不过 −40°，本质上是一次
-        俯冲逃逸。现在倒扣后仍给正过载：倒飞时升力朝下，n>0 才能让航迹角
-        真正转过 −90° 并完成 180° 转向。
+    def _split_s_impl(self, obs: Observation, n_max: float) -> Action:
+        """破 S 标准三段：半滚倒扣 → 副翼中立拉杆过垂直 → 拉平改出。
+
+        旧实现只把坡度命令到 80°（Action.bank=±1 的满刻度），从来没有真正
+        倒扣：之后所谓的“拉杆”只是一个大坡度平飞盘旋，看上去就是平飞转向。
+        现在第一段直接命令到 180° 倒扣，第二段用 roll_free 让机体在垂直面内
+        连续下俯（否则内回路会把滚转角拽回地平线、根本过不了垂直）。
+        用 own_gamma（asin 表示，±90°）判段：越过 −70° 后再回到 0 附近，
+        说明半圈已经拉完，机头回到水平、航向反转。
         """
         sign = self._def_sign
         if self._phase == 0:
-            # 滚转到位（含符号），期间不拉杆以免把坡度带成爬升。
-            if abs(obs.own_bank) >= math.radians(150.0) or self._phase_t >= 1.2:
+            # 半滚倒扣：滚到机腹朝上，期间不拉杆，避免滚入过程变成爬升。
+            if abs(obs.own_bank) >= math.radians(160.0) or self._phase_t >= 4.5:
                 self._phase, self._phase_t = 1, 0.0
-            return Action(bank=sign, n=1.0, throttle=1.0, fire=False)
-        n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
+                self._dived = False
+            return Action(bank=sign * BANK_INVERT, n=1.0, throttle=1.0, fire=False)
         if self._phase == 1:
-            if obs.own_gamma <= math.radians(-55.0) or self._phase_t >= 3.0:
+            if obs.own_gamma <= math.radians(-70.0):
+                self._dived = True
+            if self._dived and abs(obs.own_gamma) < math.radians(18.0):
                 self._phase, self._phase_t = 2, 0.0
-            return Action(bank=sign, n=n, throttle=1.0, fire=False)
-        # 改出：过了垂直向下就把航迹拉回水平，坡度回到翼平。
-        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6, throttle=0.6)
+            return Action(bank=0.0, n=n_max, throttle=1.0, fire=False,
+                          roll_free=True)
+        # 改出：坡度归零、航迹拉平，确认回到平飞后结束整个机动。
+        if abs(obs.own_gamma) < math.radians(8.0) and abs(obs.own_bank) < math.radians(30.0):
+            self._maneuver_done = True
+        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6, throttle=0.9)
 
-    def _barrel(self, obs: Observation) -> Action:
-        """防御性滚筒：滚转角在小幅范围内摆动，形成螺旋规避航迹。
+    def _barrel_impl(self, n_max: float, period: float) -> Action:
+        """桶滚：绕速度矢量连续滚转 360°，航迹画成螺旋。
 
-        幅度和过载都刻意压低：3DOF/6DOF 里当坡度摆回接近翼平而仍在
-        拉正过载时，飞机会直接变成爬升，连续滚筒会把能量抽干。
+        原来用 sin() 让坡度在小范围内来回摆，实际是“左右摇翅膀”，既不像
+        桶滚也躲不开导弹。这里直接给滚转角速度，配合持续正过载，机体在
+        滚转中把航迹拉成螺旋，才是标准防御桶滚。
         """
-        sign = self._def_sign
-        bank = sign * 0.65 * math.sin(self._phase_t * 2.0 * math.pi / 2.4)
-        n = min(
-            max(obs.own_n_avail * 0.5, 2.0),
-            self._level_cap(obs, 0.90),
-        )
+        if self._phase_t >= period:
+            self._maneuver_done = True
         return Action(
-            bank=bank,
-            n=n,
+            bank=0.0,
+            n=n_max,
             throttle=1.0,
             fire=False,
+            roll_rate=self._def_sign * 2.0 * math.pi / period,
         )
 
+    def _barrel(self, obs: Observation) -> Action:
+        """防御性滚筒（标准桶滚）。"""
+        n = min(max(obs.own_n_sustain * 1.15, 2.5), self.n_pos_tol)
+        return self._barrel_impl(n, period=4.2)
+
     def _immelmann(self, obs: Observation) -> Action:
-        """殷麦曼：翼平拉起过顶，倒扣滚转 180°，再拉杆改平并反向。
+        """殷麦曼：拉起半筋斗到倒扣平飞，再半滚改平，航向反转。
 
         旧实现只爬到 γ≈45° 就平转 150°，既没有过顶也没有真正的半滚，
-        在能量上等价于一次大坡度盘旋。现在按真实三段执行：拉起 → 顶部滚转
-        → 拉杆改出（倒扣时正过载会把机头压回水平）。
+        在能量上等价于一次大坡度盘旋。标准殷麦曼是“半个筋斗 + 半个滚转”：
+        拉起（副翼中立）到机头越过顶点、重新回到平飞但机腹朝上，
+        再滚转 180° 翻正，最后小幅度拉平。
+        γ 用 asin 表示（±90°），过顶后会从 +90° 侧回到 0 附近。
         """
-        sign = self._def_sign
+        n = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK, VERTICAL_N)
         if self._phase == 0:
-            if obs.own_gamma >= math.radians(70.0) or self._phase_t >= 2.2:
+            # 拉起：副翼中立，避免内回路在过顶时把滚转角拽回地平线。
+            if obs.own_gamma >= math.radians(70.0):
                 self._phase, self._phase_t = 1, 0.0
-            n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
-            return Action(bank=0.0, n=n, throttle=1.0, fire=False)
+                self._dived = True
+            return Action(bank=0.0, n=n, throttle=1.0, fire=False, roll_free=True)
         if self._phase == 1:
-            # 顶部滚转：把机腹翻到上方，为随后的“拉杆改平”做准备。
-            if abs(obs.own_bank) >= math.radians(150.0) or self._phase_t >= 1.4:
+            # 越过顶点后继续拉，直到机头重新回到水平（此时为倒扣平飞）。
+            if abs(obs.own_gamma) < math.radians(15.0):
                 self._phase, self._phase_t = 2, 0.0
-            return Action(bank=sign, n=1.2, throttle=1.0, fire=False)
-        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.8, throttle=0.8)
+            return Action(bank=0.0, n=n, throttle=1.0, fire=False, roll_free=True)
+        if self._phase == 2:
+            # 半滚翻正：此时机体仍是倒扣（φ≈±180°），要指令回翼平，
+            # 不能再指令到倒扣——那样“已经倒扣”会立刻被判完成，等于没翻。
+            if abs(obs.own_bank) < math.radians(25.0) or self._phase_t >= 4.5:
+                self._phase, self._phase_t = 3, 0.0
+            return Action(bank=0.0, n=1.0, throttle=1.0, fire=False)
+        if abs(obs.own_gamma) < math.radians(8.0):
+            self._maneuver_done = True
+        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6, throttle=0.8)
 
     def _loop(self, obs: Observation) -> Action:
         """内筋斗：翼平持续拉杆，在垂直平面内完成 360° 回转。
 
-        旧实现分三段追目标航迹角（65° → −40° → 0），最多只画了半个圈就
-        退出。现在同向持续拉杆、不再用 _level_cap（它按 cos γ 收过载，正好
-        在过顶时把过载压成 0），航迹角依次越过 +90°、−90° 后改平。
+        机身过顶时必须让滚转自由演化（roll_free），否则内回路会一直把
+        机体往“地平线翼平”方向拧，筋斗会被拉成螺旋。
+        γ（asin 表示）的完整顺序是 +90° → 0（倒扣平飞）→ −90° → 0，
+        据此分四段，最后一段拉平。
         """
         if self._phase == 0:
-            if obs.own_gamma >= math.radians(75.0) or self._phase_t >= 2.5:
+            if obs.own_gamma >= math.radians(75.0) or self._phase_t >= 3.0:
                 self._phase, self._phase_t = 1, 0.0
         elif self._phase == 1:
-            if obs.own_gamma <= math.radians(15.0) or self._phase_t >= 3.0:
+            if abs(obs.own_gamma) <= math.radians(15.0):
                 self._phase, self._phase_t = 2, 0.0
         elif self._phase == 2:
-            if obs.own_gamma <= math.radians(-70.0) or self._phase_t >= 3.0:
+            if obs.own_gamma <= math.radians(-70.0):
                 self._phase, self._phase_t = 3, 0.0
-        if self._phase == 3:
+        if self._phase >= 3:
+            if abs(obs.own_gamma) < math.radians(8.0):
+                self._maneuver_done = True
             return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6)
-        n = max(1.0, min(obs.own_n_avail * 0.9, G_PEAK))
-        return Action(bank=0.0, n=n, throttle=1.0, fire=False)
+        n = max(1.0, min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK, VERTICAL_N))
+        return Action(bank=0.0, n=n, throttle=1.0, fire=False, roll_free=True)
 
     def _scissors(self, obs: Observation) -> Action:
         """滚转剪刀：周期性反向最大过载转弯，逼对手冲过头。"""
         if self._scissor_t <= 0.0:
             self._scissor_sign = -self._scissor_sign
             self._scissor_t = self.SCISSOR_PERIOD
-        return Action(
-            bank=self._scissor_sign,
-            n=obs.own_n_avail * 0.95,
-            throttle=0.9,
-            fire=obs.in_gun_cone,
-        )
+        n = min(obs.own_n_avail * 0.95, self.n_pos_tol)
+        return level_turn(obs, self._scissor_sign, n, throttle=0.9)
+
+    def _yoyo_pull_n(
+        self, obs: Observation, gamma_goal: float, t_pull: float
+    ) -> float:
+        """按“要抬多少度、用多久抬到位”反解过载，而不是写死一个 g。
+
+        需要快速改变指向（接近率大、可能冲过头、机头偏得多）时把时间预算
+        压短，过载自然升高；还在从容跟随时预算放长，只需要很小的正过载，
+        把能量留着换高度。结果仍受可用过载与人体耐受收口。
+        """
+        dgamma = max(gamma_goal - obs.own_gamma, 0.0)
+        v = max(obs.own_speed, 40.0)
+        rate = dgamma / max(t_pull, 0.4)
+        n = math.cos(obs.own_gamma) + v * rate / G
+        return clamp(n, 1.0, min(obs.own_n_avail, self.n_pos_tol))
 
     def _high_yoyo(self, obs: Observation) -> Action:
-        """高 Yo-Yo：先把速度换成高度（爬升角受 Ps 约束），再俯冲重新指向目标。"""
-        if self._phase == 0:
-            if self._phase_t >= 1.2 or obs.own_gamma >= math.radians(28.0):
-                self._phase, self._phase_t = 1, 0.0
-            return aim_action(obs, obs.off_az, math.radians(30.0) - obs.own_gamma)
-        if self._phase_t >= 1.0:
-            self._phase, self._phase_t = 0, 0.0
+        """高 Yo-Yo：接近率过大、快要冲过头时，先把速度换成高度，再从上方
+        压回目标的前置线。
+
+        标准高 Yo-Yo 只在一次追击里做一遍：拉起换高度 → 俯冲把机头压回
+        前置线 → 结束，之后转回普通追逐。抬升量和过载都由态势决定：
+        接近率越大、目标偏角越大，说明越可能冲过头、越需要赶快把机头挪到
+        目标前方，抬得越高、拉得越狠；远距慢速跟随时只做一次轻抬。
+        原来固定 3.2 g 是两头都不对：慢速跟随时白白耗掉速度，高速快
+        冲过头时又抬不起来。
+        """
         az, el = lead_point(obs, 1.0)
-        return aim_action(obs, az, el, gain=1.6, throttle=0.4)
+        if self._phase == 0:
+            if self._yoyo_goal is None:
+                # 接近率归一化：80 m/s 以上按“快要冲过头”处理。
+                closure = clamp(obs.closure / 80.0, 0.0, 1.0)
+                # 机头偏差越大，越需要抬得高一点才挪得回前置线。
+                point = clamp(abs(az) / math.radians(60.0), 0.0, 1.0)
+                ps_climb = math.asin(
+                    clamp(obs.own_ps / max(obs.own_speed, 40.0), -0.95, 0.95)
+                )
+                # 高 Yo-Yo 本来就是拿动能换高度，Ps 允许值之外还要加一段
+                # “速度富余可以 zoom”的额度；否则 9 km、320 m/s 时 Ps 只够
+                # 5°，抬升会被压成一次几乎平飞的小抖动。
+                zoom = (
+                    clamp((obs.own_speed_frac - 1.30) / 0.80, 0.0, 1.0)
+                    * math.radians(28.0)
+                )
+                cap = max(ps_climb, math.radians(5.0)) + zoom
+                self._yoyo_goal = clamp(
+                    math.radians(10.0 + 18.0 * closure + 8.0 * point),
+                    math.radians(6.0), min(cap, GAMMA_CAP),
+                )
+                # 时间预算：贴得越近越拖不起，必须更猛地抬头；远距可以从容拉。
+                self._yoyo_t = clamp(obs.dist / 900.0, 0.8, 2.5)
+            # 方位仍用坡度跟，幅度限在 32° 内，避免高速下零点几度误差就把
+            # 坡度顶到 80°，把高 Yo-Yo 做成一次急转。
+            bank = clamp(az / math.radians(45.0), -0.4, 0.4)
+            n = self._yoyo_pull_n(obs, self._yoyo_goal, self._yoyo_t)
+            if (
+                obs.own_gamma >= self._yoyo_goal - math.radians(2.0)
+                or self._phase_t >= self._yoyo_t + 1.5
+            ):
+                self._phase, self._phase_t = 1, 0.0
+            return Action(bank=bank, n=n, throttle=1.0, fire=False)
+        # 俯冲回收：机头重新压回目标前置线（el≈0）即完成，进入冷却。
+        err = clamp(el, -math.radians(8.0), 0.0)
+        if abs(el) < math.radians(6.0) or self._phase_t >= 3.5:
+            self._maneuver_done = True
+            self._yoyo_cd = 6.0
+        return pursuit_action(obs, az, err, gain=1.2, throttle=0.7)
 
     def _low_yoyo(self, obs: Observation) -> Action:
-        """低 Yo-Yo：先俯冲增速，再拉起抢占角度。"""
+        """低 Yo-Yo：距离拉开、速度不足时，向目标转弯内侧俯冲增速，再把
+        机头拉回前置线，缩短咬尾距离。
+
+        俯冲深度同样按态势给：速度越接近失速、距离越远，越需要狠狠推杆
+        增速（卸载到 0.25 g）；速度还够、只是距离略远时轻压机头即可
+        （0.9 g）。俯冲段同时把机头往目标前置线带，偏角越大坡度越大。
+        原来固定 0.35 g 无坡度俯冲，速度富余时等于白掉高度，方位上也没
+        跟上目标的转弯。
+        """
+        az, el = lead_point(obs, 1.0)
         if self._phase == 0:
-            if self._phase_t >= 0.9 or obs.own_gamma <= math.radians(-22.0):
+            if self._yoyo_goal is None:
+                # 速度越不足、距离越远，越要往深里扎；两者取较大的需求。
+                speed_need = clamp((1.55 - obs.own_speed_frac) / 0.45, 0.0, 1.0)
+                range_need = clamp((obs.dist - 900.0) / 1600.0, 0.0, 1.0)
+                dive = max(speed_need, range_need)
+                self._yoyo_goal = -math.radians(10.0 + 12.0 * dive)
+                # 卸载量：需求越大越接近推杆；0.85 g 只是轻压机头。
+                self._yoyo_n = clamp(0.85 - 0.70 * dive, 0.10, 0.85)
+            bank = clamp(az / math.radians(50.0), -0.45, 0.45)
+            if (
+                obs.own_gamma <= self._yoyo_goal + math.radians(2.0)
+                or self._phase_t >= 5.0
+            ):
                 self._phase, self._phase_t = 1, 0.0
-            return aim_action(
-                obs, obs.off_az, math.radians(-25.0) - obs.own_gamma, throttle=0.35
-            )
-        if self._phase_t >= 1.1:
-            self._phase, self._phase_t = 0, 0.0
-        return aim_action(obs, obs.off_az, obs.off_el, gain=1.8)
+            return Action(bank=bank, n=self._yoyo_n, throttle=0.75, fire=False)
+        err = clamp(el, 0.0, math.radians(8.0))
+        if abs(el) < math.radians(6.0) or self._phase_t >= 3.5:
+            self._maneuver_done = True
+            self._yoyo_cd = 5.0
+        return pursuit_action(obs, az, err, gain=1.2)
 
     def _extend(self, obs: Observation) -> Action:
         """脱离：掉头背离对手，满油门拉开距离。"""
         away = wrap_pi(obs.los_az + math.pi - obs.own_psi)
-        act = aim_action(obs, away, math.radians(-5.0) - obs.own_gamma, gain=1.3)
-        # 脱离用能长期维持的过载，航迹角只压到略低于水平。原来不做限制，
-        # 大坡度掉头时会先拉 7 g 把速度换成高度，再挂着机头慢慢掉回来，
-        # 看起来就是“逃跑时不断爬升、同时掉速”。
-        cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.15, 2.0)), 1.0)
-        act.n = min(act.n, cap)
-        return act
+        # 用比例式航向控制，航迹角只压到略低于水平。原来不做限制，大坡度
+        # 掉头时会先拉 7 g 把速度换成高度，再挂着机头慢慢掉回来，看起来
+        # 就是“逃跑时不断爬升、同时掉速”。
+        return heading_turn(
+            obs, away, gain=0.6, max_rate_deg=5.0,
+            gamma_target=math.radians(-5.0),
+        )
 
     def _crank(self, obs: Observation) -> Action:
         """偏置（CRANK）：把目标压在机头约 40°，保持照射同时拉开横向距离。
@@ -1232,7 +1521,12 @@ class TacticalAgent:
         往同一侧压坡度，方位越转越大，最后把机头甩出 60° 照射锥。
         """
         az = obs.off_az - self._def_sign * math.radians(40.0)
-        return aim_action(obs, az, math.radians(-4.0) - obs.own_gamma, gain=1.9)
+        if abs(az) < math.radians(4.0):
+            az = 0.0
+        return heading_turn(
+            obs, az, gain=0.35, max_rate_deg=3.0,
+            gamma_target=math.radians(-3.0),
+        )
 
     def _notch_desc(self, obs: Observation) -> Action:
         """三九下高：把威胁放到正侧方（3/9 线）并下高。
@@ -1241,7 +1535,12 @@ class TacticalAgent:
         同时让自己的机头逐渐脱离对方雷达照射锥的跟随。
         """
         az = obs.incoming_missile_az - self._def_sign * math.radians(90.0)
-        return aim_action(obs, az, math.radians(-8.0) - obs.own_gamma, gain=2.0)
+        if abs(az) < math.radians(5.0):
+            az = 0.0
+        return heading_turn(
+            obs, az, gain=0.45, max_rate_deg=4.0,
+            gamma_target=math.radians(-6.0),
+        )
 
     def _f_pole(self, obs: Observation) -> Action:
         """F-pole：先偏置保持中制导，把自己的中距弹导完，再冷转脱离。
@@ -1256,7 +1555,10 @@ class TacticalAgent:
             else:
                 return self._crank(obs)
         away = wrap_pi(obs.los_az + math.pi - obs.own_psi)
-        return aim_action(obs, away, math.radians(-8.0) - obs.own_gamma, gain=1.7)
+        return heading_turn(
+            obs, away, gain=0.6, max_rate_deg=5.0,
+            gamma_target=math.radians(-6.0),
+        )
 
     def _cobra(self) -> Action:
         """过失速眼镜蛇：把机头拉到失速迎角以上，靠矢量喷口维持姿态。
