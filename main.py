@@ -34,28 +34,29 @@ HIGH_G_REL = 0.75
 
 
 # 近距格斗弹公开参数：
-# R-73：105 kg，2.9 m / 0.17 m，战斗部 7.4 kg，最大过载约 40 g，
-#       导引头瞬时视场 ±45°，万向支架 ±60°，因此离轴发射能力约 ±60°
-#       （RVV-MD 的支架更大，这里按 R-73 原型的公开值），
+# R-73：105 kg，2.9 m / 0.17 m，战斗部 7.4 kg，最大速度 Mach 2.5、
+#       最大过载约 50 g，导引头瞬时视场 ±45°，万向支架 ±60°，
+#       因此离轴发射能力约 ±60°（RVV-MD 的支架更大，这里按 R-73 原型的公开值），
 #       最小发射距离 300 m，R-73E 射程 30 km。
-# AIM-9X：84.4 kg，3.02 m / 0.13 m，最大过载约 50 g，
+# AIM-9X：84.4 kg，3.02 m / 0.13 m，最大速度约 Mach 2.5、最大过载约 50 g，
 #       离轴发射能力 ±90°（Block II 的高离轴能力），射程 16 km。
+# 中距弹：R-77-1 公开最大速度 Mach 4–5（俄方数据 5,512 km/h），
+#       AIM-120C-5/6/7 约 Mach 4，两者最大过载均为 40 g 量级。
 # 推进段/阻力按量级取值，命中完全由导引头视场、舵面可用过载和能量决定。
 # 锁定距离仍按导引头性能单独设定，射程只限制发射后的最大飞行距离。
-# cd0_wave 取 1.2：早期用 2.6 是为了压低峰值马赫，但总阻力系数
-# （cd0×(1+wave)）因此达到 2.1–3.3，导弹飞到末段只剩亚声速，目标一个
-# 横转就能把它拖掉。真实导弹波阻远小于这个量级，改回 1.2 后 15 km 迎头
-# 末段存速从 M2.5 提到 M3.0；R-77-1 的推力同步下调到 26 kN，峰值仍保持 M4.1。
+# 阻力口径：早期 cd0_wave 用到 2.6，总阻力系数 cd0×(1+wave) 达到 2 以上，
+# 导弹末段只剩亚声速，明显低估了真实弹的存速；现在按公开极速标定，
+# 中距弹在 9–12 km 迎头能到 M4.3–5.2，近距弹在 9 km 约 M2.6–2.8。
 R73 = MissileSpec(
     name="R-73", mass=105.0, length=2.90, diameter=0.17,
-    max_g=40.0, seeker_fov=math.radians(45.0),
+    max_g=50.0, seeker_fov=math.radians(45.0),
     gimbal_fov=math.radians(60.0), seeker_range=10000.0,
     lock_time=0.8, min_range=300.0, max_range=30000.0,
     # 两段推力：助推 1.4 s / 30 kN，续航 3.6 s / 4.8 kN，总冲约 59 kN·s
     # （等效比冲约 150 s），推进剂 40 kg 按恒定比冲烧完，弹重 105→65 kg。
     thrust=4800.0, burn_time=5.0, boost_thrust=30000.0, boost_time=1.4,
     burnout_mass=65.0,
-    cd0=0.9, cd0_wave=1.2, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
+    cd0=0.9, cd0_wave=1.0, cn_max=10.0, warhead_damage=100.0, lethal_radius=9.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -67,7 +68,7 @@ AIM9X = MissileSpec(
     # 助推 1.2 s / 24 kN，续航 2.8 s / 5.0 kN，总冲约 43 kN·s。
     thrust=5000.0, burn_time=4.0, boost_thrust=24000.0, boost_time=1.2,
     burnout_mass=50.0,
-    cd0=0.9, cd0_wave=1.2, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
+    cd0=0.9, cd0_wave=1.0, cn_max=12.0, warhead_damage=110.0, lethal_radius=8.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
 
@@ -87,7 +88,7 @@ R77_1 = MissileSpec(
     # 助推 3 s / 42 kN，续航 5 s / 16.4 kN，总冲约 208 kN·s。
     thrust=16400.0, burn_time=8.0, boost_thrust=42000.0, boost_time=3.0,
     burnout_mass=100.0,
-    cd0=0.55, cd0_wave=1.2, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
+    cd0=0.45, cd0_wave=0.7, cn_max=10.0, warhead_damage=110.0, lethal_radius=11.0,
     life=50.0, cooldown=3.0, pn_gain=4.0, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=20000.0,
 )
@@ -100,7 +101,7 @@ AIM120C = MissileSpec(
     # 助推 3 s / 34 kN，续航 4 s / 11.25 kN，总冲约 147 kN·s。
     thrust=11250.0, burn_time=7.0, boost_thrust=34000.0, boost_time=3.0,
     burnout_mass=80.0,
-    cd0=0.55, cd0_wave=1.2, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
+    cd0=0.45, cd0_wave=0.7, cn_max=10.0, warhead_damage=105.0, lethal_radius=10.0,
     life=45.0, cooldown=3.0, pn_gain=4.2, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=18000.0,
 )

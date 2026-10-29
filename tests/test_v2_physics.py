@@ -409,10 +409,10 @@ def peak_mach(mspec, shooter, range_m=6000.0, z=9000.0, v=470.0):
 
 
 @pytest.mark.parametrize("mspec,shooter,lo,hi", [
-    (R73, SU57_SPEC, 2.3, 2.9),
-    (AIM9X, F16V_SPEC, 2.4, 3.1),
-    (R77_1, SU57_SPEC, 3.6, 4.3),
-    (AIM120C, F16V_SPEC, 3.5, 4.3),
+    (R73, SU57_SPEC, 2.3, 3.0),
+    (AIM9X, F16V_SPEC, 2.4, 3.2),
+    (R77_1, SU57_SPEC, 4.2, 5.2),
+    (AIM120C, F16V_SPEC, 4.1, 4.9),
 ])
 def test_w05_missile_peak_mach(mspec, shooter, lo, hi):
     peak = peak_mach(mspec, shooter)
