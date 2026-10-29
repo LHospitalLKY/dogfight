@@ -441,7 +441,8 @@ class TacticalAgent:
     MERGE_HOLD = 2200.0
     MERGE_TIMEOUT = 12.0         # 交汇抢位方案的保持时间 s
 
-    # 导弹来袭时按顺序轮换的防御动作；被锁定（未射弹）时也有一套。
+    # 防御动作候选池：导弹来袭与被锁定（未射弹）各有一套，具体选哪个
+    # 由 _maneuver_prob 按成功率评分决定，不再按固定顺序取第一个可用项。
     # 实弹规避只用水平/下降类动作：殷麦曼、筋斗会把机头指向高空，
     # 在 9 km 外就开始规避时会连续爬升把能量抽干，反而更容易被后续弹命中。
     # 高 G 变体只在速度与过载耐受都允许时才会被 _defense_ok 放行。
@@ -1011,13 +1012,14 @@ class TacticalAgent:
                 return "HEAD_ON", "ONE_CIRCLE"
             if self._merge_plan == "TWO_CIRCLE":
                 return "HEAD_ON", "TWO_CIRCLE"
+            cands = ["LEAD", "BREAK"]
             if (
                 sit.e_adv > 0.0
                 and self.energy_pref >= 0.5
                 and self._yoyo_cd <= 0.0
             ):
-                return "HEAD_ON", "HIGH_YOYO"
-            return "HEAD_ON", "LEAD" if self.aggression > 0.6 else "BREAK"
+                cands.append("HIGH_YOYO")
+            return "HEAD_ON", self._pick_maneuver(cands, sit, obs)
 
         # 交汇后的第一圈仍按抢位方案执行：HEAD_ON 只是一个瞬时窗口，
         # 双方真正开始盘旋时已转为 NEUTRAL/DEFENSIVE，若不延续方案，
@@ -1032,29 +1034,34 @@ class TacticalAgent:
             return sit.name, name
 
         if sit.name == "DEFENSIVE":
-            # 只有对方真的冲过头（接近率为正、距离很近且机头已偏）才做剪刀；
-            # 仅仅“贴得近”就反复剪刀，会变成每 1.4 s 一次的无收益反向机动。
+            # 只有对方真的冲过头（接近率为正、距离很近且机头已偏）才把剪刀
+            # 纳入候选；仅仅“贴得近”就反复剪刀，会变成无收益的反向机动。
+            cands = ["BREAK"]
             if sit.overshoot:
-                return "DEFENSIVE", "SCISSORS"
-            return "DEFENSIVE", "BREAK"
+                cands.append("SCISSORS")
+            return "DEFENSIVE", self._pick_maneuver(cands, sit, obs)
 
         if sit.name == "OFFENSIVE":
+            cands = ["PURE", "LEAD"]
             if sit.close:
-                return "OFFENSIVE", "LAG" if sit.overshoot else "PURE"
-            if sit.far:
-                return "OFFENSIVE", "PURE"
-            # 角度还不够、速度与过载耐受都富余时用高 G 转弯抢角度。
-            # 机体本身拉不出 6.5 g 时（高空低速）换成普通追逐，等高 G 变得
-            # “名副其实”再拉，否则只是白白把能量抽干。
+                cands.append("LAG")
             if (
-                obs.own_speed_frac > 1.55
+                not sit.close
+                and not sit.far
+                and obs.own_speed_frac > 1.55
                 and self.n_pos_tol > 6.5
                 and obs.own_n_avail >= HIGH_G_MIN_AVAIL
             ):
-                return "OFFENSIVE", "HIGH_G_TURN"
-            return "OFFENSIVE", "LEAD"
+                # 角度还不够、速度与过载耐受都富余时才把高 G 转弯纳入候选。
+                # 机体本身拉不出 6.5 g 时（高空低速）高 G 只是白耗能量。
+                cands.append("HIGH_G_TURN")
+            return "OFFENSIVE", self._pick_maneuver(cands, sit, obs)
 
-        # 近距缠斗但机头落后：速度与过载耐受都富余时用高 G 转弯抢角度。
+        # NEUTRAL：把当前态势下可用的近距机动都放进候选池，再由成功率
+        # 评分挑选；评分相同（例如机头已基本指向时的 PURE/LEAD）随机选。
+        cands = ["PURE"]
+        if sit.angle < math.radians(25.0) and not sit.far:
+            cands.append("LEAD")
         if (
             not sit.far
             and sit.angle > math.radians(40.0)
@@ -1062,9 +1069,8 @@ class TacticalAgent:
             and self.n_pos_tol > 6.5
             and obs.own_n_avail >= HIGH_G_MIN_AVAIL
         ):
-            return "NEUTRAL", "HIGH_G_TURN"
-
-        # NEUTRAL：贴身缠斗时用垂直机动消耗/补充能量
+            cands.append("HIGH_G_TURN")
+        # 贴身缠斗时用垂直机动消耗/补充能量。
         if sit.close:
             high_ok = obs.own_ps_level > 5.0 and obs.z_margin_high > 4000.0
             low_ok = obs.z_margin_low > 1200.0
@@ -1074,17 +1080,147 @@ class TacticalAgent:
                 and high_ok
                 and self._yoyo_cd <= 0.0
             ):
-                return "NEUTRAL", "HIGH_YOYO"   # 太快：把多余速度换成高度
+                cands.append("HIGH_YOYO")   # 太快：把多余速度换成高度
             if (
                 obs.own_speed_frac < 1.5
                 and self.energy_pref < 0.5
                 and low_ok
                 and self._yoyo_cd <= 0.0
             ):
-                return "NEUTRAL", "LOW_YOYO"    # 太慢：俯冲增速再拉起
-        if sit.angle < math.radians(25.0):
-            return "NEUTRAL", "LEAD" if not sit.far else "PURE"
-        return "NEUTRAL", "PURE"
+                cands.append("LOW_YOYO")    # 太慢：俯冲增速再拉起
+        return "NEUTRAL", self._pick_maneuver(cands, sit, obs)
+
+    # ---------- 机动成功率评估 ----------
+
+    def _pick_maneuver(
+        self,
+        candidates: list[str],
+        sit: _Situation | None,
+        obs: Observation,
+        vs_missile: bool = False,
+    ) -> str:
+        """在候选机动里按“当前态势下的成功率”选一个，并列时随机。
+
+        候选池由战术层给出（已包含距离、能量、过载耐受等硬门限），这里
+        只负责排序：对每个候选算一个 0–1 的成功概率，取最大者；若多个
+        候选概率完全相同，用 agent 自己的随机源挑一个，避免永远偏向
+        列表里靠前的那个动作。
+        """
+        scored: dict[str, float] = {}
+        for name in candidates:
+            if not self._defense_ok(name, obs):
+                continue
+            scored[name] = self._maneuver_prob(name, sit, obs, vs_missile)
+        if not scored:
+            return candidates[0] if candidates else "PURE"
+        best = max(scored.values())
+        ties = [n for n, p in scored.items() if abs(p - best) <= 1e-9]
+        if len(ties) > 1:
+            return self._rng.choice(ties)
+        return ties[0]
+
+    def _maneuver_prob(
+        self,
+        name: str,
+        sit: _Situation | None,
+        obs: Observation,
+        vs_missile: bool = False,
+    ) -> float:
+        """估计一个机动在当前态势下的成功概率（0–1）。
+
+        评分只表达“这个动作做成并拿到收益的可能性”，不做战术取舍：
+        - 指向越准、距离越近，追踪类（PURE/LEAD/LAG）越可靠；
+        - 速度与可用过载越富余，高 G 抢角度的成功率越高；
+        - 高度余量与能量决定悠悠/破 S 这类垂直机动能不能做完；
+        - 防御动作按来袭弹剩余时间和能量余量分档。
+        """
+        speed = obs.own_speed_frac
+        energy = clamp((speed - 1.25) / 0.75, 0.0, 1.0)
+        near = clamp((2400.0 - obs.dist) / 1800.0, 0.0, 1.0)
+        low = clamp(obs.z_margin_low / 3000.0, 0.0, 1.0)
+        high = clamp(obs.z_margin_high / 5000.0, 0.0, 1.0)
+        nfrac = clamp(obs.own_n_avail / 9.0, 0.0, 1.0)
+        ttg = obs.incoming_missile_ttg
+        if not math.isfinite(ttg):
+            ttg = 99.0
+        aggr = self.aggression
+
+        if name in ("PURE", "LEAD", "LAG", "HIGH_G_TURN",
+                    "HIGH_YOYO", "LOW_YOYO"):
+            if sit is None:
+                return 0.5
+            aim = clamp(1.0 - sit.angle / math.radians(90.0), 0.0, 1.0)
+            need = 1.0 - aim          # 机头偏离越大，越需要抢角度
+            if name == "PURE":
+                return 0.52 + 0.18 * aim + 0.14 * near
+            if name == "LEAD":
+                p = 0.50 + 0.16 * aim + 0.10 * near + 0.06 * aggr
+                if sit.name == "HEAD_ON":
+                    p += 0.12
+                return p
+            if name == "LAG":
+                p = 0.48 + 0.12 * near
+                if sit.overshoot:
+                    p += 0.18
+                return p
+            if name == "HIGH_G_TURN":
+                return 0.42 + 0.22 * energy + 0.18 * nfrac + 0.18 * need
+            if name == "HIGH_YOYO":
+                return (
+                    0.40 + 0.22 * energy + 0.14 * high
+                    + 0.10 * (1.0 if sit.close else 0.0)
+                    + 0.06 * self.energy_pref
+                )
+            return (      # LOW_YOYO
+                0.40 + 0.22 * (1.0 - energy) + 0.14 * low
+                + 0.10 * (1.0 if sit.close else 0.0)
+                + 0.06 * (1.0 - self.energy_pref)
+            )
+
+        if name == "SCISSORS":
+            p = 0.44 + 0.16 * near
+            if sit is not None and sit.overshoot:
+                p += 0.26
+            return p
+        if name == "BREAK":
+            p = 0.55 + 0.10 * energy + 0.05 * low
+            if sit is not None and sit.name == "DEFENSIVE":
+                p += 0.08
+            return p
+
+        # 防御类：按来袭弹剩余时间与能量余量给分。
+        if name == "NOTCH_DESC":
+            return 0.50 + 0.18 * low + 0.12 * (1.0 if ttg > 6.0 else 0.0)
+        if name == "BEAM":
+            # 横转是可持续的规避姿态：被锁定（弹还没出）时也应保持，
+            # 只有弹进入末段（ttg 很小）才让位给高 G 硬甩。
+            return 0.62 + 0.08 * clamp(ttg / 10.0, 0.0, 1.0)
+        if name == "HIGH_G_BREAK":
+            p = 0.40 + 0.12 * energy + 0.12 * nfrac
+            if vs_missile and ttg <= 4.0:
+                p += 0.15          # 末段才值得用高 G 硬甩
+            return p
+        if name == "HIGH_G_BARREL":
+            p = 0.40 + 0.12 * energy + 0.10 * nfrac
+            if vs_missile and 3.0 < ttg <= 7.0:
+                p += 0.10
+            return p
+        if name == "BARREL":
+            return 0.42 + 0.10 * (1.0 - energy)
+        if name == "SPLIT_S":
+            return 0.46 + 0.12 * low
+        if name == "HIGH_G_SPLIT_S":
+            p = 0.42 + 0.14 * low + 0.12 * nfrac
+            if vs_missile and ttg <= 4.0:
+                p += 0.10
+            return p
+        if name == "IMMELMANN":
+            return 0.34 + 0.14 * high
+        if name == "LOOP":
+            return 0.32 + 0.16 * high
+        if name == "COBRA":
+            return 0.40 + 0.10 * near
+        return 0.45
 
     # ---------- 人体过载耐受 ----------
 
@@ -1168,29 +1304,19 @@ class TacticalAgent:
         return True
 
     def _pick_defense(self, obs: Observation, vs_missile: bool) -> str:
-        """按威胁剩余时间分档选择规避动作，全程保持同一转向侧。
+        """在防御候选池里按成功率选择规避动作，全程保持同一转向侧。
 
-        不再每 3 s 轮换一套动作：末段刚建立起来的三九/横转姿态一旦被换掉，
-        导弹只需修正很小的角度就能重新压回前置量，前面拉开的脱靶量全废。
-        分档逻辑是远距横转消耗弹能量（同时给箔条创造多普勒条件）→ 中距
-        保持横转并做高 G 修正 → 近距才切硬甩。
+        远距优先横转消耗弹能量、中距保持横转并做高 G 修正、近距才切硬甩，
+        这些战术倾向由 `_maneuver_prob` 的概率项表达，而不是固定的轮换
+        顺序；末段刚建立起来的三九/横转姿态也不会被无收益地换掉。
         """
         if obs.own_speed_frac < self.LOW_ENERGY_FRAC:
             return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
-        if vs_missile:
-            ttg = obs.incoming_missile_ttg
-            if ttg > 7.0:
-                ladder = ("NOTCH_DESC", "BEAM")
-            elif ttg > 3.0:
-                ladder = ("BEAM", "HIGH_G_BREAK", "HIGH_G_BARREL")
-            else:
-                ladder = ("HIGH_G_BREAK", "BREAK", "HIGH_G_SPLIT_S")
-        else:
-            ladder = ("BEAM", "HIGH_G_BREAK", "BREAK", "SPLIT_S")
-        for cand in ladder:
-            if self._defense_ok(cand, obs):
-                return cand
-        return "BREAK" if vs_missile else "BEAM"
+        pool = self.MISSILE_DEFENSE if vs_missile else self.LOCK_DEFENSE
+        cands = [c for c in pool if self._defense_ok(c, obs)]
+        if not cands:
+            return "BREAK" if vs_missile else "BEAM"
+        return self._pick_maneuver(cands, None, obs, vs_missile)
 
     def _defense_ok(self, primitive: str, obs: Observation) -> bool:
         """防御机动的准入条件，全部取自机动层的能力声明。"""
