@@ -637,7 +637,7 @@ def run_record(
     dof: int,
     record_path: str,
     track_path: str,
-    follow: int = 0,
+    follow: int | None = None,
     track_interval: float = 10.0,
     fps: int = 20,
     seed: int | None = None,
@@ -794,7 +794,10 @@ def main() -> None:
         "--track-plot", default="out/trajectory.png",
         help="全局轨迹图输出路径（仅 --record 时生成）",
     )
-    parser.add_argument("--follow", type=int, default=0, help="录制时跟随的飞机索引，0=SU-57")
+    parser.add_argument(
+        "--follow", type=int, default=None,
+        help="录制时跟随的飞机索引（0=SU-57，1=F-16V）；默认不跟随，使用两机中点视角",
+    )
     parser.add_argument("--track-interval", type=float, default=10.0, help="轨迹采样间隔（秒）")
     parser.add_argument("--fps", type=int, default=20, help="录制帧率")
     parser.add_argument(
