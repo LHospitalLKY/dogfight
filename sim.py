@@ -188,6 +188,50 @@ def notch_quality(ac: "Aircraft", mx: float, my: float, mz: float) -> float:
     return clamp(1.0 - radial / max(ac.v, 1.0), 0.0, 1.0)
 
 
+# ---------- 多普勒雷达的速度盲区（物理盲区） ----------
+# 脉冲多普勒雷达不是“看到回波就能跟踪”：它先做多普勒滤波，靠目标相对
+# 地面杂波的径向速度把回波从杂波里挑出来。目标正侧方横穿时径向速度
+# 趋近 0，回波落进主瓣杂波凹口，距离再近也看不见——这就是 BVR 里的
+# “多普勒盲区 / notch”，也是三九机动的物理依据。
+MDV_RADAR = 40.0        # m/s，机载雷达最小可检测径向速度
+MDV_SEEKER = 25.0       # m/s，弹载主动导引头（带宽更窄、平台更快）
+NOTCH_BAND = 25.0       # m/s，从完全盲区到稳定跟踪的过渡带宽度
+# 下视时地面杂波把多普勒谱展宽，等效 MDV 抬高；高差越大越明显。
+LOOKDOWN_MDV_GAIN = 0.55
+LOOKDOWN_REF_DZ = 4000.0
+
+
+def doppler_visibility(pos, tgt_pos, tgt_vel, mdv=MDV_RADAR,
+                       band=NOTCH_BAND, lookdown=0.0) -> float:
+    """目标相对雷达/导引头的多普勒可见度（0=掉进杂波凹口，1=稳定可见）。
+
+    这里只取**目标自身（对地）速度**在视线上的投影：多普勒凹口是对着地杂波
+    开的，载机/导弹自身的运动在“目标－杂波”的相对多普勒里正好抵消，
+    所以同速尾追并不必然致盲，真正致盲的是目标自己横穿到径向速度≈0。
+    `lookdown` 是下视杂波对 MDV 的放大系数（0 表示不抬高）。
+    """
+    dx = tgt_pos[0] - pos[0]
+    dy = tgt_pos[1] - pos[1]
+    dz = tgt_pos[2] - pos[2]
+    d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d < 1e-6:
+        return 1.0
+    radial = abs((tgt_vel[0] * dx + tgt_vel[1] * dy + tgt_vel[2] * dz) / d)
+    gate = mdv * (1.0 + lookdown)
+    return clamp((radial - gate) / max(band, 1e-6), 0.0, 1.0)
+
+
+def radar_visibility(ac: "Aircraft", foe: "Aircraft",
+                     mdv: float = MDV_RADAR) -> float:
+    """载机雷达对目标的多普勒可见度，含下视杂波对 MDV 的抬高。"""
+    dz = ac.z - foe.z
+    lookdown = LOOKDOWN_MDV_GAIN * clamp(dz / LOOKDOWN_REF_DZ, 0.0, 1.0)
+    return doppler_visibility(
+        (ac.x, ac.y, ac.z), (foe.x, foe.y, foe.z), world_velocity(foe),
+        mdv=mdv, lookdown=lookdown,
+    )
+
+
 def air_density(z: float) -> float:
     """ISA 大气密度：0–11 km 线性降温，11–20 km 等温，20–32 km 缓慢升温。"""
     h = clamp(z, 0.0, 32000.0)
@@ -719,6 +763,7 @@ class Observation:
     incoming_missile_ttg: float = 1e9    # 该弹预计命中时间 s（按接近率估算）
     incoming_missile_sarh: bool = False  # 该弹是否为半主动雷达制导（需要载机持续照射）
     incoming_missile_radar: bool = False # 该弹是否为雷达制导（含主动弹，告警距离更远）
+    incoming_missile_guided: bool = False # 该弹是否仍在制导（丢制导后只剩惯性弹道）
 
     # 雷达制导中距弹：发射前需要雷达稳定跟踪；主动弹在中制导段仍需载机
     # 提供目标信息（数据链），末段自主截获后才完全脱离。
@@ -1077,7 +1122,9 @@ def launch_envelope(ac: "Aircraft", mspec: MissileSpec,
     """
     reach = mspec.seeker_range
     if mspec.is_radar:
-        reach *= rcs_scale(foe.spec.rcs)
+        # RCS 决定雷达截面积，多普勒盲区决定“看没看见”：目标横穿掉进
+        # 速度凹口时，雷达既锁不住也支持不了中制导，包线直接归零。
+        reach *= rcs_scale(foe.spec.rcs) * radar_visibility(ac, foe)
     return mspec.min_range, min(mspec.max_range, reach)
 
 
@@ -1203,7 +1250,8 @@ class World:
             return 0.95, True
         losx, losy, losz = dx / dist, dy / dist, dz / dist
 
-        envelope = min(spec.max_range, spec.seeker_range * rcs_scale(foe.spec.rcs))
+        # 有效包线与发射包线同源：目标横穿掉进多普勒盲区时包线归零。
+        _, envelope = launch_envelope(me, spec, foe)
         # 目标速度沿视线的分量：正数表示正在背离本机逃逸。
         fvx, fvy, fvz = world_velocity(foe)
         fleeing = clamp(
@@ -1344,22 +1392,31 @@ class World:
         incoming_ttg = 1e9
         incoming_sarh = False
         incoming_radar = False
+        incoming_guided = False
         mevx, mevy, mevz = me.velocity
         for m in self.missiles:
-            if not m.alive or m.target != i or not m.guided:
+            if not m.alive or m.target != i:
                 continue
-            ddx, ddy = m.x - me.x, m.y - me.y
-            dd = math.sqrt(ddx * ddx + ddy * ddy + (m.z - me.z) ** 2)
+            ddx, ddy, ddz = m.x - me.x, m.y - me.y, m.z - me.z
+            dd = math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
+            # 弹与本机的接近率：用来估算剩余命中时间，供 F-pole 决策。
+            vc = (
+                (mevx - m.vx) * ddx + (mevy - m.vy) * ddy
+                + (mevz - m.vz) * ddz
+            ) / max(dd, 1e-6)
+            # 丢制导的弹不再被“制导中”过滤掉：它会按惯性继续飞、仍然能
+            # 近炸命中，把它当成不存在会让防御方在弹还没过顶时就提前改出。
+            # 只有明显已经在远离的弹（接近率为负）才不再计入威胁；制导中的
+            # 弹也按同一门限，避免弹已经从身边飞过后还一直被当成来袭目标，
+            # 让防御方白白横转、掉高掉速。
+            if vc < 100.0 and (not m.guided or vc < -50.0):
+                continue
             if dd < incoming_dist:
                 incoming_dist = dd
                 incoming_az = wrap_pi(math.atan2(ddy, ddx) - nose_az)
                 incoming_sarh = m.spec.is_sarh
                 incoming_radar = m.spec.is_radar
-                # 弹与本机的接近率：用来估算剩余命中时间，供 F-pole 决策。
-                vc = (
-                    (mevx - m.vx) * ddx + (mevy - m.vy) * ddy
-                    + (mevz - m.vz) * (m.z - me.z)
-                ) / max(dd, 1e-6)
+                incoming_guided = m.guided
                 incoming_ttg = dd / max(vc, 50.0)
 
         # 我方在飞中距弹的剩余命中时间：F-pole 的判据是“我的弹先到”。
@@ -1374,7 +1431,12 @@ class World:
             vc = (
                 (m.vx - fvx) * rx + (m.vy - fvy) * ry + (m.vz - fvz) * rz
             ) / max(dd, 1e-6)
-            own_radar_ttg = min(own_radar_ttg, dd / max(vc, 50.0))
+            # 已经追不上对方的弹（接近率低于 150 m/s，典型是尾追远逃目标或
+            # 药柱烧完的僵尸弹）不算“我的弹先到”：否则 dd/vc 会算出几十上百
+            # 秒的假命中时间，F-pole 判据永远不成立。
+            if vc < 150.0:
+                continue
+            own_radar_ttg = min(own_radar_ttg, dd / vc)
 
         half = self.arena / 2.0
         foe_lock_progress = 0.0
@@ -1470,6 +1532,7 @@ class World:
             incoming_missile_ttg=incoming_ttg,
             incoming_missile_sarh=incoming_sarh,
             incoming_missile_radar=incoming_radar,
+            incoming_missile_guided=incoming_guided,
             own_radar_ttg=own_radar_ttg,
             own_radar_missiles=me.radar_missiles,
             own_radar_in_flight=radar_in_flight,
@@ -2317,6 +2380,11 @@ class World:
                         m.guided
                         and mdist
                         <= m.spec.active_range * rcs_scale(target.spec.rcs)
+                        and doppler_visibility(
+                            (m.x, m.y, m.z),
+                            (target.x, target.y, target.z),
+                            world_velocity(target), mdv=MDV_SEEKER,
+                        ) >= 0.5
                     ):
                         m.active = True
                 if not m.active:
@@ -2329,8 +2397,12 @@ class World:
                         sang = math.acos(clamp(
                             (sdx * snx + sdy * sny + sdz * snz) / sdist, -1.0, 1.0
                         ))
+                        # 目标横穿掉进多普勒盲区时，载机雷达同样看不见它，
+                        # 照射/数据链随之中断——这正是“三九破中制导”的物理本质。
                         illum = (
-                            sdist <= m.spec.max_range and sang <= SARH_ILLUM_FOV
+                            sdist <= m.spec.max_range
+                            and sang <= SARH_ILLUM_FOV
+                            and radar_visibility(shooter, target) >= 0.5
                         )
                     if not illum:
                         m.guided = False
@@ -2383,7 +2455,13 @@ class World:
             # 主动弹在末段截获前由数据链中制导，弹轴还没对准目标也不会丢弹；
             # 截获之后才真正靠自己的导引头，视场越界即丢失目标。
             midcourse = m.spec.is_arh and not m.active
-            if ang_seeker > m.spec.gimbal and not midcourse:
+            # 截获之后弹自己的导引头一样受多普勒盲区限制：目标横穿、弹目
+            # 相对径向速度落进凹口，弹就丢了这帧目标，转成无控弹道。
+            seeker_blind = m.active and doppler_visibility(
+                (m.x, m.y, m.z), (target.x, target.y, target.z),
+                world_velocity(target), mdv=MDV_SEEKER,
+            ) <= 0.0
+            if (ang_seeker > m.spec.gimbal and not midcourse) or seeker_blind:
                 m.guided = False
             else:
                 # 弹体轴转向目标视线：弹体可以转得比速度矢量快，二者之差

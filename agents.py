@@ -455,7 +455,16 @@ class TacticalAgent:
     LOW_ENERGY_FRAC = 1.55   # 速度低于 1.55 倍当地失速即进入能量保护
     N_MARGIN = 1.25          # 允许短时超出维持过载的倍数，其余能量透支被禁止
     MISSILE_EVADE_DIST = 9000.0  # 来袭格斗弹进入该距离就开始规避
-    SARH_EVADE_DIST = 16000.0    # 中距弹的告警距离更远：超视距阶段就要开始偏置
+    SARH_EVADE_DIST = 16000.0    # 中距弹进入末段（近距）后的硬甩门限
+    # 雷达制导中距弹的告警距离。对方最大发射包线约 36.6 km（Su-57 打
+    # F-16V，35 km 标称距离 × RCS 四次方根缩放），取 40 km 保证弹一离架
+    # 就进入超视距防御流程。旧值 16 km 时，90° 三九横转要飞十几秒才到位，
+    # 弹早就进了末段甚至已经命中，三九/F-pole 在名义上存在、实际不生效。
+    BVR_EVADE_DIST = 40000.0
+    # 三九凹口的保持门限：|v_r| 低于该值就认为已经进了主瓣杂波凹口
+    # （机载雷达 MDV=40 m/s，留一点余量），此时只做小速率修正，避免
+    # 大转弯率把机头甩出凹口、又把径向速度顶回门限以上。
+    NOTCH_HOLD_VR = 44.0
     MISSILE_BREAK_DIST = 4500.0  # 更远时用能量友好的横转/俯冲拉长 F-pole
     # 先手发射后的偏置距离：自己的中距弹还在飞时，若与目标仍相距该距离以上，
     # 打完立刻转入 CRANK 偏置，而不是继续直冲压近。太近（<8 km）时偏置没有
@@ -647,7 +656,7 @@ class TacticalAgent:
         # 方位接近 ±180°（威胁正在正后方）时两侧完全等价，而 wrap 会让符号
         # 在边界上每拍翻转——若把它也算进计时，防御动作会每 1.5 s 反向滚
         # 140°，看上去就是在抖。这种情况直接保持当前转向侧。
-        if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+        if obs.incoming_missile_dist < self.BVR_EVADE_DIST:
             az = obs.incoming_missile_az
             if (
                 az * self._def_sign < 0.0
@@ -930,19 +939,34 @@ class TacticalAgent:
         # 这时不再继续直冲压近，而是把目标压到 40° 偏置（CRANK）——一边保持
         # 制导，一边用横向位移拉开交战几何、降低接近率，把自己从对方的
         # 发射包里拉出来。偏置窗口结束后立刻回到进攻，避免远距僵持。
+        # 但如果对方的弹会先到（或和我方同时到），偏置就只是把机头
+        # 白白钉在对方雷达视线附近，这时必须先转三九生存。
+        lost_race = (
+            obs.incoming_missile_radar
+            and obs.incoming_missile_guided
+            and obs.incoming_missile_ttg < obs.own_radar_ttg + 2.0
+        )
         if (
             self._post_launch_t > 0.0
             and obs.incoming_missile_dist > self.SARH_EVADE_DIST
             and obs.dist > self.POST_LAUNCH_CRANK_DIST
-            and not self._lure_hold(obs)
+            # 诱导先手只在“自己还没交弹”时成立：弹已经离架还保持迎头，
+            # 等于把机头钉在对方雷达视线上，白送对方第二个发射窗口。
+            and (obs.own_radar_in_flight > 0 or not self._lure_hold(obs))
+            and not lost_race
         ):
-            return "SURVIVE", "CRANK"
+            # 自己的中距弹在飞：这段偏置就是标准的 F-pole——把机头偏出去
+            # 40°，既保住弹的照射/数据链，又让对方的雷达和弹看到更大的
+            # 距离、更小的接近率。弹打完（命中/脱靶/坠毁）后才退回普通偏置。
+            return "SURVIVE", (
+                "F_POLE" if obs.own_radar_in_flight > 0 else "CRANK"
+            )
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
         # 只有进入近距才用最大过载急转硬甩。
         # 雷达制导中距弹（含主动弹）在超视距阶段就要开始偏置/横转；
         # 红外弹只有进入近距才需要硬甩。
         evade_dist = (
-            self.SARH_EVADE_DIST
+            self.BVR_EVADE_DIST
             if obs.incoming_missile_radar
             else self.MISSILE_EVADE_DIST
         )
@@ -1128,7 +1152,7 @@ class TacticalAgent:
             return None
         if obs.dist < 400.0 or obs.dist > 3000.0:
             return None
-        if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+        if obs.incoming_missile_dist < self.BVR_EVADE_DIST:
             return None
         if sit.name == "DEFENSIVE":
             plan = (
@@ -1544,33 +1568,51 @@ class TacticalAgent:
         return True
 
     def _anti_radar(self, obs: Observation) -> str | None:
-        """雷达制导中距弹的应对：F-pole 优先，其次三九下高。
+        """雷达制导中距弹的应对：先保住自己的弹（F-pole），否则三九下高。
 
-        FC3 手册的超视距防御流程：
-        - F-pole：自己的中距弹仍在中制导、且预计比对方弹先命中时，保持约 40°
-          偏置继续给弹装订，让自己的弹先落地；自己的弹进入末段自主截获
-          （主动弹）或结束后再冷转脱离。
-        - 三九下高：没有还手弹、或对方弹先到，把威胁放到正侧方并下高，
-          既拉长弹道，又用更稠密的空气消耗弹的能量、压出对方制导锥。
-        返回 None 表示已进入近距，交回原有的硬甩规避轮换。
+        判据直接落在多普勒盲区模型上：PD 雷达/导引头只靠目标自身的径向速度
+        把回波从地杂波里挑出来，目标横穿到 |v_r| < MDV 时回波整体落进主瓣
+        杂波凹口，载机雷达的照射/数据链与弹上导引头会同时丢目标，弹转为
+        无控弹道（sim.World._update_missile 里的 illum / seeker_blind）。
+        - F-pole：自己的中距弹还在飞、且比来袭弹先命中时，保持 40° 偏置
+          继续给自己的弹装订。对方的雷达弹到命中前都依赖载机照射，先把
+          对方载机打掉，对方的弹就失去中制导。
+        - 三九下高：其余情况（对方弹先到、自己没弹或弹已自主）把对方放到
+          正侧方并下高，用横穿把径向速度压进凹口。
+        返回 None 表示高度/能量不允许做三九，交回硬甩规避轮换。
         """
         ttg = obs.incoming_missile_ttg
-        # 自己的雷达弹仍需要载机支持（中制导）且目标还在跟踪范围内：先 F-pole。
-        # 横转 90° 会把自己的中制导断掉，偏置 40° 既保持支持又把对方弹道拉长，
-        # 是唯一同时兼顾攻守的动作。
+        # “谁的弹先到”是 F-pole 与三九的分水岭：弹先到就偏置保弹，
+        # 弹后到再偏置就是把自己钉在对方雷达视线里挨打。
+        # 判据只看“我还有中距弹在飞、且它比来袭弹先到”。旧实现额外要求
+        # own_radar_support（弹还没进入主动截获段），但本模拟里双方常在
+        # 20 km 上下开火，弹一离架就已进入 18–20 km 的主动截获距离，support
+        # 恒为假，F-pole 因此一次都没触发过。主动截获后载机虽然可以不管弹，
+        # 但保持 40° 偏置仍能继续拉大与来袭弹的几何、压缩对方弹的能量，
+        # 所以只要自己的弹会先落地，就该做 F-pole。
         if (
-            obs.own_radar_support
-            and obs.radar_tracking
-            and ttg > 4.0
+            obs.own_radar_in_flight > 0
+            and obs.own_radar_ttg <= ttg + 1.0
+            # 偏置只能把接近率降下来，来弹已经只剩几秒时再偏置就是站着挨打，
+            # 这种末段时间窗交给三九/硬甩。
+            and ttg > 5.0
+            # 弹仍在制导段时需要雷达能照到目标，否则偏置没有意义。
+            and (not obs.own_radar_support or obs.radar_tracking)
         ):
             return "F_POLE"
-        if ttg > 14.0:
-            return "CRANK"
+        # 对方弹已经丢了制导、只剩惯性弹道：如果已经进了凹口就守到它飞过
+        # （这时改出反而会把机头从凹口甩出来）；还没进凹口就没必要为无控弹
+        # 横转 90°。自己的中距弹也打完了才走这一步，否则先按上面的 F-pole
+        # 把弹导完。
+        if not obs.incoming_missile_guided:
+            return "NOTCH_DESC" if self.primitive == "NOTCH_DESC" else None
+        # 三九下高要掉高度：按当前-6°的下高角，20 s 的凹口保持只消耗
+        # 约 600 m，所以离地 1.2 km、高度 2 km 以上就允许。旧门限 1.5 km
+        # 把已经下到 2.8 km 的 F-16V 挡在门外，它只能做硬甩，结果被弹命中。
         if (
-            ttg > 4.5
-            and obs.z_margin_low > 1500.0
-            and obs.own_alt > 2500.0
-            and obs.own_speed_frac > 1.35
+            obs.z_margin_low > 1200.0
+            and obs.own_alt > 2000.0
+            and obs.own_speed_frac > 1.30
         ):
             return "NOTCH_DESC"
         return None
@@ -1617,7 +1659,7 @@ class TacticalAgent:
             "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
         ) and not self._def_engaged:
             self._def_engaged = True
-            if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+            if obs.incoming_missile_dist < self.BVR_EVADE_DIST:
                 self._def_sign = 1.0 if obs.incoming_missile_az >= 0.0 else -1.0
             else:
                 # 没有来袭弹时（战斗机动/被锁定的横转），转向侧跟随本次
@@ -2184,42 +2226,73 @@ class TacticalAgent:
         az = obs.off_az - self._def_sign * math.radians(40.0)
         if abs(az) < math.radians(4.0):
             az = 0.0
+        # 旧实现限制在 3°/s，从迎头转到 40° 偏置要十几秒，往往弹都进末段了
+        # 机头还没偏出去，偏置等于没做。6°/s 既能在 7 s 内建立偏置，又不会
+        # 像 aim_action 的 16°/s 那样在偏置角上来回摆振。
         return heading_turn(
-            obs, az, gain=0.35, max_rate_deg=3.0,
+            obs, az, gain=0.7, max_rate_deg=6.0,
             gamma_target=math.radians(-3.0),
         )
 
     def _notch_desc(self, obs: Observation) -> Action:
-        """三九下高：把威胁放到正侧方（3/9 线）并下高。
+        """三九下高：把对方雷达视线放到正侧方（3/9 线）并下高。
 
-        横转拉长对方的拦截几何、下高进入更稠密的空气消耗弹的能量；
-        同时让自己的机头逐渐脱离对方雷达照射锥的跟随。
+        凹口参考必须是**对方载机雷达到本机的视线**，不是来袭弹的相对方位：
+        多普勒凹口是对着地杂波开的，本机径向速度是相对载机视线算的；弹在
+        十几公里外、弹目视线和载机视线的夹角已经不可忽略。旧实现按弹方位
+        转 90°，算出来的是“相对弹横穿”，载机雷达照样能看见，中制导不断。
         """
-        az = obs.incoming_missile_az - self._def_sign * math.radians(90.0)
-        if abs(az) < math.radians(5.0):
-            az = 0.0
+        sign = self._def_sign
+        # 用视线相对**航迹**的方位（los_az − psi）：heading_turn 控制的是
+        # 速度矢量的转向率，6DOF 下机头/炮线与航迹差一个迎角，按机头对
+        # 90° 会把速度矢量留在凹口外。
+        rel = wrap_pi(obs.los_az - obs.own_psi)
+        az = rel - sign * math.radians(90.0)
+        # 真实径向速度：视线与速度矢量的点积，口径与 sim.doppler_visibility
+        # 完全一致（含俯仰项），而不是只看水平分量。
+        radial = abs(obs.own_speed * (
+            math.sin(obs.los_el) * math.sin(obs.own_gamma)
+            + math.cos(obs.los_el) * math.cos(obs.own_gamma) * math.cos(rel)
+        ))
+        if radial <= self.NOTCH_HOLD_VR:
+            # 已经进凹口：只做小速率修正，跟着视线转动保持横穿姿态。
+            return heading_turn(
+                obs, az, gain=0.6, max_rate_deg=2.0,
+                gamma_target=math.radians(-6.0),
+            )
+        # 还没进凹口：远距用大速率抢进 90°（迎头 90° 要 8–10 s），
+        # 接近凹口后收到 4°/s 避免冲过头再反向找。
+        near = abs(az) < math.radians(30.0)
         return heading_turn(
-            obs, az, gain=0.45, max_rate_deg=4.0,
+            obs, az, gain=0.6 if near else 1.0,
+            max_rate_deg=4.0 if near else 10.0,
             gamma_target=math.radians(-6.0),
         )
 
     def _f_pole(self, obs: Observation) -> Action:
-        """F-pole：先偏置保持中制导，把自己的中距弹导完，再冷转脱离。
+        """F-pole：先偏置把自己那枚中距弹导到命中，再转三九。
 
-        第一阶段与 CRANK 相同；自己的弹进入末段自主截获或结束后
-        （own_radar_support 为假），立刻掉头拉开距离，让对手剩余的
-        在飞弹多飞一段、直到燃料耗尽或丢制导。
+        第一阶段与 CRANK 相同，持续到自己那枚弹落地（命中/脱靶/坠毁）或
+        已经追不上对方（own_radar_ttg 退回无穷）；此后继续偏置没有收益，
+        立刻转三九破对方载机雷达对我的照射/对方弹的中制导，而不是掉头
+        “冷转”。旧实现的冷转航向仍沿对方视线（|v_r| 反而最大），对方雷达
+        和弹上导引头都看得清清楚楚，只能把弹道稍微拉长一点，挡不住命中。
         """
         if self._phase == 0:
-            if not obs.own_radar_support:
+            own_mine = (
+                obs.own_radar_in_flight > 0
+                and obs.own_radar_ttg <= obs.incoming_missile_ttg + 1.0
+            )
+            if not own_mine:
                 self._phase, self._phase_t = 1, 0.0
             else:
                 return self._crank(obs)
-        away = wrap_pi(obs.los_az + math.pi - obs.own_psi)
-        return heading_turn(
-            obs, away, gain=0.6, max_rate_deg=5.0,
-            gamma_target=math.radians(-6.0),
-        )
+        # 自己的弹已经落地/追不上：只要有雷达弹还在朝我来就继续三九。
+        # 丢了制导的弹也是威胁（惯性弹道照样能近炸命中），这时改回偏置
+        # 会把机头扭回弹道前方；没有来弹时才回到偏置保持姿态。
+        if obs.incoming_missile_radar:
+            return self._notch_desc(obs)
+        return self._crank(obs)
 
     def _cobra(self, obs: Observation) -> Action:
         """过失速眼镜蛇：把机头拉到失速迎角以上，靠矢量喷口维持姿态。
