@@ -387,6 +387,9 @@ def should_launch(obs: Observation) -> bool:
         and obs.own_missiles_in_flight < 1
         and obs.own_speed_frac > 1.35
         and obs.dist > max(obs.missile_min_range, 600.0)
+        # 发射纪律：超过 30° 离轴的快照弹在 9 km 高度打不动——弹在 M2 时
+        # 转弯半径约 1.6 km，目标就在 1.5 km 时 40° 以上的离轴角物理上转不进去。
+        and math.degrees(obs.angle_off_nose) <= 30.0
     )
 
 

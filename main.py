@@ -58,8 +58,9 @@ R73 = MissileSpec(
     burnout_mass=65.0,
     cd0=0.9, cd0_wave=1.0, cn_max=10.0, warhead_damage=100.0, lethal_radius=9.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
-    # 会机动的目标：R-73 的有效发射距离约 3 km（迎头），尾追约 1 km。
-    dogfight_reach=3000.0,
+    # 对会机动的目标的有效射程。NEZ 判据还会再乘 NEZ_FRACTION(0.55)，
+    # 所以这里给 6 km，落地的迎头 NEZ 约 3.3 km、尾追约 1.8 km。
+    dogfight_reach=6000.0,
 )
 
 AIM9X = MissileSpec(
@@ -72,8 +73,9 @@ AIM9X = MissileSpec(
     burnout_mass=50.0,
     cd0=0.9, cd0_wave=1.0, cn_max=12.0, warhead_damage=110.0, lethal_radius=8.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
-    # AIM-9X 的离轴能力与导引头更强，对机动目标的有效距离略大。
-    dogfight_reach=3200.0,
+    # AIM-9X 的离轴能力与导引头更强，对机动目标的有效距离略大
+    # （落地 NEZ 迎头约 3.5 km、尾追约 1.9 km）。
+    dogfight_reach=6400.0,
 )
 
 # 主动雷达制导中距弹（发射后不管）：中段靠载机雷达/数据链修正，
