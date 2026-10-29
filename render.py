@@ -25,6 +25,12 @@ TRAIL_SPACING = 60.0
 # 航迹飘带半宽（屏幕像素）：按相机深度换算成世界尺度，保证镜头拉近拉远时
 # 飘带都有稳定的可见厚度，而不是一条 1–2 px 的细线。
 TRAIL_HALF_PX = 5.0
+# 航迹飘带的“天光”方向（右上前方）：飘带法向与它越接近越亮，
+# 飞机滚转、倒扣时法向随之转动，飘带就出现明暗起伏。
+TRAIL_LIGHT = (-0.35, -0.55, 0.76)
+# 飘带按“年龄”渐变的时间窗口：最近这么久以内的段保持高亮，更旧的逐渐
+# 淡出。窗口越短，越像一条会拖尾的发光航迹，机动动作的先后顺序越清楚。
+TRAIL_FADE_TIME = 12.0
 # 开火点抽稀：同一个点射不必每一帧都插一个标记。
 SHOT_SPACING = 120.0
 # 每隔多少个采样点放一个方向箭头。
@@ -359,6 +365,8 @@ class Renderer:
         # 每个航迹采样点的机体横向轴（机体 y 轴 = 翼展方向），用来把航迹
         # 画成一条与飞机机体 xy 平面一致的宽飘带，而不是屏幕上的细线。
         self.trail_axes: list[list[tuple[float, float, float]]] = [[], []]
+        # 每个采样点的时刻，用于让飘带按“年龄”做渐变（最近的段最亮）。
+        self.trail_t: list[list[float]] = [[], []]
         self.fire_marks: list[list[tuple[float, float, float]]] = [[], []]
         # 轨迹事件：导弹发射点 (队别, 位置) 与高 G 机动点 (队别, 位置)。
         self.launch_marks: list[tuple[int, tuple[float, float, float]]] = []
@@ -476,6 +484,7 @@ class Renderer:
     def reset(self) -> None:
         self.trails = [[], []]
         self.trail_axes = [[], []]
+        self.trail_t = [[], []]
         self.fire_marks = [[], []]
         self.launch_marks = []
         self.highg_marks = []
@@ -506,6 +515,7 @@ class Renderer:
                 # 因此飞机滚转/俯仰时飘带会跟着倾斜。
                 _, yb, _ = body_axes(*attitude_of(ac))
                 self.trail_axes[i].append(yb)
+                self.trail_t[i].append(world.t)
                 self._last_sample[i] = p
             if ac.firing:
                 last_shot = self._last_shot[i]
@@ -551,6 +561,7 @@ class Renderer:
 
     def draw(self, world: World, paused: bool = False, agents=None) -> None:
         self.update_camera(world)
+        self.now = world.t
         self._record_trail(world, agents)
         self._update_engines(world)
         if self.gpu:
@@ -614,27 +625,40 @@ class Renderer:
 
     def _draw_trails(self) -> None:
         for i, trail in enumerate(self.trails):
-            color = tuple(int(c * 0.72) for c in TEAM_COLORS[i])
-            arrow_color = tuple(min(255, int(c * 1.05)) for c in TEAM_COLORS[i])
+            base = TEAM_COLORS[i]
+            arrow_color = tuple(min(255, int(c * 1.05)) for c in base)
             if len(trail) >= 2:
                 # GPU 模式下航迹线由 OpenGL 画，这里只保留箭头与事件标记。
                 if not self.gpu:
                     axes = self.trail_axes[i]
+                    ts = self.trail_t[i]
+                    now = getattr(self, "now", 0.0)
                     # 宽飘带：每一段画成一个四边形，宽度方向取当时的机体
                     # y 轴（去掉沿切线的分量），因此飘带平面始终落在飞机
                     # 机体的 xy 平面内，飞机滚转/俯仰时飘带跟着倾斜。
+                    # 颜色沿航迹渐变：按采样时刻做 22 s 拖尾，越新的段越亮，
+                    # 旧段淡出，机动轨迹的先后顺序一眼可读。
                     for j in range(1, len(trail)):
                         axis = axes[j] if j < len(axes) else (0.0, 1.0, 0.0)
+                        age = now - (ts[j] if j < len(ts) else now)
+                        fade = max(0.0, 1.0 - age / TRAIL_FADE_TIME)
                         self._draw_trail_ribbon(
-                            trail[j - 1], trail[j], axis, color,
+                            trail[j - 1], trail[j], axis, base, fade,
                         )
 
                 # 方向箭头：沿航迹等距放箭标，整局走线在远看时也能读出方向。
+                ts = self.trail_t[i]
+                now = getattr(self, "now", 0.0)
                 for j in range(ARROW_EVERY, len(trail), ARROW_EVERY):
                     s0 = self.to_screen(trail[j - 1])
                     s1 = self.to_screen(trail[j])
                     if s0 is not None and s1 is not None:
-                        self._draw_arrow(s0, s1, arrow_color)
+                        age = now - (ts[j] if j < len(ts) else now)
+                        fade = max(0.0, 1.0 - age / TRAIL_FADE_TIME)
+                        a_col = tuple(
+                            int(c * (0.38 + 0.62 * fade)) for c in arrow_color
+                        )
+                        self._draw_arrow(s0, s1, a_col)
 
         # 开火点：每个点射位置留一个亮色菱形，和航迹一起构成完整战况记录。
         for marks in self.fire_marks:
@@ -685,13 +709,19 @@ class Renderer:
         pygame.draw.polygon(self.screen, edge, pts, 1)
 
     def _draw_trail_ribbon(
-        self, p0, p1, y_axis, color: tuple[int, int, int],
+        self, p0, p1, y_axis, base: tuple[int, int, int], fade: float,
     ) -> None:
         """画一段航迹飘带：四边形宽度沿机体 y 轴，平面与机体 xy 平面一致。
 
         先把两端做近裁剪面裁剪；宽度方向取机体 y 轴在“垂直于航迹”的
         平面上的分量，再按当前相机深度换算成世界尺度，使屏幕厚度稳定在
         约 2×TRAIL_HALF_PX 像素。飘带侧对镜头时自然变窄，保留立体感。
+
+        颜色做两层处理：
+        - 渐变：``fade`` 从 0（最旧）到 1（最新），旧段变暗淡出；
+        - 光影：飘带法向（机体 z 轴方向）与固定光求点积，飞机滚转/倒扣时
+          法向随之转动，飘带亮度起伏，机动姿态因此更醒目。中心再叠一条
+          更亮的高光芯，形成“宽边 + 亮芯”的立体观感。
         """
         a, b = self._view(p0), self._view(p1)
         if a[2] <= NEAR and b[2] <= NEAR:
@@ -717,6 +747,17 @@ class Renderer:
             return
         ux, uy, uz = ux / ul, uy / ul, uz / ul
 
+        # 飘带法向 = 切线 × 展向（约等于机体 z 轴）。用固定方向的“天光”
+        # 做单面着色：法向朝天（倒扣）时最亮，平飞时偏暗。
+        nx = ty * uz - tz * uy
+        ny = tz * ux - tx * uz
+        nz = tx * uy - ty * ux
+        lit = nx * TRAIL_LIGHT[0] + ny * TRAIL_LIGHT[1] + nz * TRAIL_LIGHT[2]
+        # 单面受光：倒扣（法向朝上）时明显更亮，平飞时偏暗。破 S 先滚转
+        # 180° 再俯冲，飘带亮度会先暗后亮，滚转和倒扣一眼就能读出来。
+        shade = 0.62 + 0.38 * max(0.0, lit)
+        bright = (0.34 + 0.66 * fade) * shade
+
         # 方向在世界系，先转到相机坐标系再按深度定宽。
         u_cam = (
             ux * self.right[0] + uy * self.right[1] + uz * self.right[2],
@@ -726,15 +767,28 @@ class Renderer:
         depth = 0.5 * (a[2] + b[2])
         half = TRAIL_HALF_PX * depth / self.focal
         ox, oy, oz = (u_cam[0] * half, u_cam[1] * half, u_cam[2] * half)
-        quad = (
-            (a[0] + ox, a[1] + oy, a[2] + oz),
-            (a[0] - ox, a[1] - oy, a[2] - oz),
-            (b[0] - ox, b[1] - oy, b[2] - oz),
-            (b[0] + ox, b[1] + oy, b[2] + oz),
-        )
-        if min(q[2] for q in quad) <= NEAR:
+        ap = (a[0] + ox, a[1] + oy, a[2] + oz)
+        am = (a[0] - ox, a[1] - oy, a[2] - oz)
+        bp = (b[0] + ox, b[1] + oy, b[2] + oz)
+        bm = (b[0] - ox, b[1] - oy, b[2] - oz)
+        if min(ap[2], am[2], bp[2], bm[2]) <= NEAR:
             return
-        pygame.draw.polygon(self.screen, color, [self._screen_of(q) for q in quad])
+        # 横向拆成两半：+y 侧亮、-y 侧暗，形成一条有体积感的带子。飞机滚转
+        # 时展向跟着翻转，亮暗边随之交换——这正是“带子翻面”的视觉线索。
+        lit_side = tuple(min(255, int(c * bright * 1.08)) for c in base)
+        dark_side = tuple(min(255, int(c * bright * 0.70)) for c in base)
+        s_a, s_b = self._screen_of(a), self._screen_of(b)
+        pygame.draw.polygon(
+            self.screen, lit_side,
+            [self._screen_of(ap), self._screen_of(bp), s_b, s_a],
+        )
+        pygame.draw.polygon(
+            self.screen, dark_side,
+            [self._screen_of(am), self._screen_of(bm), s_b, s_a],
+        )
+        # 高光芯：中心一条细亮线，远看像发光的航迹，近看有霓虹般的层次。
+        core = tuple(min(255, int(c * min(1.30, bright * 1.45))) for c in base)
+        pygame.draw.line(self.screen, core, s_a, s_b, 2)
 
     def _draw_arrow(self, s0, s1, color, size: float = 10.0) -> None:
         """在 s1 处画一个沿 s0→s1 的实心箭标（尾部内凹的细长箭头）。"""
