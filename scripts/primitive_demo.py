@@ -41,6 +41,13 @@ OUT_DIR = os.path.join(
 #   edge/low  —— 贴近空域边界 / 最低高度
 SCENES = {
     "merge": ((0.0, 0.0, 9000.0, 0.0), (3200.0, 0.0, 9000.0, math.pi)),
+    # 单环/双环：两机各偏在一侧对头接近，交汇后再起转。原来同一条线上
+    # 3.2 km 外就开始转，两个圆心被拉开 3.2 km，画面上就是两条平行线。
+    "merge_ring": ((0.0, -260.0, 9000.0, 0.0), (2600.0, 260.0, 9040.0, math.pi)),
+    # 被追击：本机在前、对手在后上方咬尾，破 S / 急转这类防御动作才有意义。
+    "attacked": ((0.0, 0.0, 9000.0, 0.0), (-1300.0, 260.0, 9090.0, 0.0)),
+    # 双环用的迎头场景再近一些，交汇后同向盘旋不会甩到 4 km 以外。
+    "ring_near": ((0.0, -260.0, 9000.0, 0.0), (2000.0, 260.0, 9040.0, math.pi)),
     # 咬尾场景给目标一点横向/高度偏移，双方盘旋对穿时才不会贴到几十米内穿模。
     "chase": ((0.0, 0.0, 9000.0, 0.0), (1400.0, 350.0, 9040.0, 0.0)),
     "chase_far": ((0.0, 0.0, 9000.0, 0.0), (2400.0, 420.0, 9060.0, 0.0)),
@@ -84,16 +91,18 @@ DEFAULT_SPEED = 280.0
 
 def demo(prim, scene, secs, *,
          speed=DEFAULT_SPEED, foe="level", foe_sign=1.0, foe_kind=None,
-         foe_speed=DEFAULT_SPEED, seq=None, sign=1.0):
+         foe_speed=DEFAULT_SPEED, seq=None, sign=1.0, gate=None):
     """组装一条演示配置。
 
     sign / foe_sign 是双方的转向侧：同号 = 双环（同向盘旋），
     反号 = 单环（对头互切）。seq 用于需要分段的动作（如眼镜蛇改出）。
+    gate 是“起转距离”：双方先平飞接近，间距小于 gate 才开始做动作，
+    交汇编场景靠它避免两机在几公里外就各转各的、轨迹平行。
     """
     return dict(
         prim=prim, scene=scene, secs=secs, speed=speed,
         foe=foe_kind or foe, foe_sign=foe_sign, foe_speed=foe_speed,
-        seq=seq, sign=sign,
+        seq=seq, sign=sign, gate=gate,
     )
 
 
@@ -101,22 +110,30 @@ DEMOS = [
     # ---- 单机/安全类：对手平飞当参照 ----
     demo("RECOVER", "low", 8.0),
     demo("POSITION", "far", 12.0),
-    # ---- 交汇抢位：双方一起切内圈（反号 = 单环，对头互切） ----
+    # ---- 交汇抢位：先平飞接近，交汇后再起转 ----
+    # 领先转弯本来就是交汇前提前拉杆，保留原来的同线迎头场景。
     demo("LEAD_TURN", "merge", 8.0, foe="lead", foe_sign=-1.0),
-    demo("ONE_CIRCLE", "merge", 12.0, foe="one_circle", foe_sign=-1.0),
-    demo("TWO_CIRCLE", "merge", 14.0, foe="two_circle", foe_sign=1.0),
+    # 单环 = 双方朝对方一侧转（同一滚转方向），轨迹在交汇点交叉后互换
+    # 左右位置，所以转弯侧取同号。
+    demo("ONE_CIRCLE", "merge_ring", 15.0, foe="one_circle", foe_sign=1.0,
+         gate=600.0, speed=240.0, foe_speed=240.0),
+    # 双环 = 双方朝同一世界方向转（相对各自机头的滚转方向相反），
+    # 交汇后形成同向的追逐盘旋，所以转弯侧取反号。
+    demo("TWO_CIRCLE", "ring_near", 14.0, foe="two_circle", foe_sign=-1.0,
+         gate=600.0, speed=240.0, foe_speed=240.0),
     # ---- 进攻/防御：目标回旋，本机抢角度或急转 ----
     demo("HIGH_G_TURN", "chase", 8.0, foe="break"),
-    demo("HIGH_G_BREAK", "chase", 8.0, foe="pure", sign=-1.0),
-    demo("HIGH_G_SPLIT_S", "chase", 16.0),
+    demo("HIGH_G_BREAK", "attacked", 8.0, foe="pure", sign=-1.0),
+    demo("HIGH_G_SPLIT_S", "attacked", 16.0, foe="pure", sign=-1.0),
     demo("HIGH_G_BARREL", "chase", 10.0, foe="pure"),
-    demo("BEAM", "chase", 8.0, foe="pure", sign=-1.0),
+    demo("BEAM", "attacked", 8.0, foe="pure", sign=-1.0),
     demo("PURE", "chase", 10.0, foe="break"),
     demo("LEAD", "chase", 10.0, foe="break"),
     demo("LAG", "chase", 10.0, foe="break"),
-    demo("BREAK", "chase", 8.0, foe="pure", sign=-1.0),
-    # ---- 垂直机动：对手平飞 ----
-    demo("SPLIT_S", "chase", 16.0),
+    demo("BREAK", "attacked", 8.0, foe="pure", sign=-1.0),
+    # ---- 垂直机动 ----
+    # 破 S 是防御动作：本机在前被咬尾，半滚倒扣俯冲脱离，对手在上方冲过头。
+    demo("SPLIT_S", "attacked", 18.0, foe="pure", sign=-1.0),
     demo("BARREL", "chase", 10.0, foe="pure"),
     demo("IMMELMANN", "chase", 20.0),
     demo("LOOP", "chase", 34.0),
@@ -130,7 +147,7 @@ DEMOS = [
     demo("LOW_YOYO", "chase_far", 10.0, foe="break", speed=250.0, foe_speed=225.0),
     # ---- 超视距类 ----
     demo("CRANK", "merge_off", 8.0),
-    demo("NOTCH_DESC", "chase", 8.0, foe="pure", sign=-1.0),
+    demo("NOTCH_DESC", "attacked", 8.0, foe="pure", sign=-1.0),
     # F-pole 的完整形态是“偏置照射 → 自己的弹主动后再冷转”，无弹演示里
     # 用 CRANK 接 EXTEND 表示这两段。
     demo("F_POLE", "far", 12.0, seq=[("CRANK", 5.0), ("EXTEND", 7.0)]),
@@ -158,7 +175,7 @@ class Pilot:
     """按脚本原语飞行的演示机，支持多段序列。"""
 
     def __init__(self, primitive: str, sign: float = 1.0, seq=None,
-                 period: float | None = None) -> None:
+                 period: float | None = None, gate: float | None = None) -> None:
         self.core = TacticalAgent(energy_pref=0.55, seed=7)
         if period is not None:
             # 剪刀的换向节拍错开，双方才不会同时反向（像集体摆翼）。
@@ -168,6 +185,8 @@ class Pilot:
         self.sign = sign
         self.seq = seq or [(primitive, None)]
         self.dt = self.core.dt
+        self.gate = gate
+        self._released = gate is None
         self._seg = 0
         self._seg_t = 0.0
         self._started = False
@@ -191,6 +210,11 @@ class Pilot:
         self.core._hold = 0.0
 
     def act(self, obs) -> Action:
+        if not self._released:
+            # 交汇编场景：先平飞接近，等对方进入起转距离再开始做动作。
+            if obs.dist > self.gate:
+                return Action(bank=0.0, n=1.0, throttle=0.8, fire=False)
+            self._released = True
         if not self._started:
             self.start(obs)
         self._seg_t += self.dt
@@ -251,12 +275,12 @@ def _reposition(world: World, subject, target, speed: float,
         ac.hp = 1.0e9
 
 
-def _make_foe(kind: str, sign: float) -> object:
+def _make_foe(kind: str, sign: float, gate: float | None = None) -> object:
     primitive = FOE_PRIMITIVE.get(kind)
     if primitive is None:
         return PassiveTarget()
     period = 2.8 if primitive == "SCISSORS" else None
-    return Pilot(primitive, sign=sign, period=period)
+    return Pilot(primitive, sign=sign, period=period, gate=gate)
 
 
 def record(name: str, cfg: dict, dof: int,
@@ -286,9 +310,10 @@ def record(name: str, cfg: dict, dof: int,
     core = Pilot(
         cfg["prim"], sign=cfg["sign"], seq=cfg["seq"],
         period=2.2 if cfg["prim"] == "SCISSORS" else None,
+        gate=cfg["gate"],
     )
     core.start(world.observe(0))
-    foe = _make_foe(cfg["foe"], cfg["foe_sign"])
+    foe = _make_foe(cfg["foe"], cfg["foe_sign"], gate=cfg["gate"])
 
     fs = max(1, round(1.0 / (20.0 * PHYSICS_DT)))
     actions = [Action(), Action()]
@@ -400,15 +425,16 @@ def main() -> None:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    demos = DEMOS
+    demos = list(enumerate(DEMOS))
     if args.only:
         wanted = {s.upper() for s in args.only}
-        demos = [d for d in DEMOS if d["prim"] in wanted]
+        demos = [(i, d) for i, d in demos if d["prim"] in wanted]
+    demos = demos[args.start:]
 
     print(f"{'原语':16s} {'场景':10s} {'对手':11s} {'航向°':>7s} {'Δ高m':>7s} "
           f"{'坡度范围°':>13s} {'γ范围°':>13s} {'n峰':>5s} {'间距m':>13s} 完成")
     rows = []
-    for idx, cfg in enumerate(demos[args.start:], start=args.start):
+    for idx, cfg in demos:
         name = f"{idx:02d}_{cfg['prim']}"
         r = record(name, cfg, args.dof, dry=args.dry, trace=args.trace)
         rows.append(r)
