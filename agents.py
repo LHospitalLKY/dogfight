@@ -4,9 +4,10 @@
 ----
 1. 几何判定（`_assess`）：把 Observation 压缩成“谁占位”的态势
    （进攻/防御/对头/中立/脱离）。
-2. 战术层（`_plan` / `_tactic_*`）：按 恢复 → 生存 → 反击 → 被锁防御 → 交战 的优先级
-   选一个战术族。反击族（`COUNTER_*`）是主动的：被咬尾时用机动换角度，
-   或把尾追转成迎头，而不是一路被动规避。
+2. 战术层（`_plan` / `_tactic_*`）：按 恢复 → 生存 → 反击 → 僵持改出 →
+   被锁防御 → 交战 的优先级选一个战术族。反击族（`COUNTER_*`）是主动的：
+   被咬尾时用机动换角度，或把尾追转成迎头，而不是一路被动规避；改出族
+   （`RESET`）用于双方长时间兜圈子、谁都拿不到射击窗口时主动重置几何。
 3. 机动层（`MANEUVERS` + `_maneuvers`）：每个机动声明自己的能力
    （高 G / 最低速度 / 高度余量 / 距离门限），由表驱动执行，不再按名字前缀猜。
 4. 控制层（`Action`）：滚转角 + 过载 + 油门，由同一套内核执行。
@@ -463,6 +464,14 @@ class TacticalAgent:
     # 反击一旦选定就要执行完整套动作（破 S / 剪刀需要数秒），
     # 不能下一拍就被“被锁防御”抢走，否则只会做一个 0.1 s 的抖动。
     COUNTER_COMMIT = 4.0
+    # 僵持改出：双方在近距缠斗里长时间兜圈子、谁都拿不到射击窗口时，
+    # 主动放弃当前盘旋、重置几何（拉开重来 / 反向切 / 破 S 掉头）。
+    # 门槛取 10 s：实测单次近距缠斗窗口只有 10–14 s，门限若取 20 s，
+    # 改出还没触发双方就已经拉开，等于永远不生效；10 s 足够让“谁先转
+    # 谁丢角度”的僵持成立，又能在同一个缠斗窗口里做出改出。
+    STALEMATE_TIME = 10.0
+    RESET_COMMIT = 5.0
+    RESET_COOLDOWN = 25.0
 
     def __init__(
         self,
@@ -510,6 +519,11 @@ class TacticalAgent:
         # 已承诺执行的反击 (战术, 机动) 及剩余执行时间。
         self._counter_plan: tuple[str, str] | None = None
         self._counter_commit = 0.0
+        # 僵持改出：兜圈子累计时长、当前改出方案与冷却。
+        self._reset_plan: tuple[str, str] | None = None
+        self._reset_commit = 0.0
+        self._reset_cd = 0.0
+        self._circle_t = 0.0
         self._opening_done = False
         # 开局爬升目标的当前值：以有限速率逼近 _open_climb，避免 Ps 在门限
         # 附近抖动时把俯仰指令整档切换。
@@ -556,6 +570,12 @@ class TacticalAgent:
                 self._counter_plan = None
                 self._counter_cd = self.COUNTER_COOLDOWN
         self._yoyo_cd = max(self._yoyo_cd - self.dt, 0.0)
+        self._reset_cd = max(0.0, self._reset_cd - self.dt)
+        if self._reset_commit > 0.0:
+            self._reset_commit = max(0.0, self._reset_commit - self.dt)
+            if self._reset_commit <= 0.0:
+                self._reset_plan = None
+                self._reset_cd = self.RESET_COOLDOWN
         # 防御转向的连续性：威胁只在持续位于反侧时才换向，避免“一进防御就反转”。
         # 方位接近 ±180°（威胁正在正后方）时两侧完全等价，而 wrap 会让符号
         # 在边界上每拍翻转——若把它也算进计时，防御动作会每 1.5 s 反向滚
@@ -577,6 +597,21 @@ class TacticalAgent:
             self._def_engaged = False
         sit = self._assess(obs)
         self.situation = sit.name
+        # 兜圈子检测：近距缠斗、双方都没形成锁定、也没有来袭弹，说明谁都
+        # 拿不到射击窗口，只是在互相绕圈。累计到 STALEMATE_TIME 就交给
+        # 改出族主动改变几何，而不是继续陪对手盘旋到超时。
+        if (
+            500.0 < obs.dist < 2600.0
+            and sit.name in ("NEUTRAL", "DEFENSIVE")
+            and obs.incoming_missile_dist > self.MISSILE_EVADE_DIST
+        ):
+            self._circle_t += self.dt
+        else:
+            # 不满足时按两倍速率衰减而不是直接归零：真实缠斗里态势会在
+            # 锁定/距离门限上短暂跳出窗口，一旦清零就永远攒不到门槛，
+            # 改出族形同虚设。衰减式累计能容忍这些抖动，又不会把
+            # 两次无关的盘旋拼在一起。
+            self._circle_t = max(0.0, self._circle_t - 2.0 * self.dt)
         if obs.dist < self.OPENING_DIST:
             self._opening_done = True
 
@@ -711,14 +746,16 @@ class TacticalAgent:
     def _plan(self, sit: _Situation, obs: Observation) -> tuple[str, str]:
         """战术层入口，返回 (战术族, 机动名)。
 
-        优先级：恢复 > 生存 > 反击 > 被锁防御 > 交战。生存只处理真正的
-        威胁（来袭弹、过载疲劳、能量与弹药底线）；单纯被雷达锁定交给
-        反击族优先处理——被咬尾时反咬比横转更有收益。
+        优先级：恢复 > 生存 > 反击 > 僵持改出 > 被锁防御 > 交战。生存只处理
+        真正的威胁（来袭弹、过载疲劳、能量与弹药底线）；单纯被雷达锁定交给
+        反击族优先处理——被咬尾时反咬比横转更有收益。反击不成立时，如果
+        双方已经缠斗到兜圈子的程度，由改出族主动改变几何。
         """
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
             self._tactic_counter,
+            self._tactic_reset,
             self._tactic_defend_locked,
         ):
             plan = tactic(sit, obs)
@@ -890,6 +927,48 @@ class TacticalAgent:
         self._counter_plan = (tactic, primitive)
         self._counter_commit = self.COUNTER_COMMIT
         return self._counter_plan
+
+    def _tactic_reset(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """僵持改出：缠斗太久、谁都拿不到射击窗口时主动改变几何。
+
+        两个人在同一个水平面上互相盘旋时，角度、能量和距离都会卡在
+        一个稳定的循环里：谁先转谁丢角度，于是大家都不转，剩下的只有
+        绕圈到超时。改出族承认“当前盘旋没有收益”，用一次明确的动作把
+        循环打断：
+        - 被对手压着转（DEFENSIVE）：近距反向切、远距破 S 掉头，逼他冲过头；
+        - 占位/中立且有能量：主动拉开，把缠斗重置成迎头；
+        - 能量不足：急转脱离，先脱离当前盘旋再重新接近。
+
+        方案一旦选定就承诺执行 RESET_COMMIT 秒，避免改出动作被下一拍
+        的常规追逐抢回；之后进入 RESET_COOLDOWN，防止连续改出变成逃跑。
+        """
+        if self._reset_commit > 0.0 and self._reset_plan is not None:
+            return self._reset_plan
+        if self._reset_cd > 0.0 or self._circle_t < self.STALEMATE_TIME:
+            return None
+        if obs.dist < 400.0 or obs.dist > 3000.0:
+            return None
+        if obs.incoming_missile_dist < self.SARH_EVADE_DIST:
+            return None
+        if sit.name == "DEFENSIVE":
+            plan = (
+                ("RESET", "SCISSORS") if obs.dist < 1200.0 else ("RESET", "SPLIT_S")
+            )
+        elif obs.own_speed_frac >= 1.45 and obs.energy_diff >= -6000.0:
+            plan = ("RESET", "EXTEND")
+        elif obs.z_margin_low > 2400.0:
+            # 破 S 不需要速度富余：半滚倒扣本来就是掉高度换机头，只要
+            # 留够离地余量就能把水平盘旋改成一次垂直掉头。
+            plan = ("RESET", "SPLIT_S")
+        else:
+            plan = ("RESET", "BREAK")
+        self._reset_plan = plan
+        self._reset_commit = self.RESET_COMMIT
+        self._reset_cd = self.RESET_COOLDOWN
+        self._circle_t = 0.0
+        return plan
 
     def _tactic_defend_locked(
         self, sit: _Situation, obs: Observation,
@@ -1188,7 +1267,7 @@ class TacticalAgent:
         self._phase_t = 0.0
         # 反击战术的转向侧由战术层决定：一律朝目标所在的一侧切，才能把
         # 机头甩回对手身上。防御动作则沿用“威胁在哪侧就往哪侧规避”。
-        if self.tactic.startswith("COUNTER"):
+        if self.tactic.startswith("COUNTER") or self.tactic == "RESET":
             sign = 1.0 if obs.off_az >= 0.0 else -1.0
             self._def_sign = sign
             self._scissor_sign = sign
