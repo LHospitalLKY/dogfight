@@ -180,7 +180,9 @@ F16V_SPEC = AircraftSpec(
 # 苏-57 的 aggression 要高于 F-16V（0.75）：重型机雷达/武器数量占优时，
 # 更主动地对头开火、更早压近，才能把先手转成实际战果；energy_pref 仍保留
 # 能量机倾向（更愿意用垂直机动换高度）。
-SU57_AGENT = dict(aggression=0.85, energy_pref=0.65)
+# lure=True 打开“诱导先手”：对方中距弹没打光前不压上，保持迎头把它吊在
+# 自己包线最外沿，逼它先交弹（见 TacticalAgent._tactic_lure）。
+SU57_AGENT = dict(aggression=0.85, energy_pref=0.65, lure=True)
 F16V_AGENT = dict(aggression=0.75, energy_pref=0.40)
 
 

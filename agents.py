@@ -99,6 +99,7 @@ MANEUVERS: dict[str, Maneuver] = {
     "RECOVER": Maneuver("RECOVER", "RECOVER"),
     "UNLOAD": Maneuver("UNLOAD", "SURVIVE"),
     "POSITION": Maneuver("POSITION", "OFFENSIVE"),
+    "LURE": Maneuver("LURE", "OFFENSIVE"),
     "PURE": Maneuver("PURE", "OFFENSIVE"),
     "LEAD": Maneuver("LEAD", "OFFENSIVE"),
     "LAG": Maneuver("LAG", "OFFENSIVE"),
@@ -432,6 +433,18 @@ class TacticalAgent:
     # 0.7 s 就被切掉等于白做完一个半程机动，反而白掉能量。
     YOYO_HOLD = 2.0
     SCISSOR_PERIOD = 2.2
+    # ---- 诱导对手先手（LURE）----
+    # 对方中距弹还没打光、双方还是迎头，且距离还在 13–22 km 时，故意不压上、
+    # 保持迎头把距离“吊”在对方 NEZ 边缘。发射判据是硬阈值（_intercept_estimate
+    # 一进 NEZ 就打），不能在它开火前用欺骗把它推远；
+    # 能动的只有两件事：别在它开火前做偏置（偏置会让目标逃逸，NEZ 里的
+    # 航向惩罚项 0.45 会把它的 NEZ 从 16 km 砍到 10 km，反而逼它压得更近
+    # 才开火），以及把接近率压下来（它多飞十几秒才够到阈值，弹的飞行时间
+    # 更长、给我方留出箔条/横转窗口）。
+    LURE_MIN = 13000.0
+    LURE_MAX = 22000.0
+    LURE_HEAD_ON = math.radians(110.0)
+    LURE_THROTTLE = 0.65
     LOW_ENERGY_FRAC = 1.55   # 速度低于 1.55 倍当地失速即进入能量保护
     N_MARGIN = 1.25          # 允许短时超出维持过载的倍数，其余能量透支被禁止
     MISSILE_EVADE_DIST = 9000.0  # 来袭格斗弹进入该距离就开始规避
@@ -493,10 +506,15 @@ class TacticalAgent:
         energy_pref: float = 0.5,
         decision_dt: float = 0.1,
         seed: int | None = None,
+        lure: bool = False,
     ) -> None:
         self.aggression = aggression
         self.energy_pref = energy_pref
         self.dt = decision_dt
+        # 是否执行“诱导对手先手”（见 _tactic_lure）。只有愿意用空间换对方
+        # 弹药的一方该打开：它放弃了继续压上，换对方把两发中距弹在自包线
+        # 最外沿打掉。
+        self.lure = lure
         # 开局占位不再固定成一个模板：每次启动在机型允许的范围内随机取样。
         # seed 只用于实验复现，正常观战/无头运行时不传，即为真随机。
         self._rng = random.Random(seed)
@@ -778,6 +796,7 @@ class TacticalAgent:
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
+            self._tactic_lure,
             self._tactic_counter,
             self._tactic_reset,
             self._tactic_defend_locked,
@@ -832,6 +851,7 @@ class TacticalAgent:
             self._post_launch_t > 0.0
             and obs.incoming_missile_dist > self.SARH_EVADE_DIST
             and obs.dist > self.POST_LAUNCH_CRANK_DIST
+            and not self._lure_hold(obs)
         ):
             return "SURVIVE", "CRANK"
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
@@ -1019,6 +1039,27 @@ class TacticalAgent:
         if not self._should_defend(obs, sit):
             return None
         return "LOCK_DEFENSE", self._pick_defense(obs, vs_missile=False)
+
+    def _tactic_lure(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """诱导先手：在对方 NEZ 边缘保持迎头，让对方把中距弹先交出来。
+
+        排在生存之后：真有弹来袭时先活下来；也排在反击/被锁防御之前，
+        因为这一段的行为本身就是为了不再给对方“我在压上”的几何。
+        """
+        if not self._lure_hold(obs):
+            return None
+        return "SEPARATED", "LURE"
+
+    def _lure_hold(self, obs: Observation) -> bool:
+        """当前是否处在“诱导先手”那一段（对方还有中距弹、迎头、13–22 km）。"""
+        return (
+            self.lure
+            and obs.foe_radar_missiles > 0
+            and obs.aspect > self.LURE_HEAD_ON
+            and self.LURE_MIN <= obs.dist <= self.LURE_MAX
+        )
 
     def _tactic_engage(
         self, sit: _Situation, obs: Observation,
@@ -1511,6 +1552,7 @@ class TacticalAgent:
         return {
             "RECOVER": self._recover,
             "POSITION": self._position,
+            "LURE": self._lure,
             "LEAD_TURN": self._lead_turn,
             "ONE_CIRCLE": lambda o: self._circle(o, "ONE_CIRCLE"),
             "TWO_CIRCLE": lambda o: self._circle(o, "TWO_CIRCLE"),
@@ -1562,6 +1604,20 @@ class TacticalAgent:
             el_target - obs.own_gamma,
             gain=2.5,
         )
+
+    def _lure(self, obs: Observation) -> Action:
+        """迎头诱导：机头指向目标、把接近率压到军推水平。
+
+        不发散也不加压。发散（偏置/横转）会把“目标逃逸”的惩罚项塞进对方的
+        NEZ 估计，把它的发射距离从 16 km 砍到 10 km，等于逼它压近再打；加压
+        则让双方在它进 NEZ 前就已经贴到一起，它的两发都变成近距高 pk 弹。
+        保持迎头、收油门，它就得在自己包线最外沿开火——这是模型里唯一能
+        “诱导它先手”的着力点。
+        """
+        act = pursuit_action(
+            obs, obs.off_az, obs.off_el, gain=1.2, throttle=self.LURE_THROTTLE,
+        )
+        return act
 
     def _position(self, obs: Observation) -> Action:
         """开局占位：按“能量战 / 角度战”的机型倾向选择接近方式。
