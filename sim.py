@@ -32,6 +32,12 @@ BANK_CMD_MAX = math.pi / MAX_BANK
 PSI_DOT_LIMIT = math.radians(70.0)
 N_MIN = -3.0                       # 战斗机负过载极限约 -3 g
 MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴对准速度矢量的最大角速度
+# 离轴发射的自身安全：前推 1.5 s 弹道，若弹与载机的最近距离小于
+# 战斗部杀伤半径 + 该余量，就视为“可能把自己打下来”，放弃这次发射。
+# 大离轴角 + 载机低速时转弯半径很小，弹有可能在载机前方掉头时擦过自己。
+SELF_HIT_MARGIN = 45.0      # m
+SELF_HIT_HORIZON = 1.5      # s
+SELF_HIT_DT = 0.02          # s
 
 # ---------- 跨声速/超声速波阻 ----------
 # 阻力发散不是阶跃：onset 用 smoothstep 从 0.78 平滑开到 0.95
@@ -266,8 +272,11 @@ class MissileSpec:
     length: float                # m
     diameter: float              # m
     max_g: float                 # 结构可用过载
-    seeker_fov: float            # 发射前锁定半视场角 rad
-    gimbal_fov: float | None     # 发射后导引头万向支架极限 rad（缺省=锁定视场）
+    # 导引头瞬时半视场角（锁定所需的目标-弹轴夹角上限）。
+    seeker_fov: float
+    # 万向支架极限：导引头能偏转到的最大离轴角，也是离轴发射/跟踪的上限
+    # （缺省=锁定视场）。R-73 约 ±60°，AIM-9X 约 ±90°。
+    gimbal_fov: float | None
     seeker_range: float          # 可锁定距离 m
     lock_time: float             # 稳定跟踪所需时间 s
     min_range: float             # 最小发射距离 m
@@ -321,10 +330,11 @@ class MissileSpec:
 
     @property
     def gimbal(self) -> float:
-        """发射后导引头能偏转到的最大离轴角。
+        """导引头万向支架能覆盖的最大离轴角。
 
-        发射前用较窄的 seeker_fov 判定“能否锁定”，发射后用万向支架极限
-        判定“是否丢锁”：弹体刚离架时往往还来不及指向目标。
+        发射前锁定、离轴发射扇区与发射后丢锁判定都用这个极限：目标只要
+        落在万向支架能指到的范围内就能被截获，弹体刚离架时还来不及指向
+        目标，靠支架偏转维持跟踪。
         """
         return self.seeker_fov if self.gimbal_fov is None else self.gimbal_fov
 
@@ -1181,8 +1191,10 @@ class World:
             seeker_ang = math.acos(
                 clamp(ux * nnx + uy * nny + uz * nnz, -1.0, 1.0)
             )
+            # 离轴发射：锁定扇区取万向支架极限（R-73 ±60°、AIM-9X ±90°），
+            # 不再要求机头对准目标 ±45° 以内。
             in_msl = (
-                msl_min <= dist <= msl_max and seeker_ang <= mspec.seeker_fov
+                msl_min <= dist <= msl_max and seeker_ang <= mspec.gimbal
             )
             lock_progress = clamp(me.lock_timer / max(mspec.lock_time, 1e-6), 0.0, 1.0)
 
@@ -1748,9 +1760,9 @@ class World:
     def _update_lock(self) -> None:
         """双通道锁定：红外导引头与载机雷达各自累计稳定跟踪时间。
 
-        目标离开包线立即解锁（不保留记忆），因此高离轴发射前必须先把机头
-        指向目标；雷达制导中距弹在发射后还要保持跟踪（主动弹在末段截获前），
-        否则导弹会丢失制导。
+        目标离开包线立即解锁（不保留记忆）。红外弹的截获扇区取导引头
+        万向支架极限，因此机头不必对准目标也能离轴锁定；雷达制导中距弹
+        在发射后还要保持跟踪（主动弹在末段截获前），否则导弹会丢失制导。
         """
         for i, ac in enumerate(self.acs):
             ac.launch_cd = max(0.0, ac.launch_cd - self.dt)
@@ -1778,7 +1790,7 @@ class World:
                 ac.lock_timer = 0.0
             else:
                 lo, hi = launch_envelope(ac, mspec, foe)
-                inside = lo <= dist <= hi and ang <= mspec.seeker_fov
+                inside = lo <= dist <= hi and ang <= mspec.gimbal
                 ac.lock_timer = (
                     min(ac.lock_timer + self.dt, mspec.lock_time) if inside else 0.0
                 )
@@ -1924,6 +1936,69 @@ class World:
             self._try_launch(i, ac, ac.spec.missile, act.launch)
             self._try_launch(i, ac, ac.spec.radar_missile, act.launch_radar)
 
+    def _self_hit_risk(self, ac: Aircraft, mspec: MissileSpec,
+                       px: float, py: float, pz: float,
+                       vx: float, vy: float, vz: float,
+                       foe: Aircraft) -> bool:
+        """离轴发射前的自伤检查：前推弹道，判断弹会不会掉头扫中载机。
+
+        弹离架时弹体轴沿挂架、速度 = 载机速度 + 45 m/s，之后才用可用过载
+        转向目标。离轴角大、载机速度低时转弯半径很小，弹可能在前方掉头
+        时切进载机航迹。这里以“最大可用过载 + 舵机滞后”的最保守弹道
+        前推 1.5 s：只有弹与载机距离在缩小且已经小于战斗部杀伤半径加余量
+        时才判不安全——刚出膛时距离很小但正在拉开，不算风险。
+        """
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if speed < 1e-6:
+            return True
+        hx, hy, hz = vx / speed, vy / speed, vz / speed
+        # 可用过载越大，掉头半径越小，风险越高。
+        turn_rate = 0.9 * mspec.max_g * G / speed
+        danger = mspec.lethal_radius + SELF_HIT_MARGIN
+        ownvx, ownvy, ownvz = world_velocity(ac)
+        foevx, foevy, foevz = world_velocity(foe)
+        prev_d = 0.0
+        dt = SELF_HIT_DT
+        t = 0.0
+        for k in range(1, int(SELF_HIT_HORIZON / dt) + 1):
+            px += vx * dt
+            py += vy * dt
+            pz += vz * dt
+            t = k * dt
+            if t >= mspec.autopilot_tau:
+                rx = foe.x + foevx * t - px
+                ry = foe.y + foevy * t - py
+                rz = foe.z + foevz * t - pz
+                d = math.sqrt(rx * rx + ry * ry + rz * rz)
+                if d > 1e-6:
+                    ux, uy, uz = rx / d, ry / d, rz / d
+                    cosang = clamp(hx * ux + hy * uy + hz * uz, -1.0, 1.0)
+                    ang = math.acos(cosang)
+                    if ang > 1e-9:
+                        step = min(ang, turn_rate * dt)
+                        # 在 h→u 的平面内把速度方向转 step，弹体仍保持速率。
+                        wx, wy, wz = ux - hx * cosang, uy - hy * cosang, uz - hz * cosang
+                        wn = math.sqrt(wx * wx + wy * wy + wz * wz)
+                        if wn > 1e-9:
+                            c, s = math.cos(step), math.sin(step)
+                            hx, hy, hz = (
+                                hx * c + wx / wn * s,
+                                hy * c + wy / wn * s,
+                                hz * c + wz / wn * s,
+                            )
+                            hn = math.sqrt(hx * hx + hy * hy + hz * hz)
+                            hx, hy, hz = hx / hn, hy / hn, hz / hn
+                            vx, vy, vz = hx * speed, hy * speed, hz * speed
+            ox = ac.x + ownvx * t
+            oy = ac.y + ownvy * t
+            oz = ac.z + ownvz * t
+            d = math.sqrt((px - ox) ** 2 + (py - oy) ** 2 + (pz - oz) ** 2)
+            # 距离在缩小且已进入杀伤范围：弹正朝载机飞回来。
+            if t >= 0.2 and d < danger and d < prev_d - 1e-6:
+                return True
+            prev_d = d
+        return False
+
     def _try_launch(self, i: int, ac: Aircraft,
                     mspec: MissileSpec | None, requested: bool) -> None:
         if mspec is None or not requested:
@@ -1945,20 +2020,35 @@ class World:
             return
 
         nx, ny, nz = nose_direction(ac)
+        # 离轴角必须落在导引头万向支架内，支架之外的“锁定”是无效的。
+        ang = math.acos(clamp(
+            (dx * nx + dy * ny + dz * nz) / dist, -1.0, 1.0
+        ))
+        if ang > mspec.gimbal:
+            return
         vx, vy, vz = world_velocity(ac)
         launch_speed = 45.0
         off = ac.spec.length * 0.5
+        lx, ly, lz = ac.x + nx * off, ac.y + ny * off, ac.z + nz * off
+        lvx, lvy, lvz = (
+            vx + nx * launch_speed,
+            vy + ny * launch_speed,
+            vz + nz * launch_speed,
+        )
+        # 离轴发射自伤保护：预测弹会掉头扫过载机时，宁可少打一发。
+        if self._self_hit_risk(ac, mspec, lx, ly, lz, lvx, lvy, lvz, foe):
+            return
         self.missiles.append(
             Missile(
                 spec=mspec,
                 owner=i,
                 target=1 - i,
-                x=ac.x + nx * off,
-                y=ac.y + ny * off,
-                z=ac.z + nz * off,
-                vx=vx + nx * launch_speed,
-                vy=vy + ny * launch_speed,
-                vz=vz + nz * launch_speed,
+                x=lx,
+                y=ly,
+                z=lz,
+                vx=lvx,
+                vy=lvy,
+                vz=lvz,
                 mass=mspec.mass,
                 fuel=mspec.propellant,
                 nx=nx, ny=ny, nz=nz,
