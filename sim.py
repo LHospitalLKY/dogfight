@@ -137,6 +137,9 @@ CM_DECOY_KEEP = 1.5          # s，诱骗成功后导弹继续追诱饵的时间
 CM_ARM_TIME = 0.5            # s，投放后生效延迟
 # 热诱弹按“连投”使用：一次投放 2 枚，形成一片红外诱饵云，而不是单发。
 FLARE_SALVO = 2              # 枚/次，一次投放消耗的热诱弹数量
+# 热诱弹的近界：几百米内载机几乎占满导引头视场，诱饵脱离视场的速度也最快，
+# 此时已经进入末段跟踪的弹基本骗不走；诱骗概率从这个距离起线性衰减。
+FLARE_MIN_SEDUCE_RANGE = 400.0  # m，近于此距离热诱弹诱骗率归零
 # 箔条只有和载机落在同一个多普勒通道里才骗得走雷达导引头：迎头/尾追时
 # 载机径向速度很大，箔条一撒出去就和载机分开，所以必须配合横转/三九投放。
 CHAFF_NOTCH_MIN = 0.55       # 横转程度（0=迎头/尾追，1=正侧方）低于该值不投放
@@ -339,6 +342,10 @@ class MissileSpec:
     # 因此射程量级不变，但初期加速更快、末段存速分配更接近真实弹道。
     boost_thrust: float = 0.0    # N，助推段推力
     boost_time: float = 0.0      # s，助推段时长
+    # 对会机动的目标的有效射程 m（近距弹专用）。导引头/射程包线是“打不动靶”
+    # 的上限，末段弹速掉到 2–5 g 时转弯半径 3–5 km，追不上一个 9 g 急转的战斗机。
+    # 发射决策只认这个距离内的目标，0 表示不启用（雷达弹按原包线处理）。
+    dogfight_reach: float = 0.0
 
     def thrust_at(self, t: float) -> float:
         """t 时刻的发动机推力（0 表示已经熄火，由燃料量另行判断）。"""
@@ -1261,16 +1268,22 @@ class World:
             )
             lock_progress = clamp(me.lock_timer / max(mspec.lock_time, 1e-6), 0.0, 1.0)
 
-        # 近距弹的不可逃逸区估计：和中距弹同一套口径（包线 × 系数，
-        # 目标逃逸时按 aspect 缩水），只是包线取导引头/射程的较小值。
+        # 近距弹的不可逃逸区估计：包线 × 系数，目标逃逸时按 aspect 缩水。
+        # 但近距弹不能直接拿导引头/射程包线做基数：导引头能看到 10–12 km，
+        # 末段弹速掉到 2–5 g 时转弯半径 3–5 km，根本够不到一个 9 g 急转的目标。
+        # 用 dogfight_reach（R-73/AIM-9X 约 3 km，即“目标会机动”时的有效射程）
+        # 收口，再叠加 aspect 惩罚，就不会再出现 6 km 迎头的礼节性发射。
         msl_nez, msl_pk = False, 0.0
         if mspec is not None and me.missiles > 0 and foe.alive and msl_max > 0.0:
             msl_flee = clamp(
                 (fvx * ux + fvy * uy + fvz * uz) / max(foe.v, 1.0), -1.0, 1.0
             )
             msl_aspect = 0.5 * (1.0 + msl_flee)
+            reach = msl_max
+            if not mspec.is_radar and mspec.dogfight_reach > 0.0:
+                reach = min(reach, mspec.dogfight_reach)
             msl_nez_rng = max(
-                NEZ_FRACTION * msl_max * (1.0 - NEZ_ASPECT_PENALTY * msl_aspect),
+                NEZ_FRACTION * reach * (1.0 - NEZ_ASPECT_PENALTY * msl_aspect),
                 mspec.min_range,
             )
             msl_pk = 1.0 / (
@@ -2214,6 +2227,18 @@ class World:
                 best, best_d = cm, d
             if best is None:
                 continue
+            if not m.spec.is_radar:
+                # 热诱弹诱骗率随“弹-机距离”衰减：越近，载机在导引头视场里
+                # 占的比例越大、诱饵脱离视场越快，骗走的概率越低；近界内为零。
+                tgt = self.acs[m.target]
+                dd = math.sqrt(
+                    (tgt.x - m.x) ** 2 + (tgt.y - m.y) ** 2 + (tgt.z - m.z) ** 2
+                )
+                rate *= clamp(
+                    (dd - FLARE_MIN_SEDUCE_RANGE)
+                    / (FLARE_SEDUCE_RANGE - FLARE_MIN_SEDUCE_RANGE),
+                    0.0, 1.0,
+                )
             if self._rng.random() < rate * dt * best.quality:
                 if m.spec.is_sarh:
                     # 半主动弹没有自主导引头，箔条直接打断载机的照射回路。
