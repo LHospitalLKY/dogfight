@@ -558,6 +558,11 @@ class Action:
     launch: bool = False          # 本决策周期请求发射一枚格斗弹
     launch_radar: bool = False    # 本决策周期请求发射一枚雷达制导中距弹
     post_stall: bool = False      # 过失速指令：把机头拉到矢量喷口可维持的超大迎角
+    # 垂直机动（筋斗/半滚倒转/殷麦曼）用：过顶时机体滚转必须自由演化，
+    # 否则内回路会一直把欧拉滚转角拽向地平线，飞机根本过不了顶。
+    roll_free: bool = False
+    # 桶滚用：直接给滚转角速度指令 (rad/s)，正值与 bank 同号（左滚）。
+    roll_rate: float = 0.0
 
 
 @dataclass
@@ -1571,8 +1576,16 @@ class World:
         # 本层约定 bank>0 为左滚，而 phi>0 为右滚。bank 以 MAX_BANK 为单位，
         # 最大允许指令到倒扣 ±180°（破 S / 半滚倒转需要）。
         phi_cmd = -clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
-        p_cmd = clamp(2.5 * wrap_pi(phi_cmd - ac.phi), -1.5, 1.5)
-        da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
+        if act.roll_free:
+            # 垂直机动过顶：副翼中立，机体滚转随俯仰自然演化。
+            da = 0.0
+        elif act.roll_rate != 0.0:
+            # 桶滚：直接跟踪滚转角速度，才能连续滚过 360°。
+            p_cmd = clamp(-act.roll_rate, -1.5, 1.5)
+            da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
+        else:
+            p_cmd = clamp(2.5 * wrap_pi(phi_cmd - ac.phi), -1.5, 1.5)
+            da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
 
         # 俯仰：目标过载 → 目标升力系数 → 目标迎角 → 目标俯仰角速度 → 升降舵
         cl_req = act.n * ac.weight / max(qbar * spec.wing_area, 1e-6)

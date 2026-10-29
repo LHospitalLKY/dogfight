@@ -324,6 +324,7 @@ class Renderer:
         follow: int | None = None,
         follow_dist: float = 1800.0,
         gpu: bool = True,
+        span_factor: float = 2.1,
     ) -> None:
         pygame.init()
         self.w, self.h = size
@@ -372,6 +373,9 @@ class Renderer:
         # 跟随模式：相机锁定某架飞机（默认关闭，仍取两机中点）。
         self.follow = follow
         self.follow_dist = follow_dist
+        # 中点视角的取景倍率：2.1 是观战默认（留足机动余量），演示视频可以
+        # 调小一点，把两机拍得更近。
+        self.span_factor = span_factor
 
     # ---------- 相机与投影 ----------
 
@@ -389,7 +393,7 @@ class Renderer:
             a, b = world.acs
             sep_xy = math.hypot(b.x - a.x, b.y - a.y)
             span = max(sep_xy, abs(b.z - a.z) * 2.0, 1400.0)
-            target_dist = clamp(span * 2.1, 2200.0, 60000.0)
+            target_dist = clamp(span * self.span_factor, 2200.0, 60000.0)
         if self._cam_ready:
             self.dist += (target_dist - self.dist) * 0.06
             self.cam[0] += (cx - self.cam[0]) * 0.10
