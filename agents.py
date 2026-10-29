@@ -133,6 +133,8 @@ MANEUVERS: dict[str, Maneuver] = {
         "LOOP", "DEFENSIVE", min_speed_frac=1.85,
         high_alt_need=3000.0, ps_positive=True,
     ),
+    "GUN_LEAD": Maneuver("GUN_LEAD", "GUNS"),
+    "GUN_PRESS": Maneuver("GUN_PRESS", "GUNS"),
     "SCISSORS": Maneuver("SCISSORS", "COUNTER", max_dist=1200.0),
     "COBRA": Maneuver("COBRA", "DEFENSIVE"),
     "EXTEND": Maneuver("EXTEND", "DISENGAGE"),
@@ -185,7 +187,7 @@ def aim_action(
                    math.radians(86.0) / MAX_BANK),
         n=n,
         throttle=throttle,
-        fire=obs.in_gun_cone,
+        fire=obs.in_gun_trigger,
     )
 
 
@@ -260,7 +262,7 @@ def turn_action(
     act = aim_action(obs, sign * math.radians(150.0), el - obs.own_gamma, gain=6.0)
     act.n = max(1.0, min(n_target, act.n))
     act.throttle = throttle
-    act.fire = obs.in_gun_cone
+    act.fire = obs.in_gun_trigger
     return act
 
 
@@ -302,7 +304,7 @@ def heading_turn(
         bank=clamp(phi / MAX_BANK, -1.0, 1.0),
         n=n,
         throttle=throttle,
-        fire=obs.in_gun_cone,
+        fire=obs.in_gun_trigger,
     )
 
 
@@ -349,7 +351,7 @@ def level_turn(
                    math.radians(86.0) / MAX_BANK),
         n=n_cmd,
         throttle=throttle,
-        fire=obs.in_gun_cone,
+        fire=obs.in_gun_trigger,
     )
 
 
@@ -505,6 +507,20 @@ class TacticalAgent:
     STALEMATE_TIME = 10.0
     RESET_COMMIT = 5.0
     RESET_COOLDOWN = 25.0
+
+    # ---- 航炮攻击几何 ----
+    # 航炮门限（900 m / 8°）是机型硬指标，不为了“多打几发”去放宽；能改变
+    # 的只有怎么飞到那个炮口解上：尾后压进先用滞后追踪（LAG）保持距离，
+    # 机头还偏着时用最大过载压半径（GUN_PRESS），对正后按弹丸飞行时间
+    # 打提前量（GUN_LEAD）。
+    GUN_ENTRY_DIST = 2600.0                  # 进入尾后压进的距离门限 m
+    GUN_TAIL_ANGLE = math.radians(120.0)     # 对方机头背离视线超过该值＝已在尾后
+    GUN_PRESS_DIST = 1200.0                  # 该距离内改提前量追踪
+
+    # ---- Bingo（燃油硬约束）----
+    # 剩余燃油按军推折算的续航秒数低于该值即必须脱离：现实里 Bingo 是
+    # “返场 + 备降 + 复飞”的油量，约 5–10 分钟。与超时裁决用同一口径。
+    BINGO_ENDURANCE = 300.0
 
     def __init__(
         self,
@@ -687,7 +703,14 @@ class TacticalAgent:
         if self.primitive in VERTICAL:
             if self._phase_t >= 10.0:
                 self._maneuver_done = True
-            if not self._maneuver_done and want not in ("RECOVER", "UNLOAD"):
+            # 已经压住扳机、目标就在炮口窗口里时，不必把这次反转做完：
+            # 破 S 是“没射击机会时换角度”的动作，有射击机会就该先打掉。
+            gun_now = want in ("PURE", "GUN_PRESS", "GUN_LEAD", "LAG") and obs.in_gun_trigger
+            if (
+                not self._maneuver_done
+                and not gun_now
+                and want not in ("RECOVER", "UNLOAD")
+            ):
                 want = self.primitive
         # 只有安全类（回场/卸载）与“转入防御”可以立即抢占。
         # 旧实现把防御原语本身也放进可抢占集合，于是“防御→进攻→防御”
@@ -802,6 +825,7 @@ class TacticalAgent:
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
+            self._tactic_guns,
             self._tactic_lure,
             self._tactic_counter,
             self._tactic_reset,
@@ -965,6 +989,11 @@ class TacticalAgent:
         # 再拉机动只会把速度抽干，必须先卸载俯冲换回能量。
         if obs.own_ps_level < -10.0 and obs.own_alt > 11000.0:
             return "SURVIVE", "UNLOAD"
+        # Bingo：剩余军推续航低于返场+备降油量时必须脱离，不再回缠。
+        # 这是硬约束，且排在“弹药打光”之前——没油比没弹更致命。脱离期间
+        # 由恢复族兜底，不会为了拉开距离而飞出交战空域。
+        if obs.own_mil_endurance < self.BINGO_ENDURANCE:
+            return "DISENGAGE", "EXTEND"
         # 打空或重伤就不再纠缠。只有自己明显伤得更重才脱离：双方都被打残时
         # 继续缠斗，否则两架重伤机各自逃跑会把对局拖成“飞出空域”。
         if obs.own_ammo <= 1.0 or (
@@ -980,6 +1009,39 @@ class TacticalAgent:
         elif obs.own_speed_frac < 1.20:
             return "SURVIVE", "UNLOAD"
         return None
+
+    def _tactic_guns(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """航炮攻击几何：在尾后窗口里把机头压进 900 m / 8° 的炮口解。
+
+        航炮是唯一不需要先锁定再发射的通道，但门限是硬的：既要在 900 m
+        内，机头偏差还得小于 8°。所以这一段只在“已经咬住尾后”（对方机头
+        明显背离视线）时才进入——正面或侧方压炮口只会变成一次无收益的
+        冲撞。压进分三种：
+
+        - 机头还偏着（>25°）：GUN_PRESS，收油门 + 拉满瞬时过载，用更小的
+          转弯半径去破解“同速同过载共同盘旋→相对角度恒定 90°”的死锁；
+        - 机头基本对正（<25°）且已进 1.2 km：GUN_LEAD，按弹丸飞行时间给
+          提前量，纯追踪只会把弹打在自己后面；
+        - 其余情况：LAG，滞后追踪保持尾后位置，别一头冲过头。
+        """
+        if obs.own_ammo <= 0.0 or obs.dist > self.GUN_ENTRY_DIST:
+            return None
+        if obs.foe_off_nose < self.GUN_TAIL_ANGLE:
+            return None
+        if obs.own_speed_frac < 1.25 or obs.z_margin_low < 1500.0:
+            return None
+        if obs.angle_off_nose > math.radians(25.0):
+            # 尾后但机头还偏着：两架同速同过载一起盘旋时相对角度恒定在
+            # 90°，靠同样的转弯拿不回来，必须把半径压得比对手小。
+            return "GUNS", "GUN_PRESS"
+        if obs.dist < self.GUN_PRESS_DIST or obs.in_gun_cone:
+            # 机头已经基本对正：这时再纯追踪只会把弹丸打在自己后面（弹丸
+            # 飞 0.7–1 s，目标在这段时间里会飞 150–250 m），必须按弹丸
+            # 飞行时间给提前量。
+            return "GUNS", "GUN_LEAD"
+        return "GUNS", "LAG"
 
     def _tactic_counter(
         self, sit: _Situation, obs: Observation,
@@ -1627,6 +1689,8 @@ class TacticalAgent:
             "PURE": lambda o: pursuit_action(o, o.off_az, o.off_el),
             "LEAD": lambda o: pursuit_action(o, *lead_point(o, 1.0)),
             "LAG": lambda o: pursuit_action(o, *lead_point(o, -0.6)),
+            "GUN_LEAD": self._gun_lead_action,
+            "GUN_PRESS": self._gun_press,
             "BREAK": self._break,
             "SPLIT_S": self._split_s,
             "BARREL": self._barrel,
@@ -1648,6 +1712,58 @@ class TacticalAgent:
         if fn is None:
             return aim_action(obs, obs.off_az, obs.off_el)
         return fn(obs)
+
+    def _gun_lead(self, obs: Observation) -> tuple[float, float]:
+        """航炮提前量：按弹丸飞行时间指向目标的未来位置，返回相对炮线的偏差。
+
+        弹丸出膛后以炮口初速 + 载机速度飞行，900 m 约需 0.7 s；目标在这
+        段时间里飞 150–250 m（在 900 m 上就是 10–15°）。纯追踪永远把弹丸
+        打在自己后面，所以这里按真实飞行时间 T = 距离 / 弹丸地速 给提前量，
+        而不是用 lead_point 里那个按接近率估算、并夹在 1.5 s 的 t_go。
+        """
+        v_bullet = max(obs.own_speed + 600.0, 800.0)
+        t_go = clamp(obs.dist / v_bullet, 0.0, 1.2)
+        ce = math.cos(obs.los_el)
+        ux = ce * math.cos(obs.los_az)
+        uy = ce * math.sin(obs.los_az)
+        uz = math.sin(obs.los_el)
+        cg = math.cos(obs.foe_gamma)
+        fvx = obs.foe_speed * cg * math.cos(obs.foe_psi)
+        fvy = obs.foe_speed * cg * math.sin(obs.foe_psi)
+        fvz = obs.foe_speed * math.sin(obs.foe_gamma)
+        lx = ux * obs.dist + fvx * t_go
+        ly = uy * obs.dist + fvy * t_go
+        lz = uz * obs.dist + fvz * t_go
+        az = math.atan2(ly, lx)
+        el = math.atan2(lz, math.hypot(lx, ly))
+        return wrap_pi(az - obs.own_nose_az), el - obs.own_nose_el
+
+    def _gun_lead_action(self, obs: Observation) -> Action:
+        """按提前量把机头压到炮口解上（近距、机头已基本对正时使用）。
+
+        这里不用 pursuit_action：它把俯仰误差夹在 ±4° 以抑制高速摆振，
+        而炮口的垂直提前量往往有 10° 以上，被夹掉之后弹丸会系统性打低。
+        """
+        az, el = self._gun_lead(obs)
+        act = aim_action(obs, az, el, gain=1.6, throttle=0.85)
+        cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.25, 2.0)), 1.0)
+        if act.n > cap:
+            act.n = cap
+        act.fire = obs.in_gun_trigger
+        return act
+
+    def _gun_press(self, obs: Observation) -> Action:
+        """航炮压进：收油门到角点速度附近，用最大瞬时过载把机头压向目标。
+
+        两架同速、同过载一起盘旋时，相对角度恒定在 90°，谁也别想拿到
+        炮口解。破解办法只有一条：让转弯半径比对手小——半径 ∝ v²，
+        减速到角点速度附近再拉满瞬时过载，用真实的转弯性能差把角度抢
+        回来。这不是放宽炮口门限，而是改变进入炮口解的几何。
+        """
+        act = pursuit_action(obs, *self._gun_lead(obs), gain=1.6, throttle=0.45)
+        act.n = min(obs.own_n_avail, self.n_pos_tol)
+        act.fire = obs.in_gun_trigger
+        return act
 
     def _recover(self, obs: Observation) -> Action:
         """边界/高度安全优先：先转向空域中心，再修正高度。

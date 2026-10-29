@@ -72,10 +72,30 @@ TSFC_AB = 5.60e-5    # kg/(N·s)，加力
 # 所有机载雷达/导引头的标称距离都按这个基准值给出。
 RCS_REF = 1.0
 
+# ---------- 机炮扳机窗口 ----------
+GUN_TRIGGER_RANGE_FRAC = 0.90   # 扳机窗口的射程 = 机炮射程 × 该系数
+GUN_TRIGGER_CONE = math.radians(15.0)  # 扳机窗口的半锥角
+# 扳机是“压住扳机打连发”，不是“只在精确炮口解那一瞬扣一下”：0.1 s 的决策
+# 延迟内机头会多次穿越 8° 门限，只按决策时刻的 in_gun_cone 放弹，真正的
+# 炮口解几乎必然漏掉。所以 Agent 用更宽的扳机窗口，弹丸照常沿炮线出膛，
+# 命中仍由外弹道与散布决定——打偏的弹是真实的浪费，而不是被代码吞掉。
+
 
 def rcs_scale(rcs: float) -> float:
     """目标 RCS 对雷达探测距离的缩放系数（相对 1 m²）。"""
     return (max(rcs, 0.001) / RCS_REF) ** 0.25
+
+
+def military_endurance(spec: "AircraftSpec", fuel: float) -> float:
+    """剩余燃油按军用推力折算的可持续秒数（跨机型统一的“还能打多久”口径）。
+
+    燃料流量 ≈ 军推 × 军推耗油率。Bingo 约束与超时裁决都用这一口径，
+    而不是“燃油百分比”：Su-57 与 F-16 的油箱、发动机差了一个量级，
+    只有换算成时间，两边的续航才可比。
+    """
+    if spec.fuel_capacity <= 0.0:
+        return float("inf")
+    return max(fuel, 0.0) / max(spec.mil_thrust() * TSFC_MIL, 1e-9)
 
 # 导弹的终端物理：动压不足时舵面已经压不出升力，导弹只能按弹道坠落。
 MISSILE_MIN_Q = 1200.0          # Pa，低于该动压判定失去控制能力
@@ -103,14 +123,20 @@ CHAFF_LIFE = 4.0            # s，箔条云有效持续时间
 FLARE_LIFE = 2.5            # s，热诱弹燃烧时间
 CHAFF_SEDUCE_RANGE = 2000.0  # m，箔条对雷达导引头的有效诱骗距离
 FLARE_SEDUCE_RANGE = 1800.0  # m，热诱弹对红外导引头的有效诱骗距离
-CHAFF_SEDUCE_RATE = 0.35     # 1/s，箔条每秒诱骗成功的概率
-FLARE_SEDUCE_RATE = 0.45     # 1/s，热诱弹每秒诱骗成功的概率
-AUTO_CHAFF_RANGE = 5000.0    # m，雷达弹进入该距离自动投箔条
-# 箔条寿命只有几秒、有效诱骗距离约 2 km，撒得太早会在弹飞到之前就飘散失效，
-# 所以这个距离必须和 CHAFF_LIFE / CHAFF_SEDUCE_RANGE 匹配，而不是越远越好。
-AUTO_FLARE_RANGE = 5000.0    # m，红外弹进入该距离自动投热诱弹
+CHAFF_SEDUCE_RATE = 0.28     # 1/s，箔条每秒诱骗成功的概率
+FLARE_SEDUCE_RATE = 0.28     # 1/s，热诱弹每秒诱骗成功的概率
+# 自动投放距离必须落在导引头的有效诱骗距离附近，而不是越远越好：
+# 干扰物寿命只有几秒，在 5 km 外撒出去，等弹飞到早就烧完/飘散了。
+AUTO_CHAFF_RANGE = 3500.0    # m，雷达弹逼近到该距离自动投箔条
+AUTO_FLARE_RANGE = 2000.0    # m，红外弹逼近到该距离自动投热诱弹
 CM_DROP_CD = 1.5             # s，同一种干扰物的投放间隔
 CM_DECOY_KEEP = 1.5          # s，诱骗成功后导弹继续追诱饵的时间
+# 引信/点火延迟：干扰物离机后要经过点火、展开才能形成有效回波/热源，
+# 这个窗口内它骗不走任何导引头。没有这一项，干扰弹等于“撒手即生效”，
+# 近距弹在 5 km 内几乎百分之百被诱骗。
+CM_ARM_TIME = 0.5            # s，投放后生效延迟
+# 热诱弹按“连投”使用：一次投放 2 枚，形成一片红外诱饵云，而不是单发。
+FLARE_SALVO = 2              # 枚/次，一次投放消耗的热诱弹数量
 # 箔条只有和载机落在同一个多普勒通道里才骗得走雷达导引头：迎头/尾追时
 # 载机径向速度很大，箔条一撒出去就和载机分开，所以必须配合横转/三九投放。
 CHAFF_NOTCH_MIN = 0.55       # 横转程度（0=迎头/尾追，1=正侧方）低于该值不投放
@@ -619,6 +645,10 @@ class Observation:
     closure: float               # 接近率，正为接近
     in_gun_range: bool
     in_gun_cone: bool
+    # 扳机窗口：比 900 m / 8° 的炮口锥宽一圈。飞行员在接近炮口解时就压住
+    # 扳机，实际出膛由火控按每个物理步的瞬时炮口解放行——0.1 s 的决策
+    # 延迟足以让机头在门限内外穿越好几次，只看决策时刻必然漏掉真正的窗口。
+    in_gun_trigger: bool
 
     # 本机状态
     own_speed: float
@@ -657,6 +687,9 @@ class Observation:
     dof: int = 3                     # 当前内核自由度，过失速只在 6DOF 生效
     own_tvc: bool = False            # 本机是否带推力矢量喷口
     own_fuel_frac: float = 1.0       # 剩余燃油比例
+    # 剩余燃油按军推折算的续航秒数（见 military_endurance）：Bingo 判据与
+    # 超时裁决的统一口径，不同机型的油箱/耗油率因此可以直接比较。
+    own_mil_endurance: float = 0.0
     own_ab: bool = False             # 当前是否在开加力
     own_thrust_frac: float = 0.0     # 当前推力 / 最大加力推力
     own_cruise_throttle: float = 0.8  # 维持当前速度所需的军推油门（巡航功率）
@@ -1205,6 +1238,10 @@ class World:
         closure = -((fvx - mvx) * ux + (fvy - mvy) * uy + (fvz - mvz) * uz)
         in_range = dist <= me.spec.gun_range
         in_cone = in_range and angle_off_nose <= me.spec.gun_cone
+        trigger = (
+            dist <= me.spec.gun_range * GUN_TRIGGER_RANGE_FRAC
+            and angle_off_nose <= GUN_TRIGGER_CONE
+        )
 
         # 导引头包线：弹轴（机头）视场 + 锁定距离，与机炮炮线分开计算。
         mspec = me.spec.missile
@@ -1356,6 +1393,7 @@ class World:
             closure=closure,
             in_gun_range=in_range,
             in_gun_cone=in_cone,
+            in_gun_trigger=trigger,
             own_speed=me.v,
             own_speed_frac=me.v / me.spec.v_stall_at(me.z, me.mass),
             own_alt=me.z,
@@ -1377,6 +1415,7 @@ class World:
                 me.fuel / me.spec.fuel_capacity
                 if me.spec.fuel_capacity > 0.0 else 1.0
             ),
+            own_mil_endurance=military_endurance(me.spec, me.fuel),
             own_ab=me.ab > 0.05,
             own_thrust_frac=me.thrust / max(me.spec.thrust_max, 1.0),
             own_cruise_throttle=_cruise_throttle(
@@ -2095,9 +2134,12 @@ class World:
     def _update_countermeasures(self) -> None:
         """干扰物投放、飘落与对在飞导弹的诱骗。
 
-        自动投放：雷达制导导弹逼近到 9 km 投箔条，红外弹逼近到 5 km 投热诱弹。
-        诱骗判定：诱饵落在导引头视场内且足够近时，按秒概率把导弹的视线
-        拉到诱饵上（主动弹需要已进入末段自主截获，中制导段的数据链不受箔条影响）。
+        自动投放：雷达弹逼近到 AUTO_CHAFF_RANGE、红外弹逼近到 AUTO_FLARE_RANGE
+        才投放，且必须已建立跟踪（红外弹还要越过导引头锁定时间）。热诱弹按
+        FLARE_SALVO 连投，弹药因此是真正会打光的。
+        诱骗判定：诱饵落在导引头视场内、足够近、且已越过 CM_ARM_TIME 的
+        点火展开延迟后，才按秒概率把导弹视线拉到诱饵上（主动弹需要已进入
+        末段自主截获，中制导段的数据链不受箔条影响）。
         """
         dt = self.dt
 
@@ -2120,10 +2162,12 @@ class World:
                             self._drop(idx, ac, "chaff", q)
                             ac.chaff -= 1
                             ac.chaff_cd = CM_DROP_CD
-                elif not m.spec.is_radar and ac.flares > 0 and ac.flare_cd <= 0.0:
-                    if dist <= AUTO_FLARE_RANGE:
+                elif not m.spec.is_radar and ac.flares >= FLARE_SALVO and ac.flare_cd <= 0.0:
+                    # 热诱弹只在导引头确实锁定、且已经烧过锁定时间之后才投：
+                    # 投放器不是听到“有红外弹”就撒，而是等告警确认被跟踪。
+                    if dist <= AUTO_FLARE_RANGE and m.t >= m.spec.lock_time:
                         self._drop(idx, ac, "flare")
-                        ac.flares -= 1
+                        ac.flares -= FLARE_SALVO
                         ac.flare_cd = CM_DROP_CD
 
         # 干扰物飘落：强阻尼 + 重力，箔条几乎停在原地，热诱弹掉得更快。
@@ -2160,6 +2204,9 @@ class World:
                 dx, dy, dz = cm.x - m.x, cm.y - m.y, cm.z - m.z
                 d = math.sqrt(dx * dx + dy * dy + dz * dz)
                 if d >= best_d or d < 1e-6:
+                    continue
+                # 刚投放的诱饵还没点火/展开，骗不走导引头。
+                if cm.t < CM_ARM_TIME:
                     continue
                 # 诱饵必须落在弹体导引头视场内才有意义。
                 if (m.nx * dx + m.ny * dy + m.nz * dz) / d < math.cos(m.spec.gimbal):
@@ -2565,6 +2612,22 @@ class World:
                 self._finish(0, "超时判定：血量优势", "timeout")
             elif b_ratio > r_ratio:
                 self._finish(1, "超时判定：血量优势", "timeout")
+            elif (
+                abs(
+                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
+                    - military_endurance(self.acs[1].spec, self.acs[1].fuel)
+                )
+                > 5.0
+            ):
+                # 血量打平就比“还能打多久”：剩余军推续航长的一方掌握主动权，
+                # 续航短的一方按 Bingo 规则本来就必须退出交战，判其失利。
+                if (
+                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
+                    > military_endurance(self.acs[1].spec, self.acs[1].fuel)
+                ):
+                    self._finish(0, "超时判定：续航优势", "timeout")
+                else:
+                    self._finish(1, "超时判定：续航优势", "timeout")
             else:
                 self.result = "draw"
                 self.reason = "超时判定：平局"
