@@ -487,6 +487,10 @@ class TacticalAgent:
         MISSILE_DEFENSE + LOCK_DEFENSE
         + ("CRANK", "NOTCH_DESC", "F_POLE", "COBRA")
     )
+    # 半滚倒转（含高 G 变体）在竖直面里画半个圆，高度净损失 2R；俯冲中
+    # 还会加速、半径继续变大。所有“能不能做破 S”的判据统一走 _split_s_room，
+    # 不再各自写死一个 2400 m 之类的常数。
+    _SPLIT_FAMILY = frozenset(("SPLIT_S", "HIGH_G_SPLIT_S"))
     # 反击动作是一次性的角度反转：做完（或做砸）要冷却一段时间再评估，
     # 否则被咬尾时会每 0.1 s 重新下发一次破 S，永远停在改出段。
     COUNTER_COOLDOWN = 5.0
@@ -805,8 +809,46 @@ class TacticalAgent:
         ):
             plan = tactic(sit, obs)
             if plan is not None:
-                return plan
-        return self._tactic_engage(sit, obs)
+                return self._floor_guard(plan, obs)
+        return self._floor_guard(self._tactic_engage(sit, obs), obs)
+
+    def _floor_guard(
+        self, plan: tuple[str, str], obs: Observation,
+    ) -> tuple[str, str]:
+        """破 S 的离地安全检查：余量不足时换成水平急转。
+
+        反击/改出族一旦锁定动作就按 4–5 s 的承诺期重复返回同一个破 S，
+        承诺期里高度可能已经从 5 km 掉到 3 km。这种“承诺”不能覆盖安全：
+        低空时统一改成不下降的 BREAK，等承诺期结束再由各战术重新决策。
+        """
+        if (
+            plan[1] in self._SPLIT_FAMILY
+            and obs.z_margin_low <= self._split_s_room(obs)
+        ):
+            return "SURVIVE", "BREAK"
+        return plan
+
+    def _turn_radius(self, obs: Observation) -> float:
+        """当前速度下竖直面转弯半径 R = v²/(g√(n²−1))。
+
+        过载取与 _split_s 相同的指令值（own_n_avail·0.9，并受耐受与结构
+        上限约束）：若按“理论可用过载”估算，半径会偏小两三成，算出来的
+        余量正好放行一次实际拉不出来的破 S。
+        """
+        n = max(min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK), 2.5)
+        return obs.own_speed ** 2 / (G * math.sqrt(max(n * n - 1.0, 1.0)))
+
+    def _split_s_room(self, obs: Observation) -> float:
+        """做一次破 S 需要的离地余量。
+
+        半滚倒扣后拉半圈，高度净掉 2R（R 见 _turn_radius）；俯冲段还会
+        加速 —— 速度涨 15% 半径就涨 32%，所以半径按 1.15·v 算，再乘 1.2
+        并加 200 m 安全垫。低空时半径很小、2R 也许不到 2400 m，仍保留
+        2400 m 作为机型级的下限。
+        """
+        n = max(min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK), 2.5)
+        r = (1.15 * obs.own_speed) ** 2 / (G * math.sqrt(max(n * n - 1.0, 1.0)))
+        return max(2400.0, 2.4 * r + 200.0)
 
     def _tactic_recover(
         self, sit: _Situation, obs: Observation,
@@ -815,6 +857,14 @@ class TacticalAgent:
         # 转弯半径随速度平方增长，所以边界余量按速度缩放，避免高速时来不及转回。
         edge_need = max(900.0, 8.0 * obs.own_speed)
         low_need = max(1200.0, 3.5 * obs.own_speed)
+        if obs.own_gamma < math.radians(-10.0):
+            # 已经在下俯：余量必须盖住“把航迹拉平”要占用的竖直空间，
+            # 否则 RECOVER 会在 −70° 俯冲里才启动，剩几百米根本拉不起来。
+            low_need = max(
+                low_need,
+                self._turn_radius(obs)
+                * (1.0 - math.cos(obs.own_gamma)) * 1.25 + 300.0,
+            )
         if (
             obs.edge_margin < edge_need
             or obs.z_margin_low < low_need
@@ -835,7 +885,9 @@ class TacticalAgent:
         # 眼镜蛇是瞬态机动：机头拉到极限迎角后必须立刻改出，否则会变成
         # 挂在高迎角上持续爬升，速度被抽干、反而成了靶子。
         if self.primitive == "COBRA" and self._phase_t > 1.5:
-            return "SURVIVE", "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+            return "SURVIVE", (
+                "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
+            )
         # 规避过程中仍要守住能量：机头已经高高抬起、速度又不够时，
         # 继续压坡度拉过载只会变成爬升耗能，先俯冲把航迹角压下来。
         if (
@@ -843,8 +895,10 @@ class TacticalAgent:
             and obs.own_gamma > math.radians(25.0)
             and obs.own_speed_frac < 1.70
         ):
-            # 破 S 会掉近 2 km 高度，低空时再做就是直接扎地。
-            return "SURVIVE", "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+            # 破 S 会掉 2R 高度（R 随速度平方增长），低空时再做就是直接扎地。
+            return "SURVIVE", (
+                "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
+            )
         # 先手打完立刻转为偏置防御：刚发射的中距弹还需要载机照射/数据链，
         # 这时不再继续直冲压近，而是把目标压到 40° 偏置（CRANK）——一边保持
         # 制导，一边用横向位移拉开交战几何、降低接近率，把自己从对方的
@@ -896,7 +950,10 @@ class TacticalAgent:
             )
             if not keep_illum:
                 if obs.incoming_missile_dist > self.MISSILE_BREAK_DIST:
-                    return "SURVIVE", "BEAM" if obs.z_margin_low > 1500.0 else "SPLIT_S"
+                    # 远距规避只用横转：破 S 是掉高度的动作，离地 1.5 km
+                    # 时再倒扣拉半圈等于自己撞地（原来这里的判断还写反了，
+                    # 低空反而去选 SPLIT_S）。
+                    return "SURVIVE", "BEAM"
                 return "SURVIVE", self._pick_defense(obs, vs_missile=True)
         # 过载疲劳接近失控：没有近距威胁时先卸载恢复，避免 G-LOC 白送人头。
         if (
@@ -965,7 +1022,7 @@ class TacticalAgent:
             obs.dist > 1200.0
             and obs.own_speed_frac > 1.55
             and obs.energy_diff > -15000.0
-            and obs.z_margin_low > 1200.0
+            and obs.z_margin_low > self._split_s_room(obs)
         ):
             return self._start_counter("COUNTER_HEADON", "SPLIT_S")
         # 反咬：距离很近、速度允许时剪刀是唯一能立刻抢角度的动作。
@@ -1014,9 +1071,9 @@ class TacticalAgent:
             )
         elif obs.own_speed_frac >= 1.45 and obs.energy_diff >= -6000.0:
             plan = ("RESET", "EXTEND")
-        elif obs.z_margin_low > 2400.0:
+        elif obs.z_margin_low > self._split_s_room(obs):
             # 破 S 不需要速度富余：半滚倒扣本来就是掉高度换机头，只要
-            # 留够离地余量就能把水平盘旋改成一次垂直掉头。
+            # 留够离地余量（2R）就能把水平盘旋改成一次垂直掉头。
             plan = ("RESET", "SPLIT_S")
         else:
             plan = ("RESET", "BREAK")
@@ -1387,7 +1444,7 @@ class TacticalAgent:
         顺序；末段刚建立起来的三九/横转姿态也不会被无收益地换掉。
         """
         if obs.own_speed_frac < self.LOW_ENERGY_FRAC:
-            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+            return "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
         pool = self.MISSILE_DEFENSE if vs_missile else self.LOCK_DEFENSE
         cands = [c for c in pool if self._defense_ok(c, obs)]
         if not cands:
@@ -1406,6 +1463,10 @@ class TacticalAgent:
         ):
             return False
         if obs.own_speed_frac < m.min_speed_frac:
+            return False
+        if primitive in self._SPLIT_FAMILY and (
+            obs.z_margin_low <= self._split_s_room(obs)
+        ):
             return False
         if m.low_alt_need and obs.z_margin_low <= m.low_alt_need:
             return False
@@ -1596,10 +1657,19 @@ class TacticalAgent:
         """
         el_target = 0.0
         pull_out = obs.own_gamma < math.radians(-15.0)
-        if obs.z_margin_low < max(1200.0, 3.5 * obs.own_speed):
+        urgent = obs.z_margin_low < max(1200.0, 3.5 * obs.own_speed)
+        if urgent:
             el_target = math.radians(25.0) if pull_out else math.radians(12.0)
         elif obs.z_margin_high < 600.0:
             el_target = math.radians(-12.0)
+        if urgent and pull_out:
+            # 低空大俯角：先翼平、按可用过载全力拉起。此时再把升力分给
+            # “飞向空域中心”的坡度，竖直分量只剩 n·cosφ，就是压不出
+            # 足够的 γ̇，人在 1.5 km 边界上看着飞机以 −70° 扎下去。
+            act = aim_action(obs, 0.0, el_target - obs.own_gamma, gain=2.5)
+            act.bank = 0.0
+            act.n = min(obs.own_n_avail, self.n_pos_tol)
+            return act
         return aim_action(
             obs,
             wrap_pi(obs.center_az - obs.own_psi),
