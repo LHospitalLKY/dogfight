@@ -163,54 +163,6 @@ F16_CANOPY_MATERIALS = {
 F16_GEAR_Y = -0.95
 
 
-def _simple_model(length: float, twin: bool = False) -> dict:
-    """OBJ 缺失时的替代机体：用方块按真实尺寸比例拼一架简化战斗机。
-
-    仓库不带 3D 模型（.gitignore 忽略了模型目录），远程/CI 环境拿不到 OBJ。
-    这里按机体长度生成低面数几何，保证观战与录制仍能出画面；有模型时
-    仍然走原来的体素简化路径，两者接口一致。
-    """
-    half = length / 2.0
-    w = 0.055 * length       # 机身半宽
-    h = 0.050 * length       # 机身半高
-    thin = 0.008 * length    # 翼面厚度
-    faces: list[tuple[list[tuple[float, float, float]], str]] = []
-
-    def box(x0, x1, y0, y1, z0, z1, kind="body"):
-        v = [
-            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
-            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
-        ]
-        for a, b, c, d in (
-            (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
-            (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0),
-        ):
-            faces.append(([v[a], v[b], v[c], v[d]], kind))
-
-    # 机身 + 锥形机头。
-    box(-0.62 * half, 0.60 * half, -w, w, -h, h)
-    box(0.60 * half, half, -0.35 * w, 0.35 * w, -0.55 * h, 0.55 * h)
-    # 主翼：后掠直角三角形按矩形近似，展长按公开翼展取。
-    box(-0.24 * half, 0.10 * half, -0.34 * length, 0.34 * length, -thin, thin, "wing")
-    # 平尾。
-    box(-0.98 * half, -0.72 * half, -0.20 * length, 0.20 * length, -thin, thin, "tail")
-    # 垂尾（z 向下为正，因此向负 z 竖起）+ 腹鳍。
-    box(-0.98 * half, -0.66 * half, -0.02 * length, 0.02 * length, -h - 0.10 * length, -h, "tail")
-    # 座舱。
-    box(0.06 * half, 0.46 * half, -0.032 * length, 0.032 * length, -h - 0.035 * length, -h, "canopy")
-    # 进气道与喷口。
-    box(-0.10 * half, 0.20 * half, -w - 0.022 * length, -w, -0.45 * h, 0.35 * h, "intake")
-    box(-0.10 * half, 0.20 * half, w, w + 0.022 * length, -0.45 * h, 0.35 * h, "intake")
-    if twin:
-        for y in (-0.030 * length, 0.030 * length):
-            box(-0.70 * half, -0.62 * half, y - 0.022 * length,
-                y + 0.022 * length, -0.030 * length, 0.030 * length, "nozzle")
-    else:
-        box(-0.70 * half, -0.62 * half, -0.028 * length, 0.028 * length,
-            -0.032 * length, 0.032 * length, "nozzle")
-    return {"length": length, "faces": faces, "cull": False, "outline": False}
-
-
 def _load_obj_model(
     path: str,
     length: float,
@@ -218,17 +170,12 @@ def _load_obj_model(
     keep_materials: set | None = None,
     canopy_materials: set | None = None,
     gear_y: float | None = None,
-    twin: bool = False,
 ) -> dict:
     """读取 OBJ 并做体素聚类简化，返回机体坐标系下的面列表。
 
     原始 OBJ 坐标：x 朝机头、z 为展向、y 向上，原点不在机身中心。
     这里统一缩放/平移成 (x 前, y 右, z 下)，与内核和渲染的机体系一致。
-    文件不存在时回退到 `_simple_model`，不阻断观战/录制。
     """
-    if not os.path.exists(path):
-        return _simple_model(length, twin)
-
     canopy_set = _CANOPY_MATERIALS if canopy_materials is None else canopy_materials
     verts = []
     faces = []
