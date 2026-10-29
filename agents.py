@@ -432,6 +432,14 @@ class TacticalAgent:
     MISSILE_EVADE_DIST = 9000.0  # 来袭格斗弹进入该距离就开始规避
     SARH_EVADE_DIST = 16000.0    # 中距弹的告警距离更远：超视距阶段就要开始偏置
     MISSILE_BREAK_DIST = 4500.0  # 更远时用能量友好的横转/俯冲拉长 F-pole
+    # 先手发射后的偏置距离：自己的中距弹还在飞时，若与目标仍相距该距离以上，
+    # 打完立刻转入 CRANK 偏置，而不是继续直冲压近。太近（<8 km）时偏置没有
+    # 几何收益，反而浪费补射窗口，交回进攻层。
+    POST_LAUNCH_CRANK_DIST = 8000.0
+    # 偏置窗口时长：中距弹从 20 km 飞到命中约 15–17 s，全程偏置会把对局
+    # 拖成远距僵持（实测发射数 +17%、命中率 38%→22%）。8 s 足够把接近率
+    # 压下来、让自己脱离对方当时发射线，又不至于丢掉随后的补射窗口。
+    POST_LAUNCH_CRANK_TIME = 8.0
     COBRA_DIST = 1800.0          # 矢量喷口机型的过失速反制距离：来弹贴脸才用
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
     OPENING_DIST = 20000.0       # 开局占位阶段：距离大于该值时不直冲对头
@@ -559,10 +567,20 @@ class TacticalAgent:
         self.n_pos_tol = G_PEAK
         self.n_neg_tol = G_NEG_PEAK
 
+        # 先手发射后的偏置窗口：看到自己的中距弹离架就开计时，
+        # 窗口内用 CRANK 保持照射/数据链并拉开几何，窗口结束立刻回到进攻。
+        self._post_launch_t = 0.0
+        self._prev_radar_in_flight = 0
+
     # ---------- 主入口 ----------
 
     def act(self, obs: Observation) -> Action:
         self._update_g_tolerance(obs)
+        # 先手偏置窗口：中距弹数量增加说明刚有一发离架。
+        if obs.own_radar_in_flight > self._prev_radar_in_flight:
+            self._post_launch_t = self.POST_LAUNCH_CRANK_TIME
+        self._prev_radar_in_flight = obs.own_radar_in_flight
+        self._post_launch_t = max(0.0, self._post_launch_t - self.dt)
         self._counter_cd = max(0.0, self._counter_cd - self.dt)
         if self._counter_commit > 0.0:
             self._counter_commit = max(0.0, self._counter_commit - self.dt)
@@ -801,6 +819,16 @@ class TacticalAgent:
         ):
             # 破 S 会掉近 2 km 高度，低空时再做就是直接扎地。
             return "SURVIVE", "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+        # 先手打完立刻转为偏置防御：刚发射的中距弹还需要载机照射/数据链，
+        # 这时不再继续直冲压近，而是把目标压到 40° 偏置（CRANK）——一边保持
+        # 制导，一边用横向位移拉开交战几何、降低接近率，把自己从对方的
+        # 发射包里拉出来。偏置窗口结束后立刻回到进攻，避免远距僵持。
+        if (
+            self._post_launch_t > 0.0
+            and obs.incoming_missile_dist > self.SARH_EVADE_DIST
+            and obs.dist > self.POST_LAUNCH_CRANK_DIST
+        ):
+            return "SURVIVE", "CRANK"
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
         # 只有进入近距才用最大过载急转硬甩。
         # 雷达制导中距弹（含主动弹）在超视距阶段就要开始偏置/横转；
