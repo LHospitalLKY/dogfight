@@ -1017,7 +1017,9 @@ class Renderer:
             # 机动原语标签随飞机移动：从机体引一条短线；靠近屏幕边缘时翻到
             # 机体另一侧，不再做贴边夹取（夹取会让标签脱开飞机停在边框上）。
             primitive = getattr(agents[i], "primitive", "PURE") if agents else "PURE"
-            label = self.font_small.render(f"{primitive} {ac.z:.0f}m", True, color)
+            tactic = getattr(agents[i], "tactic", "") if agents else ""
+            text = f"{tactic}·{primitive} {ac.z:.0f}m" if tactic else f"{primitive} {ac.z:.0f}m"
+            label = self.font_small.render(text, True, color)
             tw, th = label.get_size()
             gap = 20.0 * size
             ty = int(pos[1] + (-34.0 if i == 0 else 8.0))
@@ -1378,7 +1380,7 @@ class Renderer:
             pygame.draw.polygon(self.screen, color_, pts)
 
     def _draw_aircraft_panel(self, ac, agent, color, right: bool, incoming: int = 0) -> None:
-        width, height = 236, 194
+        width, height = 236, 232
         x = self.w - width - 20 if right else 20
         y = 20
         pygame.draw.rect(self.screen, (26, 29, 34), pygame.Rect(x, y, width, height))
@@ -1437,6 +1439,16 @@ class Renderer:
         sit = self.font_small.render(f"SIT {situation}", True, SUB)
         self.screen.blit(sit, (x + width - 14 - sit.get_width(), y + 119))
 
+        # 分层显示：TAC 是战术层（打什么仗），MAN 是机动层（具体怎么飞）。
+        tactic = getattr(agent, "tactic", "") if agent else ""
+        primitive = getattr(agent, "primitive", "") if agent else ""
+        self.screen.blit(
+            self.font_small.render(f"TAC {tactic}", True, color), (x + 14, y + 137)
+        )
+        self.screen.blit(
+            self.font_small.render(f"MAN {primitive}", True, TEXT), (x + 14, y + 155)
+        )
+
         # 燃油与功率档位：AB = 加力，MIL = 军推；油尽后只能军推。
         cap = ac.spec.fuel_capacity
         fuel_frac = clamp(ac.fuel / cap, 0.0, 1.0) if cap > 0.0 else 1.0
@@ -1446,11 +1458,11 @@ class Renderer:
             self.font_small.render(
                 line, True, (255, 168, 64) if ab_on else (150, 200, 160)
             ),
-            (x + 14, y + 135),
+            (x + 14, y + 177),
         )
 
         # HP 条 + 数值
-        bx, by, bw, bh = x + 14, y + 161, 132, 12
+        bx, by, bw, bh = x + 14, y + 203, 132, 12
         pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
         ratio = max(0.0, ac.hp / ac.spec.hp_max)
         pygame.draw.rect(self.screen, color, pygame.Rect(bx, by, bw * ratio, bh))
