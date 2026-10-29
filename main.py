@@ -51,7 +51,10 @@ R73 = MissileSpec(
     max_g=40.0, seeker_fov=math.radians(45.0),
     gimbal_fov=math.radians(60.0), seeker_range=10000.0,
     lock_time=0.8, min_range=300.0, max_range=30000.0,
-    thrust=12000.0, burn_time=5.0, burnout_mass=65.0,
+    # 两段推力：助推 1.4 s / 30 kN，续航 3.6 s / 4.8 kN，总冲约 59 kN·s
+    # （等效比冲约 150 s），推进剂 40 kg 按恒定比冲烧完，弹重 105→65 kg。
+    thrust=4800.0, burn_time=5.0, boost_thrust=30000.0, boost_time=1.4,
+    burnout_mass=65.0,
     cd0=0.9, cd0_wave=1.2, cn_max=8.0, warhead_damage=100.0, lethal_radius=9.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
@@ -61,7 +64,9 @@ AIM9X = MissileSpec(
     max_g=50.0, seeker_fov=math.radians(90.0),
     gimbal_fov=math.radians(90.0), seeker_range=12000.0,
     lock_time=0.5, min_range=300.0, max_range=16000.0,
-    thrust=10800.0, burn_time=4.0, burnout_mass=50.0,
+    # 助推 1.2 s / 24 kN，续航 2.8 s / 5.0 kN，总冲约 43 kN·s。
+    thrust=5000.0, burn_time=4.0, boost_thrust=24000.0, boost_time=1.2,
+    burnout_mass=50.0,
     cd0=0.9, cd0_wave=1.2, cn_max=10.0, warhead_damage=110.0, lethal_radius=8.0,
     life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
 )
@@ -79,7 +84,9 @@ R77_1 = MissileSpec(
     max_g=40.0, seeker_fov=math.radians(60.0),
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.5, min_range=1500.0, max_range=80000.0,
-    thrust=26000.0, burn_time=8.0, burnout_mass=100.0,
+    # 助推 3 s / 42 kN，续航 5 s / 16.4 kN，总冲约 208 kN·s。
+    thrust=16400.0, burn_time=8.0, boost_thrust=42000.0, boost_time=3.0,
+    burnout_mass=100.0,
     cd0=0.55, cd0_wave=1.2, cn_max=8.0, warhead_damage=110.0, lethal_radius=11.0,
     life=50.0, cooldown=3.0, pn_gain=4.0, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=20000.0,
@@ -90,7 +97,9 @@ AIM120C = MissileSpec(
     max_g=40.0, seeker_fov=math.radians(60.0),
     gimbal_fov=math.radians(60.0), seeker_range=35000.0,
     lock_time=1.2, min_range=1500.0, max_range=75000.0,
-    thrust=21000.0, burn_time=7.0, burnout_mass=80.0,
+    # 助推 3 s / 34 kN，续航 4 s / 11.25 kN，总冲约 147 kN·s。
+    thrust=11250.0, burn_time=7.0, boost_thrust=34000.0, boost_time=3.0,
+    burnout_mass=80.0,
     cd0=0.55, cd0_wave=1.2, cn_max=9.0, warhead_damage=105.0, lethal_radius=10.0,
     life=45.0, cooldown=3.0, pn_gain=4.2, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=18000.0,

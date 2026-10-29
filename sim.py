@@ -31,7 +31,12 @@ BANK_CMD_MAX = math.pi / MAX_BANK
 # 只在 3DOF 的 psi_dot 坐标奇点处给一个角速度上限，避免 cos(gamma)->0 时数值爆掉。
 PSI_DOT_LIMIT = math.radians(70.0)
 N_MIN = -3.0                       # 战斗机负过载极限约 -3 g
-MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴对准速度矢量的最大角速度
+MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴转向目标视线的最大角速度
+# 弹体轴与速度矢量的最大夹角（可用迎角）。弹体可以比速度矢量转得快，
+# 但迎角超过气动极限后翼面失速、升力反而下降。近距弹在大迎角下靠
+# 气动舵面 + 助推段推力沿弹体轴的转弯分量获得很高的初始转向能力，
+# 这也是 R-73/AIM-9X 能做大离轴发射的物理基础。
+MISSILE_ALPHA_MAX = math.radians(20.0)
 # 离轴发射的自身安全：前推 1.5 s 弹道，若弹与载机的最近距离小于
 # 战斗部杀伤半径 + 该余量，就视为“可能把自己打下来”，放弃这次发射。
 # 大离轴角 + 载机低速时转弯半径很小，弹有可能在载机前方掉头时擦过自己。
@@ -303,6 +308,31 @@ class MissileSpec:
     # 导弹推重比高，峰值马赫几乎完全由这一项决定；旧模型没有它，
     # 中距弹会冲到 M5 以上，比真实弹道快出一大截。
     cd0_wave: float = 0.55
+    # 助推-续航两段推力：固体火箭通常先大推力短时助推，再小推力长时续航。
+    # boost_time<=0 时退化为原来的“全程恒定推力”。两段总冲保持不变，
+    # 因此射程量级不变，但初期加速更快、末段存速分配更接近真实弹道。
+    boost_thrust: float = 0.0    # N，助推段推力
+    boost_time: float = 0.0      # s，助推段时长
+
+    def thrust_at(self, t: float) -> float:
+        """t 时刻的发动机推力（0 表示已经熄火，由燃料量另行判断）。"""
+        if 0.0 < self.boost_time and t < self.boost_time:
+            return self.boost_thrust
+        return self.thrust
+
+    def mass_flow_at(self, t: float) -> float:
+        """t 时刻推进剂质量流 kg/s：按恒定比冲折算，与推力成正比。
+
+        两段推力的总冲由 ∫Tdt 给出，质量流取 propellant·T(t)/∫Tdt，
+        保证全部推进剂恰好在 burn_time 内烧完，弹重随时间连续下降。
+        """
+        impulse = (
+            self.boost_thrust * self.boost_time
+            + self.thrust * max(self.burn_time - self.boost_time, 0.0)
+        )
+        if impulse <= 0.0:
+            return 0.0
+        return self.propellant * self.thrust_at(t) / impulse
 
     @property
     def is_sarh(self) -> bool:
@@ -323,10 +353,6 @@ class MissileSpec:
     @property
     def propellant(self) -> float:
         return max(self.mass - self.burnout_mass, 0.0)
-
-    @property
-    def mass_flow(self) -> float:
-        return self.propellant / self.burn_time if self.burn_time > 0.0 else 0.0
 
     @property
     def gimbal(self) -> float:
@@ -2237,13 +2263,16 @@ class World:
                     if not illum:
                         m.guided = False
 
-            # 推进剂质量流失，推力只作用到燃料耗尽。
+            # 推进剂质量流失：质量流与当前推力成正比（恒定比冲），
+            # 弹重随时间下降，加速度 a=T/m 因此逐渐变大；燃料耗尽后熄火。
             thrust = 0.0
             if m.fuel > 1e-6 and m.mass > 1e-6:
-                burn = min(m.fuel, m.spec.mass_flow * dt)
+                flow = m.spec.mass_flow_at(m.t)
+                burn = min(m.fuel, flow * dt)
                 m.fuel -= burn
                 m.mass -= burn
-                thrust = m.spec.thrust
+                # 熄火判据用“烧完”而不是“本步没烧满”：后者会把正常步误判成熄火。
+                thrust = 0.0 if m.fuel <= 1e-6 else m.spec.thrust_at(m.t)
             if m.mass <= 1.0:
                 m.alive = False
                 continue
@@ -2285,12 +2314,11 @@ class World:
             if ang_seeker > m.spec.gimbal and not midcourse:
                 m.guided = False
             else:
-                slew = min(
-                    MISSILE_SLEW_RATE,
-                    a_axis_max / max(speed, 40.0),
-                )
+                # 弹体轴转向目标视线：弹体可以转得比速度矢量快，二者之差
+                # 就是迎角（气动舵面因此建立升力）。但迎角受气动极限约束，
+                # 超出后翼面失速；这里把弹体轴投影回迎角锥内。
                 if ang_seeker > 1e-6:
-                    frac = min(1.0, slew * dt / ang_seeker)
+                    frac = min(1.0, MISSILE_SLEW_RATE * dt / ang_seeker)
                     px_, py_, pz_ = (
                         losx - m.nx * cos_seeker,
                         losy - m.ny * cos_seeker,
@@ -2306,6 +2334,23 @@ class World:
                         m.nz = m.nz * ca + pz_ * sa
                         nn = math.sqrt(m.nx * m.nx + m.ny * m.ny + m.nz * m.nz)
                         m.nx, m.ny, m.nz = m.nx / nn, m.ny / nn, m.nz / nn
+                cos_a = m.nx * ux + m.ny * uy + m.nz * uz
+                if cos_a < math.cos(MISSILE_ALPHA_MAX):
+                    # 把弹体轴投影到“绕速度矢量、半锥角 α_max”的锥面上。
+                    nxp, nyp, nzp = (
+                        m.nx - ux * cos_a, m.ny - uy * cos_a, m.nz - uz * cos_a,
+                    )
+                    npn = math.sqrt(nxp * nxp + nyp * nyp + nzp * nzp)
+                    if npn < 1e-9:
+                        # 退化情形（弹体轴与速度反向）：任取一个垂直方向。
+                        nxp, nyp, nzp = (-uy, ux, 0.0) if abs(ux) + abs(uy) > 1e-6 else (1.0, 0.0, 0.0)
+                        npn = math.sqrt(nxp * nxp + nyp * nyp + nzp * nzp)
+                    nxp, nyp, nzp = nxp / npn, nyp / npn, nzp / npn
+                    ca = math.cos(MISSILE_ALPHA_MAX)
+                    sa = math.sin(MISSILE_ALPHA_MAX)
+                    m.nx = ux * ca + nxp * sa
+                    m.ny = uy * ca + nyp * sa
+                    m.nz = uz * ca + nzp * sa
 
             cmd_x = cmd_y = cmd_z = 0.0     # 本拍制导指令（横向加速度 N）
             if m.guided and dist > 1.0:
