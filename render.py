@@ -22,6 +22,9 @@ SUB = (148, 155, 165)
 TEAM_COLORS = ((232, 92, 80), (86, 150, 255))
 # 轨迹采样间距：整场都保留，但按距离抽点，避免几千段线拖慢每帧。
 TRAIL_SPACING = 60.0
+# 航迹飘带半宽（屏幕像素）：按相机深度换算成世界尺度，保证镜头拉近拉远时
+# 飘带都有稳定的可见厚度，而不是一条 1–2 px 的细线。
+TRAIL_HALF_PX = 5.0
 # 开火点抽稀：同一个点射不必每一帧都插一个标记。
 SHOT_SPACING = 120.0
 # 每隔多少个采样点放一个方向箭头。
@@ -353,6 +356,9 @@ class Renderer:
         self.focal = (self.h / 2.0) / math.tan(FOV / 2.0)
 
         self.trails: list[list[tuple[float, float, float]]] = [[], []]
+        # 每个航迹采样点的机体横向轴（机体 y 轴 = 翼展方向），用来把航迹
+        # 画成一条与飞机机体 xy 平面一致的宽飘带，而不是屏幕上的细线。
+        self.trail_axes: list[list[tuple[float, float, float]]] = [[], []]
         self.fire_marks: list[list[tuple[float, float, float]]] = [[], []]
         # 轨迹事件：导弹发射点 (队别, 位置) 与高 G 机动点 (队别, 位置)。
         self.launch_marks: list[tuple[int, tuple[float, float, float]]] = []
@@ -469,6 +475,7 @@ class Renderer:
 
     def reset(self) -> None:
         self.trails = [[], []]
+        self.trail_axes = [[], []]
         self.fire_marks = [[], []]
         self.launch_marks = []
         self.highg_marks = []
@@ -495,6 +502,10 @@ class Renderer:
             last = self._last_sample[i]
             if last is None or math.dist(last, p) >= TRAIL_SPACING:
                 self.trails[i].append(p)
+                # 记录当时的机翼方向：飘带宽度沿机体 y 轴展开，
+                # 因此飞机滚转/俯仰时飘带会跟着倾斜。
+                _, yb, _ = body_axes(*attitude_of(ac))
+                self.trail_axes[i].append(yb)
                 self._last_sample[i] = p
             if ac.firing:
                 last_shot = self._last_shot[i]
@@ -603,24 +614,20 @@ class Renderer:
 
     def _draw_trails(self) -> None:
         for i, trail in enumerate(self.trails):
-            color = tuple(int(c * 0.60) for c in TEAM_COLORS[i])
-            arrow_color = tuple(int(c * 0.95) for c in TEAM_COLORS[i])
+            color = tuple(int(c * 0.72) for c in TEAM_COLORS[i])
+            arrow_color = tuple(min(255, int(c * 1.05)) for c in TEAM_COLORS[i])
             if len(trail) >= 2:
                 # GPU 模式下航迹线由 OpenGL 画，这里只保留箭头与事件标记。
                 if not self.gpu:
-                    run: list[tuple[float, float]] = []
-                    for p0, p1 in zip(trail, trail[1:]):
-                        seg = self._clip_segment(p0, p1)
-                        if seg is None:
-                            if len(run) >= 2:
-                                pygame.draw.lines(self.screen, color, False, run, 2)
-                            run = []
-                            continue
-                        if not run:
-                            run.append(seg[0])
-                        run.append(seg[1])
-                    if len(run) >= 2:
-                        pygame.draw.lines(self.screen, color, False, run, 2)
+                    axes = self.trail_axes[i]
+                    # 宽飘带：每一段画成一个四边形，宽度方向取当时的机体
+                    # y 轴（去掉沿切线的分量），因此飘带平面始终落在飞机
+                    # 机体的 xy 平面内，飞机滚转/俯仰时飘带跟着倾斜。
+                    for j in range(1, len(trail)):
+                        axis = axes[j] if j < len(axes) else (0.0, 1.0, 0.0)
+                        self._draw_trail_ribbon(
+                            trail[j - 1], trail[j], axis, color,
+                        )
 
                 # 方向箭头：沿航迹等距放箭标，整局走线在远看时也能读出方向。
                 for j in range(ARROW_EVERY, len(trail), ARROW_EVERY):
@@ -677,18 +684,74 @@ class Renderer:
         pygame.draw.polygon(self.screen, fill, pts)
         pygame.draw.polygon(self.screen, edge, pts, 1)
 
-    def _draw_arrow(self, s0, s1, color, size: float = 6.0) -> None:
-        """在 s1 处画一个沿 s0→s1 的箭头。"""
+    def _draw_trail_ribbon(
+        self, p0, p1, y_axis, color: tuple[int, int, int],
+    ) -> None:
+        """画一段航迹飘带：四边形宽度沿机体 y 轴，平面与机体 xy 平面一致。
+
+        先把两端做近裁剪面裁剪；宽度方向取机体 y 轴在“垂直于航迹”的
+        平面上的分量，再按当前相机深度换算成世界尺度，使屏幕厚度稳定在
+        约 2×TRAIL_HALF_PX 像素。飘带侧对镜头时自然变窄，保留立体感。
+        """
+        a, b = self._view(p0), self._view(p1)
+        if a[2] <= NEAR and b[2] <= NEAR:
+            return
+        if a[2] <= NEAR:
+            t = (NEAR - a[2]) / (b[2] - a[2])
+            a = tuple(a[k] + (b[k] - a[k]) * t for k in range(3))
+        elif b[2] <= NEAR:
+            t = (NEAR - b[2]) / (a[2] - b[2])
+            b = tuple(b[k] + (a[k] - b[k]) * t for k in range(3))
+
+        tx, ty, tz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+        tl = math.sqrt(tx * tx + ty * ty + tz * tz)
+        if tl < 1e-6:
+            return
+        tx, ty, tz = tx / tl, ty / tl, tz / tl
+        d = y_axis[0] * tx + y_axis[1] * ty + y_axis[2] * tz
+        ux, uy, uz = (
+            y_axis[0] - tx * d, y_axis[1] - ty * d, y_axis[2] - tz * d,
+        )
+        ul = math.sqrt(ux * ux + uy * uy + uz * uz)
+        if ul < 1e-6:
+            return
+        ux, uy, uz = ux / ul, uy / ul, uz / ul
+
+        # 方向在世界系，先转到相机坐标系再按深度定宽。
+        u_cam = (
+            ux * self.right[0] + uy * self.right[1] + uz * self.right[2],
+            ux * self.up[0] + uy * self.up[1] + uz * self.up[2],
+            ux * self.forward[0] + uy * self.forward[1] + uz * self.forward[2],
+        )
+        depth = 0.5 * (a[2] + b[2])
+        half = TRAIL_HALF_PX * depth / self.focal
+        ox, oy, oz = (u_cam[0] * half, u_cam[1] * half, u_cam[2] * half)
+        quad = (
+            (a[0] + ox, a[1] + oy, a[2] + oz),
+            (a[0] - ox, a[1] - oy, a[2] - oz),
+            (b[0] - ox, b[1] - oy, b[2] - oz),
+            (b[0] + ox, b[1] + oy, b[2] + oz),
+        )
+        if min(q[2] for q in quad) <= NEAR:
+            return
+        pygame.draw.polygon(self.screen, color, [self._screen_of(q) for q in quad])
+
+    def _draw_arrow(self, s0, s1, color, size: float = 10.0) -> None:
+        """在 s1 处画一个沿 s0→s1 的实心箭标（尾部内凹的细长箭头）。"""
         dx, dy = s1[0] - s0[0], s1[1] - s0[1]
         n = math.hypot(dx, dy)
         if n < 8.0:
             return
         ux, uy = dx / n, dy / n
-        left = (s1[0] - ux * size - uy * size * 0.6,
-                s1[1] - uy * size + ux * size * 0.6)
-        right = (s1[0] - ux * size + uy * size * 0.6,
-                 s1[1] - uy * size - ux * size * 0.6)
-        pygame.draw.lines(self.screen, color, False, [left, s1, right], 2)
+        # 箭尖在航迹点，箭身向后收；两侧翼点略靠前、尾部中点内凹，
+        # 屏幕上就是一个细长的实心箭头，和宽飘带一起读作“带方向的航迹”。
+        tip = s1
+        back = (s1[0] - ux * size * 2.2, s1[1] - uy * size * 2.2)
+        left = (s1[0] - ux * size * 1.1 - uy * size * 0.62,
+                s1[1] - uy * size * 1.1 + ux * size * 0.62)
+        right = (s1[0] - ux * size * 1.1 + uy * size * 0.62,
+                 s1[1] - uy * size * 1.1 - ux * size * 0.62)
+        pygame.draw.polygon(self.screen, color, [tip, left, back, right])
 
     def _draw_gun_envelopes(self, world: World) -> None:
         """机炮包线画成机体所在高度的水平圆环，透视后自然成椭圆。"""
