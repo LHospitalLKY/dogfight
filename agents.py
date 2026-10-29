@@ -1,18 +1,24 @@
-"""M2 Agent：几何态势判定 + 机动原语战术层。
+"""M2 Agent：四层结构 = 几何判定 → 战术 → 机动 → 控制。
 
-分三层
-------
-1. 几何判定：把 Observation 压缩成“谁占位”的态势（进攻/防御/对头/中立/脱离）。
-2. 原语选择：按态势、能量、距离和个体倾向选一个机动原语。
-3. 原语执行：每个决策周期输出一次 Action(bank, n, throttle, fire)。
+分层
+----
+1. 几何判定（`_assess`）：把 Observation 压缩成“谁占位”的态势
+   （进攻/防御/对头/中立/脱离）。
+2. 战术层（`_plan` / `_tactic_*`）：按 恢复 → 生存 → 反击 → 被锁防御 → 交战 的优先级
+   选一个战术族。反击族（`COUNTER_*`）是主动的：被咬尾时用机动换角度，
+   或把尾追转成迎头，而不是一路被动规避。
+3. 机动层（`MANEUVERS` + `_maneuvers`）：每个机动声明自己的能力
+   （高 G / 最低速度 / 高度余量 / 距离门限），由表驱动执行，不再按名字前缀猜。
+4. 控制层（`Action`）：滚转角 + 过载 + 油门，由同一套内核执行。
 
-所有原语最终都落到 3DOF 的滚转角 + 过载指令上，因此可以被同一套
-点质量内核执行，也方便以后交给 RL 直接学习。
+所有机动最终都落到滚转角 + 过载指令上，因此可以被点质量内核执行，
+也方便以后交给 RL 直接学习。
 """
 from __future__ import annotations
 
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sim import G, MAX_BANK, Action, Observation, clamp, wrap_pi
@@ -66,6 +72,69 @@ TURNING = frozenset((
     "BREAK", "HIGH_G_BREAK", "BEAM",
 ))
 TURN_HOLD = 2.0
+
+
+@dataclass(frozen=True)
+class Maneuver:
+    """机动动作（第 2 层）：只描述“怎么做”和它的准入能力。
+
+    tactic 是该机动的归属战术族，仅用于分层说明与日志；真正的选择逻辑
+    在战术层，机动层不参与“打不打”的判断。
+    """
+
+    name: str
+    tactic: str = "OFFENSIVE"
+    high_g: bool = False          # 靠透支能量换角度，能量保护要让位
+    min_speed_frac: float = 1.0   # 最低速度（相对当地失速）
+    low_alt_need: float = 0.0     # 需要的离地余量 m
+    high_alt_need: float = 0.0    # 需要的高度余量 m
+    ps_positive: bool = False     # 要求 Ps > 0（否则做不完垂直机动）
+    max_dist: float = 0.0         # 需要贴脸才能做的动作
+
+
+# 第 2 层注册表：名字 → 能力声明。准入条件（_defense_ok）与能量保护
+# （_limit_energy）都从这里读取，不再用 "HIGH_G" 前缀或名字集合硬编码。
+MANEUVERS: dict[str, Maneuver] = {
+    "RECOVER": Maneuver("RECOVER", "RECOVER"),
+    "UNLOAD": Maneuver("UNLOAD", "SURVIVE"),
+    "POSITION": Maneuver("POSITION", "OFFENSIVE"),
+    "PURE": Maneuver("PURE", "OFFENSIVE"),
+    "LEAD": Maneuver("LEAD", "OFFENSIVE"),
+    "LAG": Maneuver("LAG", "OFFENSIVE"),
+    "LEAD_TURN": Maneuver("LEAD_TURN", "OFFENSIVE"),
+    "ONE_CIRCLE": Maneuver("ONE_CIRCLE", "OFFENSIVE"),
+    "TWO_CIRCLE": Maneuver("TWO_CIRCLE", "OFFENSIVE"),
+    "HIGH_G_TURN": Maneuver("HIGH_G_TURN", "OFFENSIVE", high_g=True),
+    "HIGH_YOYO": Maneuver("HIGH_YOYO", "OFFENSIVE"),
+    "LOW_YOYO": Maneuver("LOW_YOYO", "OFFENSIVE"),
+    "BEAM": Maneuver("BEAM", "DEFENSIVE"),
+    "NOTCH_DESC": Maneuver("NOTCH_DESC", "DEFENSIVE"),
+    "CRANK": Maneuver("CRANK", "DEFENSIVE"),
+    "F_POLE": Maneuver("F_POLE", "DEFENSIVE"),
+    "BREAK": Maneuver("BREAK", "DEFENSIVE"),
+    "HIGH_G_BREAK": Maneuver("HIGH_G_BREAK", "DEFENSIVE", high_g=True),
+    "SPLIT_S": Maneuver(
+        "SPLIT_S", "DEFENSIVE", min_speed_frac=1.35, low_alt_need=2400.0,
+    ),
+    "HIGH_G_SPLIT_S": Maneuver(
+        "HIGH_G_SPLIT_S", "DEFENSIVE", high_g=True, low_alt_need=2200.0,
+    ),
+    "BARREL": Maneuver("BARREL", "DEFENSIVE", min_speed_frac=1.35),
+    "HIGH_G_BARREL": Maneuver(
+        "HIGH_G_BARREL", "DEFENSIVE", high_g=True, low_alt_need=2200.0,
+    ),
+    "IMMELMANN": Maneuver(
+        "IMMELMANN", "DEFENSIVE", min_speed_frac=1.70,
+        high_alt_need=2500.0, ps_positive=True,
+    ),
+    "LOOP": Maneuver(
+        "LOOP", "DEFENSIVE", min_speed_frac=1.85,
+        high_alt_need=3000.0, ps_positive=True,
+    ),
+    "SCISSORS": Maneuver("SCISSORS", "COUNTER", max_dist=1200.0),
+    "COBRA": Maneuver("COBRA", "DEFENSIVE"),
+    "EXTEND": Maneuver("EXTEND", "DISENGAGE"),
+}
 
 
 def aim_action(
@@ -388,6 +457,12 @@ class TacticalAgent:
         MISSILE_DEFENSE + LOCK_DEFENSE
         + ("CRANK", "NOTCH_DESC", "F_POLE", "COBRA")
     )
+    # 反击动作是一次性的角度反转：做完（或做砸）要冷却一段时间再评估，
+    # 否则被咬尾时会每 0.1 s 重新下发一次破 S，永远停在改出段。
+    COUNTER_COOLDOWN = 5.0
+    # 反击一旦选定就要执行完整套动作（破 S / 剪刀需要数秒），
+    # 不能下一拍就被“被锁防御”抢走，否则只会做一个 0.1 s 的抖动。
+    COUNTER_COMMIT = 4.0
 
     def __init__(
         self,
@@ -418,8 +493,11 @@ class TacticalAgent:
             # 48 km 的接近段最多只换取 0.5–1.2 km 高度。
             self._open_climb_gain = self._rng.uniform(500.0, 1200.0)
 
-        self.primitive = "PURE"
+        self.primitive = "PURE"     # 当前机动（第 2 层，保留给日志/渲染）
+        self.tactic = "OFFENSIVE"   # 当前战术族（第 1 层）
         self.situation = ""
+        # 第 2 层执行表：机动名 → 具体动作函数。选择逻辑不在这一层。
+        self._maneuvers = self._build_maneuver_table()
         self._hold = 0.0
         self._phase = 0
         self._phase_t = 0.0
@@ -428,6 +506,10 @@ class TacticalAgent:
         self._def_sign = 1.0
         self._def_reverse_t = 0.0
         self._def_engaged = False
+        self._counter_cd = 0.0
+        # 已承诺执行的反击 (战术, 机动) 及剩余执行时间。
+        self._counter_plan: tuple[str, str] | None = None
+        self._counter_commit = 0.0
         self._opening_done = False
         # 开局爬升目标的当前值：以有限速率逼近 _open_climb，避免 Ps 在门限
         # 附近抖动时把俯仰指令整档切换。
@@ -466,6 +548,13 @@ class TacticalAgent:
 
     def act(self, obs: Observation) -> Action:
         self._update_g_tolerance(obs)
+        self._counter_cd = max(0.0, self._counter_cd - self.dt)
+        if self._counter_commit > 0.0:
+            self._counter_commit = max(0.0, self._counter_commit - self.dt)
+            if self._counter_commit <= 0.0:
+                # 承诺期结束：清空方案并进入冷却，避免立刻重新选同一个反击。
+                self._counter_plan = None
+                self._counter_cd = self.COUNTER_COOLDOWN
         self._yoyo_cd = max(self._yoyo_cd - self.dt, 0.0)
         # 防御转向的连续性：威胁只在持续位于反侧时才换向，避免“一进防御就反转”。
         # 方位接近 ±180°（威胁正在正后方）时两侧完全等价，而 wrap 会让符号
@@ -506,7 +595,9 @@ class TacticalAgent:
         ):
             self._make_merge_plan(obs)
 
-        want = self._sticky_defense(self._choose(sit, obs))
+        tactic, want = self._plan(sit, obs)
+        self.tactic = tactic
+        want = self._sticky_defense(want)
         # 垂直机动必须做完：破 S / 殷麦曼 / 筋斗 / 桶滚都依赖连续几秒的
         # 滚转 + 拉杆，被 0.7 s 的最短驻留切走就只剩一次莫名其妙的摆翼。
         # 只有边界/能量这类安全原语可以打断；超时兜底防止卡在某个分段。
@@ -615,10 +706,30 @@ class TacticalAgent:
             far=far,
         )
 
-    # ---------- 第二层：原语选择 ----------
+    # ---------- 第二层：战术（恢复 / 生存 / 反击 / 交战） ----------
 
-    def _choose(self, sit: _Situation, obs: Observation) -> str:
-        # 安全优先：贴着边界或高度上下限时先回场。
+    def _plan(self, sit: _Situation, obs: Observation) -> tuple[str, str]:
+        """战术层入口，返回 (战术族, 机动名)。
+
+        优先级：恢复 > 生存 > 反击 > 被锁防御 > 交战。生存只处理真正的
+        威胁（来袭弹、过载疲劳、能量与弹药底线）；单纯被雷达锁定交给
+        反击族优先处理——被咬尾时反咬比横转更有收益。
+        """
+        for tactic in (
+            self._tactic_recover,
+            self._tactic_survive,
+            self._tactic_counter,
+            self._tactic_defend_locked,
+        ):
+            plan = tactic(sit, obs)
+            if plan is not None:
+                return plan
+        return self._tactic_engage(sit, obs)
+
+    def _tactic_recover(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """恢复：贴着边界或高度上下限时先回场。"""
         # 转弯半径随速度平方增长，所以边界余量按速度缩放，避免高速时来不及转回。
         edge_need = max(900.0, 8.0 * obs.own_speed)
         low_need = max(1200.0, 3.5 * obs.own_speed)
@@ -627,11 +738,22 @@ class TacticalAgent:
             or obs.z_margin_low < low_need
             or obs.z_margin_high < 600.0
         ):
-            return "RECOVER"
+            return "RECOVER", "RECOVER"
+        return None
+
+    def _tactic_survive(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """生存：导弹规避、过载疲劳、能量与弹药底线。
+
+        这一段不追求占位，只保证“先活下来”；全部命中即返回，否则交回
+        战术层继续询问反击与交战。单纯被雷达锁定不在这里处理：那是
+        反击族的机会窗口，反咬不成立时才由 LOCK_DEFENSE 兜底。
+        """
         # 眼镜蛇是瞬态机动：机头拉到极限迎角后必须立刻改出，否则会变成
         # 挂在高迎角上持续爬升，速度被抽干、反而成了靶子。
         if self.primitive == "COBRA" and self._phase_t > 1.5:
-            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+            return "SURVIVE", "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
         # 规避过程中仍要守住能量：机头已经高高抬起、速度又不够时，
         # 继续压坡度拉过载只会变成爬升耗能，先俯冲把航迹角压下来。
         if (
@@ -640,7 +762,7 @@ class TacticalAgent:
             and obs.own_speed_frac < 1.70
         ):
             # 破 S 会掉近 2 km 高度，低空时再做就是直接扎地。
-            return "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
+            return "SURVIVE", "SPLIT_S" if obs.z_margin_low > 2400.0 else "BREAK"
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
         # 只有进入近距才用最大过载急转硬甩。
         # 雷达制导中距弹（含主动弹）在超视距阶段就要开始偏置/横转；
@@ -665,13 +787,13 @@ class TacticalAgent:
                 and obs.own_speed_frac > 1.90
                 and obs.z_margin_low > 1200.0
             ):
-                return "COBRA"
+                return "SURVIVE", "COBRA"
             # 雷达制导中距弹按 FC3 手册的超视距防御流程处理：
             # 自己的弹先到就 F-pole 偏置，否则三九下高。
             if obs.incoming_missile_radar:
                 anti = self._anti_radar(obs)
                 if anti is not None:
-                    return anti
+                    return "SURVIVE", anti
             # 自己的雷达弹还处在需要照射/数据链的中制导段：远距先保持机头
             # 指向把弹导完；主动弹一旦末段截获就不再需要（own_radar_support）。
             keep_illum = (
@@ -681,70 +803,142 @@ class TacticalAgent:
             )
             if not keep_illum:
                 if obs.incoming_missile_dist > self.MISSILE_BREAK_DIST:
-                    return "BEAM" if obs.z_margin_low > 1500.0 else "SPLIT_S"
-                return self._pick_defense(obs, vs_missile=True)
+                    return "SURVIVE", "BEAM" if obs.z_margin_low > 1500.0 else "SPLIT_S"
+                return "SURVIVE", self._pick_defense(obs, vs_missile=True)
         # 过载疲劳接近失控：没有近距威胁时先卸载恢复，避免 G-LOC 白送人头。
         if (
             (self.g_load > 0.90 or self.g_load_neg > 0.90)
             and obs.incoming_missile_dist > self.MISSILE_BREAK_DIST
         ):
-            return "UNLOAD"
-        # 被对方导引头/雷达锁定：先评估是否值得转入防御。自己也占进攻位、
-        # 还没打弹、或对方已经没弹时，继续进攻往往比被动规避收益更高。
-        if (
-            (obs.foe_locked or obs.foe_radar_locked)
-            and obs.dist < self.LOCK_BREAK_DIST
-            and obs.own_speed_frac > 1.30
-            and self._should_defend(obs, sit)
-        ):
-            return self._pick_defense(obs, vs_missile=False)
+            return "SURVIVE", "UNLOAD"
         # 能量-高度约束：连 1g 平飞都维持不住（Ps<0）说明已超过能量升限，
         # 再拉机动只会把速度抽干，必须先卸载俯冲换回能量。
         if obs.own_ps_level < -10.0 and obs.own_alt > 11000.0:
-            return "UNLOAD"
+            return "SURVIVE", "UNLOAD"
         # 打空或重伤就不再纠缠。只有自己明显伤得更重才脱离：双方都被打残时
         # 继续缠斗，否则两架重伤机各自逃跑会把对局拖成“飞出空域”。
         if obs.own_ammo <= 1.0 or (
             obs.own_hp_frac < 0.18
             and obs.foe_hp_frac > max(0.25, obs.own_hp_frac + 0.08)
         ):
-            return "EXTEND"
+            return "DISENGAGE", "EXTEND"
         # 能量纪律：速度接近失速时先卸载俯冲，不允许挂着机头往上爬
         if self.primitive == "UNLOAD":
             # 必须同时满足“速度回来了”和“机头已经压下来”，避免反复抬头
             if obs.own_speed_frac < 1.40 or obs.own_gamma > math.radians(15.0):
-                return "UNLOAD"
+                return "SURVIVE", "UNLOAD"
         elif obs.own_speed_frac < 1.20:
-            return "UNLOAD"
+            return "SURVIVE", "UNLOAD"
+        return None
 
+    def _tactic_counter(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """反击：被咬尾时用机动换角度，而不是一路被动规避。
+
+        四个反击战术按“最快见效”排序：
+        - COUNTER_SNAP：对手已经冲过头，立即剪刀反切；
+        - COUNTER_HEADON：能量够时做 180° 垂直反转，把尾追变迎头；
+        - COUNTER_REVERSE：同能量或占优且贴脸，用剪刀把机头甩回去；
+        - COUNTER_DRAG：能量劣势时先拉开，等对手掉速再反切。
+
+        反击必须让位给生存：有来袭弹、或过载疲劳接近失控时一律不做，
+        否则会在弹道末端把机腹反复转向来袭弹。
+        """
+        if obs.incoming_missile_dist < self.MISSILE_EVADE_DIST:
+            return None
+        # 承诺期内不重新决策：破 S / 剪刀是数秒量级的动作，中途被下一拍
+        # 改判就只剩一个没有收益的抖动。
+        if self._counter_commit > 0.0 and self._counter_plan is not None:
+            return self._counter_plan
+        if obs.own_speed_frac < 1.35 or self.g_load > 0.85 or self._counter_cd > 0.0:
+            return None
+        # “被咬尾”：目标几乎在正后方，而我的机头背离他。
+        tail = (
+            obs.foe_off_nose < math.radians(50.0)
+            and obs.angle_off_nose > math.radians(110.0)
+        )
+        if not tail and sit.name != "DEFENSIVE":
+            return None
+        if obs.dist > 6000.0:
+            return None
+        # 反切：对手冲过头。
+        if sit.overshoot and obs.dist < 900.0 and obs.own_speed_frac > 1.45:
+            return self._start_counter("COUNTER_SNAP", "SCISSORS")
+        # 迎头化：破 S 的 180° 反转需要离地余量，且不能太慢。
+        # energy_diff 的单位是 J/kg（v²/2 + g·z）：-15000 约等于 300 m/s 下
+        # 20 m/s 的速度亏欠，再差就说明反转做完会被对手直接压住。
+        if (
+            obs.dist > 1200.0
+            and obs.own_speed_frac > 1.55
+            and obs.energy_diff > -15000.0
+            and obs.z_margin_low > 1200.0
+        ):
+            return self._start_counter("COUNTER_HEADON", "SPLIT_S")
+        # 反咬：距离很近、速度允许时剪刀是唯一能立刻抢角度的动作。
+        # 这里不再要求比能量占优——被咬尾时本来就常年能量吃亏，
+        # 要求占优等于永远不反咬。
+        if obs.dist < 1500.0 and obs.own_speed_frac > 1.45:
+            return self._start_counter("COUNTER_REVERSE", "SCISSORS")
+        # 诱敌：能量劣势时先拉开距离，等对手掉速后再转入反切。
+        if 2000.0 <= obs.dist <= 6000.0 and obs.energy_diff < -8000.0:
+            return self._start_counter("COUNTER_DRAG", "EXTEND")
+        return None
+
+    def _start_counter(self, tactic: str, primitive: str) -> tuple[str, str]:
+        """锁定一次反击，并设定承诺执行时间（见 COUNTER_COMMIT）。"""
+        self._counter_plan = (tactic, primitive)
+        self._counter_commit = self.COUNTER_COMMIT
+        return self._counter_plan
+
+    def _tactic_defend_locked(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """被锁防御：被雷达/红外锁定但没有立刻可用的反击几何时，转被动规避。
+
+        这一档排在反击之后：同样是“被咬尾”，能反咬就先反咬，反咬不成立
+        （距离、速度、能量或冷却不允许）才退回横转/破 S 消耗对手的射击机会。
+        """
+        if not (obs.foe_locked or obs.foe_radar_locked):
+            return None
+        if obs.dist >= self.LOCK_BREAK_DIST or obs.own_speed_frac <= 1.30:
+            return None
+        if not self._should_defend(obs, sit):
+            return None
+        return "LOCK_DEFENSE", self._pick_defense(obs, vs_missile=False)
+
+    def _tactic_engage(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str]:
+        """交战：占位、抢位方案、进攻/防御几何与近距缠斗。"""
         if sit.name == "SEPARATED":
             # 超视距阶段按“先视、先射、先撤”推进。
             # 自己的中距弹还在中制导时必须保持机头指向（数据链/照射），
             # 占位/偏置动作只能在这里之后做；照射一断弹就变无控弹道。
             if obs.own_radar_support and obs.radar_tracking:
-                return "PURE"
+                return "SEPARATED", "PURE"
             # 开局先按能量/角度倾向占位。
             if not self._opening_done:
-                return "POSITION"
+                return "SEPARATED", "POSITION"
             # 进入交汇距离后提前做领先转弯，切进对手转弯圆环的内侧。
             if obs.dist < self.MERGE_START and obs.aspect > math.radians(120.0):
-                return "LEAD_TURN"
-            return "PURE"
+                return "SEPARATED", "LEAD_TURN"
+            return "SEPARATED", "PURE"
 
         if sit.name == "HEAD_ON":
             # 交汇瞬间按抢位方案执行：单环抢先指向，双环持续盘旋。
             # 能量明显占优时改用高 Yo-Yo 把速度换成高度再从上方压下来。
             if self._merge_plan == "ONE_CIRCLE":
-                return "ONE_CIRCLE"
+                return "HEAD_ON", "ONE_CIRCLE"
             if self._merge_plan == "TWO_CIRCLE":
-                return "TWO_CIRCLE"
+                return "HEAD_ON", "TWO_CIRCLE"
             if (
                 sit.e_adv > 0.0
                 and self.energy_pref >= 0.5
                 and self._yoyo_cd <= 0.0
             ):
-                return "HIGH_YOYO"
-            return "LEAD" if self.aggression > 0.6 else "BREAK"
+                return "HEAD_ON", "HIGH_YOYO"
+            return "HEAD_ON", "LEAD" if self.aggression > 0.6 else "BREAK"
 
         # 交汇后的第一圈仍按抢位方案执行：HEAD_ON 只是一个瞬时窗口，
         # 双方真正开始盘旋时已转为 NEUTRAL/DEFENSIVE，若不延续方案，
@@ -755,20 +949,21 @@ class TacticalAgent:
             and obs.dist < self.MERGE_HOLD
             and obs.aspect > math.radians(55.0)
         ):
-            return "ONE_CIRCLE" if self._merge_plan == "ONE_CIRCLE" else "TWO_CIRCLE"
+            name = "ONE_CIRCLE" if self._merge_plan == "ONE_CIRCLE" else "TWO_CIRCLE"
+            return sit.name, name
 
         if sit.name == "DEFENSIVE":
             # 只有对方真的冲过头（接近率为正、距离很近且机头已偏）才做剪刀；
             # 仅仅“贴得近”就反复剪刀，会变成每 1.4 s 一次的无收益反向机动。
             if sit.overshoot:
-                return "SCISSORS"
-            return "BREAK"
+                return "DEFENSIVE", "SCISSORS"
+            return "DEFENSIVE", "BREAK"
 
         if sit.name == "OFFENSIVE":
             if sit.close:
-                return "LAG" if sit.overshoot else "PURE"
+                return "OFFENSIVE", "LAG" if sit.overshoot else "PURE"
             if sit.far:
-                return "PURE"
+                return "OFFENSIVE", "PURE"
             # 角度还不够、速度与过载耐受都富余时用高 G 转弯抢角度。
             # 机体本身拉不出 6.5 g 时（高空低速）换成普通追逐，等高 G 变得
             # “名副其实”再拉，否则只是白白把能量抽干。
@@ -777,8 +972,8 @@ class TacticalAgent:
                 and self.n_pos_tol > 6.5
                 and obs.own_n_avail >= HIGH_G_MIN_AVAIL
             ):
-                return "HIGH_G_TURN"
-            return "LEAD"
+                return "OFFENSIVE", "HIGH_G_TURN"
+            return "OFFENSIVE", "LEAD"
 
         # 近距缠斗但机头落后：速度与过载耐受都富余时用高 G 转弯抢角度。
         if (
@@ -788,7 +983,7 @@ class TacticalAgent:
             and self.n_pos_tol > 6.5
             and obs.own_n_avail >= HIGH_G_MIN_AVAIL
         ):
-            return "HIGH_G_TURN"
+            return "NEUTRAL", "HIGH_G_TURN"
 
         # NEUTRAL：贴身缠斗时用垂直机动消耗/补充能量
         if sit.close:
@@ -800,17 +995,17 @@ class TacticalAgent:
                 and high_ok
                 and self._yoyo_cd <= 0.0
             ):
-                return "HIGH_YOYO"      # 太快：把多余速度换成高度
+                return "NEUTRAL", "HIGH_YOYO"   # 太快：把多余速度换成高度
             if (
                 obs.own_speed_frac < 1.5
                 and self.energy_pref < 0.5
                 and low_ok
                 and self._yoyo_cd <= 0.0
             ):
-                return "LOW_YOYO"       # 太慢：俯冲增速再拉起
+                return "NEUTRAL", "LOW_YOYO"    # 太慢：俯冲增速再拉起
         if sit.angle < math.radians(25.0):
-            return "LEAD" if not sit.far else "PURE"
-        return "PURE"
+            return "NEUTRAL", "LEAD" if not sit.far else "PURE"
+        return "NEUTRAL", "PURE"
 
     # ---------- 人体过载耐受 ----------
 
@@ -919,36 +1114,26 @@ class TacticalAgent:
         return "BREAK" if vs_missile else "BEAM"
 
     def _defense_ok(self, primitive: str, obs: Observation) -> bool:
-        """防御原语的能量/高度/距离/过载耐受准入条件。"""
-        if primitive.startswith("HIGH_G"):
-            # 高 G 规避要同时有速度和过载余量；疲劳时拉不出高 G，不如老实横转。
-            ok = (
-                obs.own_speed_frac > 1.45
-                and self.n_pos_tol > 6.0
-                and obs.own_n_avail >= HIGH_G_MIN_AVAIL
-            )
-            if primitive in ("HIGH_G_SPLIT_S", "HIGH_G_BARREL"):
-                # 高 G 破 S 同样要近 2 km 的掉高空间；
-                ok = ok and obs.z_margin_low > 2200.0
-            return ok
-        if primitive == "SPLIT_S":
-            return obs.z_margin_low > 2400.0 and obs.own_speed_frac > 1.35
-        if primitive == "BARREL":
-            return obs.own_speed_frac > 1.35
-        if primitive == "SCISSORS":
-            return obs.dist < 1200.0
-        if primitive == "IMMELMANN":
-            return (
-                obs.own_speed_frac > 1.70
-                and obs.z_margin_high > 2500.0
-                and obs.own_ps_level > 0.0
-            )
-        if primitive == "LOOP":
-            return (
-                obs.own_speed_frac > 1.85
-                and obs.z_margin_high > 3000.0
-                and obs.own_ps_level > 0.0
-            )
+        """防御机动的准入条件，全部取自机动层的能力声明。"""
+        m = MANEUVERS.get(primitive)
+        if m is None:
+            return True
+        if m.high_g and (
+            obs.own_speed_frac <= 1.45
+            or self.n_pos_tol <= 6.0
+            or obs.own_n_avail < HIGH_G_MIN_AVAIL
+        ):
+            return False
+        if obs.own_speed_frac < m.min_speed_frac:
+            return False
+        if m.low_alt_need and obs.z_margin_low <= m.low_alt_need:
+            return False
+        if m.high_alt_need and obs.z_margin_high <= m.high_alt_need:
+            return False
+        if m.ps_positive and obs.own_ps_level <= 0.0:
+            return False
+        if m.max_dist and obs.dist >= m.max_dist:
+            return False
         return True
 
     def _anti_radar(self, obs: Observation) -> str | None:
@@ -1001,6 +1186,15 @@ class TacticalAgent:
         self._hold = 0.0
         self._phase = 0
         self._phase_t = 0.0
+        # 反击战术的转向侧由战术层决定：一律朝目标所在的一侧切，才能把
+        # 机头甩回对手身上。防御动作则沿用“威胁在哪侧就往哪侧规避”。
+        if self.tactic.startswith("COUNTER"):
+            sign = 1.0 if obs.off_az >= 0.0 else -1.0
+            self._def_sign = sign
+            self._scissor_sign = sign
+            self._def_engaged = True
+            self._def_reverse_t = 0.0
+            self._counter_cd = self.COUNTER_COOLDOWN
         # 分段状态每次进入都要重置，否则上一次破 S 的 _dived 会漏进来。
         self._dived = False
         self._maneuver_done = primitive not in VERTICAL
@@ -1065,7 +1259,8 @@ class TacticalAgent:
         否则高 G 机动永远拉不到 6 g 以上、形同普通盘旋。只在速度已经
         掉到接近失速时才重新套用能量保护，避免真的拉进失速。
         """
-        if primitive.startswith("HIGH_G") and obs.own_speed_frac > 1.30:
+        m = MANEUVERS.get(primitive)
+        if m is not None and m.high_g and obs.own_speed_frac > 1.30:
             return act
         if obs.own_speed_frac < self.LOW_ENERGY_FRAC:
             cap = max(1.0, obs.own_n_sustain * self.N_MARGIN)
@@ -1073,62 +1268,43 @@ class TacticalAgent:
                 act.n = cap
         return act
 
+    def _build_maneuver_table(self) -> dict[str, Callable[[Observation], Action]]:
+        """第 2 层：机动名 → 执行函数。这里只做动作，不做选择。"""
+        return {
+            "RECOVER": self._recover,
+            "POSITION": self._position,
+            "LEAD_TURN": self._lead_turn,
+            "ONE_CIRCLE": lambda o: self._circle(o, "ONE_CIRCLE"),
+            "TWO_CIRCLE": lambda o: self._circle(o, "TWO_CIRCLE"),
+            "HIGH_G_TURN": self._high_g_turn,
+            "HIGH_G_BREAK": self._high_g_break,
+            "HIGH_G_SPLIT_S": self._high_g_split_s,
+            "HIGH_G_BARREL": self._high_g_barrel,
+            "BEAM": self._beam,
+            "PURE": lambda o: pursuit_action(o, o.off_az, o.off_el),
+            "LEAD": lambda o: pursuit_action(o, *lead_point(o, 1.0)),
+            "LAG": lambda o: pursuit_action(o, *lead_point(o, -0.6)),
+            "BREAK": self._break,
+            "SPLIT_S": self._split_s,
+            "BARREL": self._barrel,
+            "IMMELMANN": self._immelmann,
+            "LOOP": self._loop,
+            "SCISSORS": self._scissors,
+            "HIGH_YOYO": self._high_yoyo,
+            "LOW_YOYO": self._low_yoyo,
+            "CRANK": self._crank,
+            "NOTCH_DESC": self._notch_desc,
+            "F_POLE": self._f_pole,
+            "COBRA": self._cobra,
+            "EXTEND": self._extend,
+            "UNLOAD": self._unload,
+        }
+
     def _dispatch(self, primitive: str, obs: Observation) -> Action:
-        if primitive == "RECOVER":
-            return self._recover(obs)
-        if primitive == "POSITION":
-            return self._position(obs)
-        if primitive == "LEAD_TURN":
-            return self._lead_turn(obs)
-        if primitive in ("ONE_CIRCLE", "TWO_CIRCLE"):
-            return self._circle(obs, primitive)
-        if primitive == "HIGH_G_TURN":
-            return self._high_g_turn(obs)
-        if primitive == "HIGH_G_BREAK":
-            return self._high_g_break(obs)
-        if primitive == "HIGH_G_SPLIT_S":
-            return self._high_g_split_s(obs)
-        if primitive == "HIGH_G_BARREL":
-            return self._high_g_barrel(obs)
-        if primitive == "BEAM":
-            return self._beam(obs)
-        if primitive == "PURE":
-            return pursuit_action(obs, obs.off_az, obs.off_el)
-        if primitive == "LEAD":
-            az, el = lead_point(obs, 1.0)
-            return pursuit_action(obs, az, el)
-        if primitive == "LAG":
-            az, el = lead_point(obs, -0.6)
-            return pursuit_action(obs, az, el)
-        if primitive == "BREAK":
-            return self._break(obs)
-        if primitive == "SPLIT_S":
-            return self._split_s(obs)
-        if primitive == "BARREL":
-            return self._barrel(obs)
-        if primitive == "IMMELMANN":
-            return self._immelmann(obs)
-        if primitive == "LOOP":
-            return self._loop(obs)
-        if primitive == "SCISSORS":
-            return self._scissors(obs)
-        if primitive == "HIGH_YOYO":
-            return self._high_yoyo(obs)
-        if primitive == "LOW_YOYO":
-            return self._low_yoyo(obs)
-        if primitive == "CRANK":
-            return self._crank(obs)
-        if primitive == "NOTCH_DESC":
-            return self._notch_desc(obs)
-        if primitive == "F_POLE":
-            return self._f_pole(obs)
-        if primitive == "COBRA":
-            return self._cobra()
-        if primitive == "EXTEND":
-            return self._extend(obs)
-        if primitive == "UNLOAD":
-            return self._unload()
-        return aim_action(obs, obs.off_az, obs.off_el)
+        fn = self._maneuvers.get(primitive)
+        if fn is None:
+            return aim_action(obs, obs.off_az, obs.off_el)
+        return fn(obs)
 
     def _recover(self, obs: Observation) -> Action:
         """边界/高度安全优先：先转向空域中心，再修正高度。
@@ -1560,7 +1736,7 @@ class TacticalAgent:
             gamma_target=math.radians(-6.0),
         )
 
-    def _cobra(self) -> Action:
+    def _cobra(self, obs: Observation) -> Action:
         """过失速眼镜蛇：把机头拉到失速迎角以上，靠矢量喷口维持姿态。
 
         近距来弹时用来制造过冲：导弹的导引头还追着原来的速度矢量，
@@ -1569,6 +1745,6 @@ class TacticalAgent:
         """
         return Action(bank=0.0, n=1.0, throttle=0.4, fire=False, post_stall=True)
 
-    def _unload(self) -> Action:
+    def _unload(self, obs: Observation) -> Action:
         """失速边缘的补救：压平机翼、推杆改出，用高度换回速度。"""
         return Action(bank=0.0, n=-1.2, throttle=1.0, fire=False)
