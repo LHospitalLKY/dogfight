@@ -563,8 +563,18 @@ class TacticalAgent:
     # 机头还偏着时用最大过载压半径（GUN_PRESS），对正后按弹丸飞行时间
     # 打提前量（GUN_LEAD）。
     GUN_ENTRY_DIST = 2600.0                  # 进入尾后压进的距离门限 m
+    GUN_EXIT_DIST = 3000.0                   # 已进入后的保持门限（滞环，防边界抖动）
     GUN_TAIL_ANGLE = math.radians(120.0)     # 对方机头背离视线超过该值＝已在尾后
+    GUN_TAIL_EXIT = math.radians(105.0)      # 保持尾后几何的退出角（滞环）
+    GUN_SPEED_ENTRY = 1.25                   # 进入所需的速度比（相对失速速度）
+    GUN_SPEED_EXIT = 1.20                    # 保持门限；低于该值说明能量已不够压炮
     GUN_PRESS_DIST = 1200.0                  # 该距离内改提前量追踪
+    # 压进是一次冲刺而不是长期盘旋：8 g 压进每秒要掉 10–15 m/s，超过 3 s
+    # 就从“抢半径”变成“掉速被拉开”。到点后转 LAG 保位并重新积累能量。
+    GUN_PRESS_TIME = 3.0                    # 单次 GUN_PRESS 最长时间 s
+    GUN_PRESS_COOLDOWN = 2.0                # 压进中止后的冷却，防止 LAG↔PRESS 抖
+    GUN_OPEN_ABORT = 0.5                    # 接近率连续为负超过该时长即放弃压进
+    GUNS_HOLD = 1.0                        # 航炮原语最短驻留（比通用 0.7 s 长）
 
     # ---- Bingo（燃油硬约束）----
     # 剩余燃油按军推折算的续航秒数低于该值即必须脱离：现实里 Bingo 是
@@ -622,6 +632,10 @@ class TacticalAgent:
         # 已承诺执行的反击 (战术, 机动) 及剩余执行时间。
         self._counter_plan: tuple[str, str] | None = None
         self._counter_commit = 0.0
+        # 航炮压进计时：单次压进时长、压进中止冷却、接近率连续为负的时长。
+        self._gun_press_t = 0.0
+        self._gun_press_cd = 0.0
+        self._gun_open_t = 0.0
         # 僵持改出：兜圈子累计时长、当前改出方案与冷却。
         self._reset_plan: tuple[str, str] | None = None
         self._reset_commit = 0.0
@@ -687,6 +701,16 @@ class TacticalAgent:
                 self._counter_plan = None
                 self._counter_cd = self.COUNTER_COOLDOWN
         self._yoyo_cd = max(self._yoyo_cd - self.dt, 0.0)
+        # 航炮计时：按上一拍实际在执行的原语累计，离开 GUN_PRESS 即清零。
+        self._gun_press_cd = max(0.0, self._gun_press_cd - self.dt)
+        if self.tactic == "GUNS" and self.primitive == "GUN_PRESS":
+            self._gun_press_t += self.dt
+        else:
+            self._gun_press_t = 0.0
+        if self.tactic == "GUNS" and obs.closure <= 0.0:
+            self._gun_open_t += self.dt
+        else:
+            self._gun_open_t = 0.0
         self._reset_cd = max(0.0, self._reset_cd - self.dt)
         if self._reset_commit > 0.0:
             self._reset_commit = max(0.0, self._reset_commit - self.dt)
@@ -776,6 +800,10 @@ class TacticalAgent:
         need = self.YOYO_HOLD if self.primitive in ("HIGH_YOYO", "LOW_YOYO") else self.MIN_HOLD
         if self.primitive in TURNING:
             need = max(need, TURN_HOLD)
+        # 航炮三种原语切换要更慢：25° 门限附近 PRESS↔LEAD 每 0.7 s 抖一次，
+        # 油门 0.45↔1.0、过载上限同时整档跳，画面就是明显的顿挫。
+        if self.tactic == "GUNS" and self.primitive in ("GUN_PRESS", "GUN_LEAD", "LAG"):
+            need = max(need, self.GUNS_HOLD)
         if want != self.primitive and (self._hold >= need or bypass):
             self._enter(want, obs)
 
@@ -1149,16 +1177,45 @@ class TacticalAgent:
         - 机头基本对正（<25°）且已进 1.2 km：GUN_LEAD，按弹丸飞行时间给
           提前量，纯追踪只会把弹打在自己后面；
         - 其余情况：LAG，滞后追踪保持尾后位置，别一头冲过头。
+
+        门限都带滞环：进入用 2600 m / 120° / 速度比 1.25，已经在 GUNS 里
+        则放宽到 3000 m / 105° / 1.20，避免在边界上整族进出。压进本身是
+        限时冲刺——接近率转负、连续拉开 0.5 s、或已压满 3 s 就转 LAG 保位，
+        不再用 8 g 一直烧到速度见底。
         """
-        if obs.own_ammo <= 0.0 or obs.dist > self.GUN_ENTRY_DIST:
+        in_guns = self.tactic == "GUNS"
+        dist_lim = self.GUN_EXIT_DIST if in_guns else self.GUN_ENTRY_DIST
+        tail_lim = self.GUN_TAIL_EXIT if in_guns else self.GUN_TAIL_ANGLE
+        speed_lim = self.GUN_SPEED_EXIT if in_guns else self.GUN_SPEED_ENTRY
+        if obs.own_ammo <= 0.0 or obs.dist > dist_lim:
             return None
-        if obs.foe_off_nose < self.GUN_TAIL_ANGLE:
+        if obs.foe_off_nose < tail_lim:
             return None
-        if obs.own_speed_frac < 1.25 or obs.z_margin_low < 1500.0:
+        if obs.own_speed_frac < speed_lim or obs.z_margin_low < 1500.0:
             return None
-        if obs.angle_off_nose > math.radians(25.0):
+        # 进入压进用 25° 门限，已经压进去后放宽到 20° 才退出：否则机头
+        # 偏差在门限上每拍来回跨一次，PRESS↔LEAD 连同油门 0.45/1.0 一起抖。
+        press_angle = (
+            math.radians(20.0) if self.primitive == "GUN_PRESS"
+            else math.radians(25.0)
+        )
+        if obs.angle_off_nose > press_angle:
             # 尾后但机头还偏着：两架同速同过载一起盘旋时相对角度恒定在
             # 90°，靠同样的转弯拿不回来，必须把半径压得比对手小。
+            abort = (
+                self._gun_press_t >= self.GUN_PRESS_TIME
+                or self._gun_open_t >= self.GUN_OPEN_ABORT
+            )
+            if abort:
+                if self.primitive == "GUN_PRESS":
+                    self._gun_press_cd = self.GUN_PRESS_COOLDOWN
+                return "GUNS", "LAG"
+            if self._gun_press_cd > 0.0 or obs.closure <= 0.0:
+                # 接近率为负说明目标在拉开：压半径拿不到角度，只会把速度
+                # 烧光。转 LAG 开满油门保位，等几何重新收敛再压第二次。
+                if self.primitive == "GUN_PRESS":
+                    self._gun_press_cd = self.GUN_PRESS_COOLDOWN
+                return "GUNS", "LAG"
             return "GUNS", "GUN_PRESS"
         if obs.dist < self.GUN_PRESS_DIST or obs.in_gun_cone:
             # 机头已经基本对正：这时再纯追踪只会把弹丸打在自己后面（弹丸
