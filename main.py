@@ -773,7 +773,7 @@ def run_record(
         baseline, seed=seed, f16_radar=f16_radar, su57_radar=su57_radar,
     )
     # 录制要走 SDL dummy 驱动，没有 GL 上下文，直接用 CPU 渲染保证帧可读。
-    renderer = Renderer(follow=follow, follow_dist=1200.0, gpu=False)
+    renderer = Renderer(follow=follow, follow_dist=1200.0, gpu=False, size=(1280, 800))
     steps_per_frame = max(1, round(1.0 / (fps * PHYSICS_DT)))
     actions = [Action(), Action()]
     steps = 0

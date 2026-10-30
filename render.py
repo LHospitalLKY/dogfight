@@ -12,7 +12,15 @@ from array import array
 
 import pygame
 
-from sim import World, body_axes, clamp, gun_direction, wrap_pi
+from sim import (
+    CONTACT_DETECT,
+    CONTACT_TRACK,
+    World,
+    body_axes,
+    clamp,
+    gun_direction,
+    wrap_pi,
+)
 
 BG = (18, 20, 24)
 GRID = (31, 35, 41)
@@ -329,11 +337,11 @@ def _norm(a) -> tuple[float, float, float]:
 class Renderer:
     def __init__(
         self,
-        size: tuple[int, int] = (1280, 800),
+        size: tuple[int, int] = (1600, 900),
         follow: int | None = None,
         follow_dist: float = 1800.0,
         gpu: bool = True,
-        span_factor: float = 2.1,
+        span_factor: float = 1.25,
     ) -> None:
         pygame.init()
         self.w, self.h = size
@@ -387,8 +395,8 @@ class Renderer:
         # 跟随模式：相机锁定某架飞机（默认关闭，仍取两机中点）。
         self.follow = follow
         self.follow_dist = follow_dist
-        # 中点视角的取景倍率：2.1 是观战默认（留足机动余量），演示视频可以
-        # 调小一点，把两机拍得更近。
+        # 中点视角的取景倍率：1.25 让两机在 50° 视场内留约 6% 边距；
+        # 演示视频可以再调小一点，把两机拍得更近。
         self.span_factor = span_factor
 
     # ---------- 相机与投影 ----------
@@ -407,7 +415,10 @@ class Renderer:
             a, b = world.acs
             sep_xy = math.hypot(b.x - a.x, b.y - a.y)
             span = max(sep_xy, abs(b.z - a.z) * 2.0, 1400.0)
-            target_dist = clamp(span * self.span_factor, 2200.0, 60000.0)
+            # 取景距离直接按两机间距缩放：120 km 开局时旧的上限 60 km 会把
+            # 双方都推出画面，这里改成随间距线性放大（FOV 50° 下 1.25 倍间距
+            # 留约 6% 边距），上限 320 km 覆盖 200 km 空域的对角。
+            target_dist = clamp(span * self.span_factor, 2200.0, 320000.0)
         if self._cam_ready:
             self.dist += (target_dist - self.dist) * 0.06
             self.cam[0] += (cx - self.cam[0]) * 0.10
@@ -1216,6 +1227,7 @@ class Renderer:
 
         self._draw_missile_status(world)
         self._draw_attitude_panel(world)
+        self._draw_fighter_stations(world)
 
         if paused:
             ps = self.font.render("PAUSED", True, TEXT)
@@ -1586,6 +1598,394 @@ class Renderer:
 
         hp_text = self.font_small.render(f"HP {ac.hp:5.1f}", True, TEXT)
         self.screen.blit(hp_text, (bx + bw + 8, by + bh / 2 - hp_text.get_height() / 2))
+
+    # ---------- 机载座舱显示：雷达屏 + 抬头/头瞄 + 武器告警 ----------
+    STATION_W, STATION_H = 340, 414
+    SCOPE_W, SCOPE_H = 324, 150
+    HUD_W, HUD_H = 324, 110
+
+    def _draw_fighter_stations(self, world: World) -> None:
+        """红方座舱区放左侧、蓝方放右侧，每块含雷达屏、头瞄视野与武器告警。
+
+        目标颜色统一按火控状态：绿=已跟踪但未锁定，黄=正在锁定（可发射），
+        红=已完成锁定。这样雷达屏与头瞄里的同一个目标颜色始终一致。
+        """
+        y = self.h - 64 - self.STATION_H
+        left_x = 20
+        right_x = self.w - 20 - self.STATION_W
+        for i, x in enumerate((left_x, right_x)):
+            self._draw_station(
+                world, i, pygame.Rect(x, y, self.STATION_W, self.STATION_H)
+            )
+
+    def _lock_state(self, ac) -> tuple[tuple[int, int, int], str]:
+        red, yellow, green = (255, 80, 72), (255, 212, 96), (116, 232, 150)
+        if not ac.alive:
+            return red, "LOST"
+        if ac.radar_locked:
+            return red, "LOCK"
+        if ac.radar_lock_timer > 0.0:
+            return yellow, "LOCKING"
+        if ac.contact >= CONTACT_TRACK:
+            return green, "TRACK"
+        if ac.contact == CONTACT_DETECT or ac.rwr:
+            return green, "DETECT"
+        return (86, 170, 118), "SEARCH"
+
+    def _missile_threat(self, world: World, i: int):
+        """最近一枚来袭弹的 (相对机头方位, 距离)；没有威胁返回 None。"""
+        ac = world.acs[i]
+        best = None
+        for m in world.missiles:
+            if not m.alive or m.target != i:
+                continue
+            dx, dy, dz = m.x - ac.x, m.y - ac.y, m.z - ac.z
+            d = math.sqrt(dx * dx + dy * dy + dz * dz)
+            az = wrap_pi(math.atan2(dy, dx) - ac.psi)
+            if best is None or d < best[1]:
+                best = (az, d)
+        return best
+
+    def _alpha_rect(
+        self, rect: pygame.Rect, color: tuple[int, int, int], alpha: int
+    ) -> None:
+        """半透明底：座舱区压在 3D 场景上，不能把后面的空战画面盖死。"""
+        surf = pygame.Surface(rect.size, pygame.SRCALPHA)
+        surf.fill((color[0], color[1], color[2], alpha))
+        self.screen.blit(surf, rect.topleft)
+
+    def _alpha_poly(
+        self, rect: pygame.Rect, color: tuple[int, int, int],
+        points, alpha: int,
+    ) -> None:
+        surf = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.polygon(
+            surf, (color[0], color[1], color[2], alpha),
+            [(x - rect.x, y - rect.y) for x, y in points],
+        )
+        self.screen.blit(surf, rect.topleft)
+
+    def _draw_station(self, world: World, i: int, rect: pygame.Rect) -> None:
+        ac = world.acs[i]
+        team = TEAM_COLORS[i]
+        lock_color, lock_text = self._lock_state(ac)
+        # 玻璃感底衬：偏冷的浅色 + 低透明度，地面网格和航迹能透出来
+        self._alpha_rect(rect, (20, 30, 44), 95)
+        pygame.draw.rect(self.screen, team, rect, 1)
+        pygame.draw.rect(self.screen, team, pygame.Rect(rect.x, rect.y, rect.w, 3))
+
+        title = self.font_small.render(
+            f"{ac.spec.name}   {'RDR ON' if ac.radar_on else 'RDR SIL'}", True, team
+        )
+        self.screen.blit(title, (rect.x + 10, rect.y + 6))
+        st = self.font_small.render(lock_text, True, lock_color)
+        self.screen.blit(st, (rect.right - 10 - st.get_width(), rect.y + 6))
+        # 锁定进度：黄灯阶段给一条细填充条，锁定后消失（已变红）
+        if ac.radar_lock_timer > 0.0 and not ac.radar_locked:
+            rspec = ac.spec.radar_missile
+            frac = (
+                clamp(ac.radar_lock_timer / max(rspec.lock_time, 1e-6), 0.0, 1.0)
+                if rspec is not None else 0.0
+            )
+            bx, by, bw, bh = rect.right - 106, rect.y + 27, 96, 4
+            pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
+            pygame.draw.rect(
+                self.screen, lock_color, pygame.Rect(bx, by, int(bw * frac), bh)
+            )
+
+        # 竖排：雷达屏在上、抬头显示器在下
+        scope_rect = pygame.Rect(
+            rect.x + 8, rect.y + 34, self.SCOPE_W, self.SCOPE_H
+        )
+        self._draw_scope(world, i, scope_rect)
+        hud_rect = pygame.Rect(
+            rect.x + 8, scope_rect.bottom + 6, self.HUD_W, self.HUD_H
+        )
+        self._draw_fwd_hud(world, i, hud_rect)
+        self._draw_weapon_rows(world, i, rect)
+
+    def _draw_scope(self, world: World, i: int, rect: pygame.Rect) -> None:
+        """本机机头朝上的雷达屏：只有拿到距离级接触才画目标光点。"""
+        ac = world.acs[i]
+        foe = world.acs[1 - i]
+        team = TEAM_COLORS[i]
+        lock_color, _ = self._lock_state(ac)
+        bg = (7, 15, 11)
+        grid = (34, 88, 58)
+        dim = (86, 170, 118)
+        self._alpha_rect(rect, bg, 90)
+        pygame.draw.rect(self.screen, grid, rect, 1)
+
+        cx = rect.centerx
+        cy = rect.centery
+        radius = min(rect.w, rect.h) // 2 - 20
+
+        # 距离档：有稳定跟踪时缩放到当前距离的 1.35 倍；没有接触时用常用档。
+        d = math.dist((ac.x, ac.y, ac.z), (foe.x, foe.y, foe.z))
+        if ac.contact >= CONTACT_TRACK and d < 1e8:
+            rng = clamp(d * 1.35, 4000.0, max(ac.spec.radar_range, 40000.0))
+        else:
+            rng = max(ac.spec.radar_range, 40000.0) * 0.6
+
+        for frac in (0.25, 0.5, 0.75, 1.0):
+            pygame.draw.circle(
+                self.screen, grid, (cx, cy), int(radius * frac), 1
+            )
+        # 距离档标注放在圆环下缘：目标通常出现在机头方向（画面上方）。
+        for frac in (0.5, 1.0):
+            label = self.font_small.render(f"{rng * frac / 1000:.0f}", True, dim)
+            self.screen.blit(label, (cx + 3, cy + int(radius * frac) - 17))
+        pygame.draw.line(self.screen, grid, (cx - radius, cy), (cx + radius, cy), 1)
+        pygame.draw.line(self.screen, grid, (cx, cy - radius), (cx, cy + radius), 1)
+
+        # 本机符号：机头朝上的小三角
+        pygame.draw.polygon(
+            self.screen, team,
+            [(cx, cy - 8), (cx - 5, cy + 6), (cx + 5, cy + 6)],
+        )
+
+        rel = wrap_pi(math.atan2(foe.y - ac.y, foe.x - ac.x) - ac.psi)
+        if ac.contact >= CONTACT_TRACK and foe.alive:
+            rr = clamp(d / rng, 0.0, 0.96) * radius
+            tx = cx + rr * math.sin(rel)
+            ty = cy - rr * math.cos(rel)
+            pygame.draw.line(self.screen, lock_color, (cx, cy), (tx, ty), 1)
+            pygame.draw.circle(self.screen, lock_color, (int(tx), int(ty)), 4)
+            pygame.draw.circle(self.screen, bg, (int(tx), int(ty)), 2)
+            tag = self.font_small.render(f"{d / 1000:4.1f}", True, lock_color)
+            dz = foe.z - ac.z
+            alt = self.font_small.render(f"{dz / 1000:+4.1f}k", True, dim)
+            # 标签贴着光点放，但避开边框，避免压住距离环刻度。
+            lx = tx + 8
+            if lx + tag.get_width() > rect.right - 4:
+                lx = tx - 8 - tag.get_width()
+            ly = ty - 18
+            if ly < rect.y + 4:
+                ly = ty + 6
+            self.screen.blit(tag, (lx, ly))
+            self.screen.blit(alt, (lx, ly + tag.get_height()))
+        elif ac.contact == CONTACT_DETECT or ac.rwr:
+            az = ac.rwr_az if ac.rwr else rel
+            tcol = (255, 96, 88) if ac.rwr else dim
+            for sgn in (-1.0, 1.0):
+                a = az + sgn * math.radians(4.0)
+                pygame.draw.line(
+                    self.screen, tcol,
+                    (cx + 14 * math.sin(a), cy - 14 * math.cos(a)),
+                    (cx + radius * math.sin(a), cy - radius * math.cos(a)), 1,
+                )
+            tag = "RWR" if ac.rwr else "AZ"
+            lab = self.font_small.render(tag, True, tcol)
+            ex = cx + (radius - 2) * math.sin(az)
+            ey = cy - (radius - 2) * math.cos(az)
+            self.screen.blit(lab, (ex - lab.get_width() / 2, ey - 18))
+        else:
+            lab = self.font_small.render("NO CONTACT", True, dim)
+            self.screen.blit(lab, (cx - lab.get_width() / 2, cy + radius - 4))
+
+        # 来袭导弹：只在边缘画红色测向楔形，不给距离
+        threat = self._missile_threat(world, i)
+        if threat is not None:
+            az = threat[0]
+            for sgn in (-1.0, 1.0):
+                a = az + sgn * math.radians(3.0)
+                pygame.draw.line(
+                    self.screen, (255, 80, 72),
+                    (cx + (radius - 9) * math.sin(a), cy - (radius - 9) * math.cos(a)),
+                    (cx + radius * math.sin(a), cy - radius * math.cos(a)), 2,
+                )
+            lab = self.font_small.render("MSL", True, (255, 80, 72))
+            self.screen.blit(lab, (rect.x + 4, rect.bottom - 19))
+
+    def _draw_fwd_hud(self, world: World, i: int, rect: pygame.Rect) -> None:
+        """抬头/头瞄视野：地平线、俯仰梯、目标框、炮口准星与来袭告警。
+
+        地平线与俯仰梯随本机俯仰/滚转滚动；跟踪目标在视场内画框，出视场时
+        退化为左右边缘的头瞄指引，和真实 HMD 的用法一致。
+        """
+        ac = world.acs[i]
+        foe = world.acs[1 - i]
+        lock_color, _ = self._lock_state(ac)
+        _psi, theta, phi = attitude_of(ac)
+        cx, cy = rect.centerx, rect.centery + 4
+        px_per_deg = 1.5
+        # 地平线按俯仰姿态（theta）走，而不是航迹角：大迎角时两者会差几度。
+        horizon_y = cy + math.degrees(theta) * px_per_deg
+        half = rect.w * 0.5
+        slope = math.tan(phi)
+
+        self.screen.set_clip(rect)
+        try:
+            self._alpha_rect(rect, (20, 36, 55), 70)
+            # 地面：地平线以下的半边，随滚转倾斜
+            self._alpha_poly(
+                rect, (46, 38, 25),
+                [
+                    (rect.left, horizon_y + slope * (rect.left - cx)),
+                    (rect.right, horizon_y + slope * (rect.right - cx)),
+                    (rect.right, rect.bottom),
+                    (rect.left, rect.bottom),
+                ], 70,
+            )
+            # 地平线本体：整条贯穿视野，读起来更像抬头显示器
+            pygame.draw.line(
+                self.screen, (108, 206, 150),
+                (rect.left, horizon_y + slope * (rect.left - cx)),
+                (rect.right, horizon_y + slope * (rect.right - cx)), 1,
+            )
+            # 俯仰梯：每 10° 一格，0° 为地平线
+            pitch = math.degrees(theta)
+            for p in range(-30, 31, 10):
+                y = horizon_y + (pitch - p) * px_per_deg
+                if not rect.top + 14 < y < rect.bottom - 6:
+                    continue
+                dx, dy = 15.0 * math.cos(phi), 15.0 * math.sin(phi)
+                pygame.draw.line(
+                    self.screen, (74, 122, 96),
+                    (cx - dx, y - dy), (cx + dx, y + dy), 1,
+                )
+                if p % 20 == 0:
+                    lab = self.font_small.render(f"{p:+d}", True, (86, 150, 112))
+                    self.screen.blit(lab, (cx - dx - 20, int(y - dy) - 8))
+
+            # 目标框：视场内按真实方位/仰角投影，出视场退化为头瞄边缘指引
+            if ac.contact >= CONTACT_TRACK and foe.alive:
+                dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                rel = wrap_pi(math.atan2(dy, dx) - ac.psi)
+                elev = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
+                if abs(rel) < math.radians(52.0):
+                    tx = cx + math.tan(rel) / math.tan(math.radians(26.0)) * half * 0.82
+                    ty = horizon_y + (pitch - elev) * px_per_deg
+                    tx = clamp(tx, rect.left + 12, rect.right - 12)
+                    ty = clamp(ty, rect.top + 20, rect.bottom - 12)
+                    pygame.draw.rect(
+                        self.screen, lock_color,
+                        pygame.Rect(int(tx) - 8, int(ty) - 8, 16, 16), 1,
+                    )
+                    pygame.draw.line(
+                        self.screen, lock_color, (int(tx) - 8, int(ty)), (int(tx) + 8, int(ty)), 1
+                    )
+                    lab = self.font_small.render(f"{dist / 1000:4.1f}", True, lock_color)
+                    lx = tx + 10 if tx + 10 + lab.get_width() < rect.right else tx - 10 - lab.get_width()
+                    self.screen.blit(lab, (lx, ty - 20))
+                else:
+                    side = rect.right - 10 if rel > 0.0 else rect.left + 10
+                    tri = (
+                        [(side, cy - 7), (side, cy + 7),
+                         (side - 10 if rel > 0.0 else side + 10, cy)]
+                    )
+                    pygame.draw.polygon(self.screen, lock_color, tri)
+                    lab = self.font_small.render("HMD", True, lock_color)
+                    self.screen.blit(
+                        lab, (side - lab.get_width() if rel > 0.0 else side, rect.top + 6)
+                    )
+
+            # 炮口准星 + 速度/高度读数
+            pygame.draw.circle(self.screen, (170, 220, 180), (cx, cy), 3, 1)
+            pygame.draw.line(self.screen, (170, 220, 180), (cx - 7, cy), (cx + 7, cy), 1)
+            spd = self.font_small.render(f"{ac.v:4.0f}", True, (170, 210, 180))
+            self.screen.blit(spd, (rect.left + 6, rect.bottom - 20))
+            alt = self.font_small.render(f"{ac.z:5.0f}", True, (170, 210, 180))
+            self.screen.blit(alt, (rect.right - 6 - alt.get_width(), rect.bottom - 20))
+            tag = self.font_small.render("HMD", True, (86, 150, 112))
+            self.screen.blit(tag, (rect.left + 6, rect.top + 4))
+
+            # 来袭导弹：红色标记落在相对本机的方位上，顶部给方位读数
+            threat = self._missile_threat(world, i)
+            if threat is not None:
+                az, td = threat
+                wx = cx + math.sin(az) * half * 0.82
+                wy = cy - math.cos(az) * rect.h * 0.38
+                wx = clamp(wx, rect.left + 10, rect.right - 10)
+                wy = clamp(wy, rect.top + 22, rect.bottom - 10)
+                pygame.draw.circle(self.screen, (255, 80, 72), (int(wx), int(wy)), 5)
+                lab = self.font_small.render(
+                    f"MSL {math.degrees(az):+04.0f}  {td / 1000:4.1f}km",
+                    True, (255, 80, 72),
+                )
+                self.screen.blit(lab, (cx - lab.get_width() / 2, rect.top + 4))
+        finally:
+            self.screen.set_clip(None)
+
+    def _draw_missile_icon(self, x: float, y: float, color) -> None:
+        """挂架上的小弹形图标：参考座舱挂载页的白色弹体剪影。"""
+        pygame.draw.rect(self.screen, color, pygame.Rect(int(x), int(y) + 4, 4, 12))
+        pygame.draw.polygon(
+            self.screen, color,
+            [(int(x), int(y) + 4), (int(x) + 4, int(y) + 4), (int(x) + 2, int(y) - 3)],
+        )
+        pygame.draw.line(
+            self.screen, color, (int(x) - 2, int(y) + 16), (int(x) + 6, int(y) + 16), 1
+        )
+
+    def _store_row(
+        self, x: int, y: int, name: str, remaining: int, total: int,
+        extra: str = "",
+    ) -> None:
+        """一个挂载行：弹体图标 + 余量/总数 + READY 状态 + 在飞弹数。"""
+        for k in range(min(total, 4)):
+            color = (206, 214, 222) if k < remaining else (92, 100, 108)
+            self._draw_missile_icon(x + k * 13, y, color)
+        label = f"{name} {remaining}/{total}"
+        col = (206, 214, 222) if remaining > 0 else (170, 138, 96)
+        self.screen.blit(self.font_small.render(label, True, col), (x + 58, y))
+        if extra:
+            ex = x + 58 + self.font_small.size(label)[0] + 8
+            self.screen.blit(
+                self.font_small.render(extra, True, (255, 212, 96)), (ex, y)
+            )
+
+    def _draw_weapon_rows(self, world: World, i: int, rect: pygame.Rect) -> None:
+        """挂载页：弹种、弹体图标、READY/EMPTY、机炮与干扰物、来袭告警。"""
+        ac = world.acs[i]
+        dim = (150, 158, 168)
+        x = rect.x + 10
+        y = rect.y + 302
+        inflight = sum(1 for m in world.missiles if m.alive and m.owner == i)
+
+        rspec = ac.spec.radar_missile
+        if rspec is not None:
+            self._store_row(
+                x, y, rspec.name, ac.radar_missiles,
+                ac.spec.radar_missile_count, f"IN {inflight}" if inflight else "",
+            )
+            tag, tcol = (
+                ("READY", (116, 232, 150)) if ac.radar_missiles > 0
+                else ("EMPTY", (170, 138, 96))
+            )
+            t = self.font_small.render(tag, True, tcol)
+            self.screen.blit(t, (rect.right - 10 - t.get_width(), y))
+        y += 26
+
+        ispec = ac.spec.missile
+        if ispec is not None:
+            self._store_row(x, y, ispec.name, ac.missiles, ac.spec.missile_count)
+            tag, tcol = (
+                ("READY", (116, 232, 150)) if ac.missiles > 0
+                else ("EMPTY", (170, 138, 96))
+            )
+            t = self.font_small.render(tag, True, tcol)
+            self.screen.blit(t, (rect.right - 10 - t.get_width(), y))
+        y += 26
+
+        gun = f"GUN {int(ac.ammo)}/{int(ac.spec.ammo_max)}"
+        self.screen.blit(self.font_small.render(gun, True, dim), (x, y))
+        cm = self.font_small.render(
+            f"CH {ac.chaff}  FL {ac.flares}", True, dim
+        )
+        self.screen.blit(cm, (rect.right - 10 - cm.get_width(), y))
+        y += 26
+
+        threat = self._missile_threat(world, i)
+        if threat is not None:
+            az, d = threat
+            text = f"MSL {math.degrees(az):+04.0f}  {d / 1000:4.1f}km"
+            col = (255, 80, 72)
+        else:
+            text = "NO THREAT"
+            col = (110, 150, 128)
+        self.screen.blit(self.font_small.render(text, True, col), (x, y))
 
     def _draw_result(self, world: World) -> None:
         self.overlay.fill((8, 9, 11, 190))
