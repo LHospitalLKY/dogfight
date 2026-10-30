@@ -1378,7 +1378,7 @@ class Renderer:
             pygame.draw.polygon(self.screen, color_, pts)
 
     def _draw_aircraft_panel(self, ac, agent, color, right: bool, incoming: int = 0) -> None:
-        width, height = 236, 194
+        width, height = 236, 212
         x = self.w - width - 20 if right else 20
         y = 20
         pygame.draw.rect(self.screen, (26, 29, 34), pygame.Rect(x, y, width, height))
@@ -1430,12 +1430,19 @@ class Renderer:
             line = f"RDR {ac.radar_missiles}/{ac.spec.radar_missile_count}  {rstatus}"
             self.screen.blit(self.font_small.render(line, True, rcolor), (x + 14, y + 101))
 
-        # 机动原语已改为跟随飞机的浮动标签，面板这里保留态势与干扰物余量。
+        # 干扰物余量与态势判定。
         line = f"CH {ac.chaff:2d}  FL {ac.flares:2d}"
         self.screen.blit(self.font_small.render(line, True, SUB), (x + 14, y + 119))
         situation = getattr(agent, "situation", "") if agent else ""
         sit = self.font_small.render(f"SIT {situation}", True, SUB)
         self.screen.blit(sit, (x + width - 14 - sit.get_width(), y + 119))
+
+        # 战术族 + 当前机动原语。跟随视角下对手经常不在画面里，浮动标签
+        # 看不到，所以面板里也保留一份，保证任何镜头都能读到决策。
+        tactic = getattr(agent, "tactic", "") if agent else ""
+        primitive = getattr(agent, "primitive", "") if agent else ""
+        line = f"{tactic} / {primitive}"
+        self.screen.blit(self.font_small.render(line, True, TEXT), (x + 14, y + 137))
 
         # 燃油与功率档位：AB = 加力，MIL = 军推；油尽后只能军推。
         cap = ac.spec.fuel_capacity
@@ -1446,11 +1453,11 @@ class Renderer:
             self.font_small.render(
                 line, True, (255, 168, 64) if ab_on else (150, 200, 160)
             ),
-            (x + 14, y + 135),
+            (x + 14, y + 153),
         )
 
         # HP 条 + 数值
-        bx, by, bw, bh = x + 14, y + 161, 132, 12
+        bx, by, bw, bh = x + 14, y + 179, 132, 12
         pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
         ratio = max(0.0, ac.hp / ac.spec.hp_max)
         pygame.draw.rect(self.screen, color, pygame.Rect(bx, by, bw * ratio, bh))
