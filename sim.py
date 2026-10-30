@@ -57,6 +57,16 @@ DRAG_SUP_START_MACH = 0.95
 DRAG_SUP_END_MACH = 1.35
 DRAG_SUPERSONIC = 0.18
 
+# ---------- 主动减速（减速板 / 扰流板 / 差动舵面） ----------
+# 战斗机靠减速板、扰流板、垂尾方向舵差动与可动鸭翼来“主动减速”，
+# 而不是只能收油门等阻力。这里按等效零升阻力系数增量建模：全开时
+# 额外增加 BRAKE_CD 的阻力系数，作用在机翼参考面积上。
+# 0.08 约相当于 2.2 m² 的等效阻力板（F-16 的减速板约 0.8 m²，Su-57
+# 没有独立减速板但能用差动舵面/鸭翼产生几倍于它的阻力），
+# 300 m/s、9 km 高度下大约产生 0.3–0.4 g 的减速度，足够在几秒内
+# 从高速压到角点速度，又不会让飞机瞬间掉到失速。
+BRAKE_CD = 0.08
+
 # 载机雷达对目标的照射/数据链锥：半主动弹全程需要，主动弹只在末段截获前需要。
 SARH_ILLUM_FOV = math.radians(60.0)
 
@@ -676,6 +686,8 @@ class Action:
     roll_free: bool = False
     # 桶滚用：直接给滚转角速度指令 (rad/s)，正值与 bank 同号（左滚）。
     roll_rate: float = 0.0
+    # 主动减速：0..1 的减速板/扰流板开度，直接叠加额外零升阻力。
+    brake: float = 0.0
 
 
 @dataclass
@@ -1636,7 +1648,10 @@ class World:
         q = 0.5 * rho * v * v
         mach = mach_number(v, ac.z)
         a_thrust = self._apply_power(ac, act, mach) / m
-        a_drag0 = q * cd0_at(mach, spec.cd0) * spec.wing_area / m
+        brake = clamp(act.brake, 0.0, 1.0)
+        a_drag0 = (
+            q * (cd0_at(mach, spec.cd0) + BRAKE_CD * brake) * spec.wing_area / m
+        )
         a_induced = (
             ac.n * ac.n
             * 2.0 * m * G * G
@@ -1813,7 +1828,12 @@ class World:
             cl = math.copysign(cl_stall * decay, alpha)
         k_ind = 1.0 / (math.pi * spec.aspect_ratio * spec.oswald)
         mach = mach_number(V, ac.z)
-        cd = cd0_at(mach, spec.cd0) + k_ind * cl * cl + 0.8 * beta * beta
+        cd = (
+            cd0_at(mach, spec.cd0)
+            + k_ind * cl * cl
+            + 0.8 * beta * beta
+            + BRAKE_CD * clamp(act.brake, 0.0, 1.0)
+        )
         cy = spec.cy_beta * beta
 
         qs = qbar * spec.wing_area

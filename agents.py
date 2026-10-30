@@ -168,7 +168,19 @@ def aim_action(
     gamma_dot = clamp((target_gamma - obs.own_gamma) * gain,
                       -MAX_GAMMA_DOT, MAX_GAMMA_DOT)
 
-    a = max(cg + v * gamma_dot / G, 0.12)   # 垂直方向升力分量
+    a = cg + v * gamma_dot / G              # 垂直方向升力分量
+    if a < 0.0 and obs.own_gamma > math.radians(30.0):
+        # 机头已经高高抬起，而能量只允许更小的爬升角：必须推杆（负过载）
+        # 把航迹压下来。旧的 max(a, 0.12) 把推杆指令吃掉了，低速大航迹角
+        # 时实际 γ̇ 只剩 +0.3°/s，飞机会“挂”在机头上以 70–80° 缓慢爬升
+        # （近失速爬升但不掉速的僵持）。推杆时限幅在人体短时负过载极限。
+        return Action(
+            bank=0.0,
+            n=clamp(a, -2.5, -0.05),
+            throttle=throttle,
+            fire=obs.in_gun_trigger,
+        )
+    a = max(a, 0.12)
     b = v * cg * psi_dot / G                # 水平方向升力分量
     n = math.hypot(a, b)
     phi = math.atan2(b, a)
@@ -260,7 +272,9 @@ def turn_action(
     按指定过载（瞬时或持续）稳定盘旋。sign 与相对方位同号。
     """
     act = aim_action(obs, sign * math.radians(150.0), el - obs.own_gamma, gain=6.0)
-    act.n = max(1.0, min(n_target, act.n))
+    # aim_action 在“机头高抬、能量不允许继续爬”时会给出负过载推杆，
+    # 这里不能再按最小 1 g 兜底，否则推杆指令会被拉回平飞、飞机继续挂在机头上。
+    act.n = min(n_target, act.n) if act.n > 0.0 else act.n
     act.throttle = throttle
     act.fire = obs.in_gun_trigger
     return act
@@ -346,6 +360,13 @@ def level_turn(
         (math.radians(30.0) - abs(bank_err)) / math.radians(20.0), 0.0, 1.0
     )
     n_cmd = max(1.6, n_level * roll_in)
+    if abs(sign) < 1e-6:
+        # 不需要转弯（sign=0，翼平）：竖直方向升力分量就等于过载本身，
+        # 不能再套用“先滚转、后拉杆”的坡度渐入。否则翼平还挂着 n_level
+        # （6 g / 3.2 g）等于纯爬升：低油量恢复时航迹角一路从 11° 爬到
+        # 27°，随后又因为坡度误差变化把过载从 1.6 g 跳到 6 g，看着就是
+        # 莫名其妙的高 G 抖动。
+        n_cmd = clamp(math.cos(obs.own_gamma) + v * gd / G, 0.2, n_level)
     return Action(
         bank=clamp(sign * phi / MAX_BANK, -math.radians(86.0) / MAX_BANK,
                    math.radians(86.0) / MAX_BANK),
@@ -482,6 +503,22 @@ class TacticalAgent:
     # 是为了让“保持方案”和停用的距离门限错开，避免在门限上每拍翻转转向侧。
     MERGE_HOLD = 2200.0
     MERGE_TIMEOUT = 12.0         # 交汇抢位方案的保持时间 s
+    # 中距弹交完后的压近目标距离：中距弹已经交完（或已经进到 16 km 以内）、
+    # 还隔着 6 km 以上时就没有继续在超视距对峙的理由了——主动压上去，
+    # 进入近距弹/机炮的格斗距离。原来此时会按“被锁防御/僵持改出”处理，
+    # 双方在 6–12 km 上兜圈到超时，谁也拿不到近距弹的发射窗口。
+    WVR_PRESS_DIST = 6000.0
+    # 压近的启动距离：压到对手 NEZ 内沿（16 km）以内后，继续留在超视距
+    # 对峙已经没有意义——中距弹的窗口要么已经交完、要么已经被距离关掉。
+    # 自己还留着中距弹、但距离已经小于该值时同样压上去，把它留给近距弹
+    # 更划算（实测经常出现“留着最后一枚中距弹始终等不到 NEZ”而僵持到超时）。
+    BVR_PRESS_DIST = 16000.0
+    # 主动减速门限：速度高于角点速度太多时，转弯半径 ∝ v² 会大到抢不到
+    # 角度、也会在接近率大的咬尾里直接冲过头。速度超过失速速度的该倍数后
+    # 才开始开减速板（现实对应减速板/扰流板/可动鸭翼）。
+    BRAKE_SPEED_FRAC = 1.60
+    # 角点速度对应的速度比：超过这个倍数才值得用减速板缩小回旋半径。
+    BRAKE_CORNER_FRAC = 2.10
 
     # 防御动作候选池：导弹来袭与被锁定（未射弹）各有一套，具体选哪个
     # 由 _maneuver_prob 按成功率评分决定，不再按固定顺序取第一个可用项。
@@ -616,6 +653,10 @@ class TacticalAgent:
         self._plan_ttl = 0.0
         self._turn_sign = 1.0
         self._turn_locked = False
+        # 恢复阶段的“是否还在转向空域中心”：用带死区的状态位而不是
+        # |方位误差| >= 5° 的硬门限。门限来回穿越时 bank 在 0° 与 86°、
+        # 过载在 1.6 g 与 6 g 之间每 0.1 s 翻一次（低油量高 G 抖动的直接原因）。
+        self._rec_turning = False
 
         # 人体过载耐受状态：0=完全恢复，1=到达耐受极限（G-LOC 边界）。
         self.g_load = 0.0
@@ -775,6 +816,16 @@ class TacticalAgent:
             obs.own_speed_frac < 1.45
             or obs.incoming_missile_dist < self.SARH_EVADE_DIST
         )
+        if (
+            obs.own_speed_frac < 1.50
+            and obs.own_gamma > math.radians(40.0)
+            and obs.incoming_missile_dist > self.SARH_EVADE_DIST
+        ):
+            # 大航迹角低速爬升时开加力只会把飞机继续顶在机头上，速度也不会
+            # 回来（推力方向几乎与重力同向）。想恢复能量必须先收油门、推杆。
+            act.afterburner = 0.0
+            act.throttle = min(act.throttle, 0.55)
+            return
         if obs.own_fuel_frac < 0.12 and not urgent:
             # 油量见底时省着用：只保留军推，除非正在被弹追击。
             act.afterburner = 0.0
@@ -837,6 +888,7 @@ class TacticalAgent:
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
+            self._tactic_press,
             self._tactic_guns,
             self._tactic_lure,
             self._tactic_counter,
@@ -901,10 +953,19 @@ class TacticalAgent:
                 self._turn_radius(obs)
                 * (1.0 - math.cos(obs.own_gamma)) * 1.25 + 300.0,
             )
+        high_need = 600.0
+        if self.tactic == "RECOVER":
+            # 恢复一旦启动就加一段粘滞。低油量脱离（Bingo 的 −5° 下高）正好
+            # 落在同一个高度带上：原来掉出 10 m 就切 RECOVER、拉起来 10 m
+            # 又切回 EXTEND，两族每 0.5 s 互换一次，指令在 0.2 g 与 8 g 之间
+            # 来回跳，看上去就是“低油量时莫名其妙的高 G 抖动”。
+            edge_need *= 1.5
+            low_need += 600.0
+            high_need = 1500.0
         if (
             obs.edge_margin < edge_need
             or obs.z_margin_low < low_need
-            or obs.z_margin_high < 600.0
+            or obs.z_margin_high < high_need
         ):
             return "RECOVER", "RECOVER"
         return None
@@ -926,6 +987,15 @@ class TacticalAgent:
             )
         # 规避过程中仍要守住能量：机头已经高高抬起、速度又不够时，
         # 继续压坡度拉过载只会变成爬升耗能，先俯冲把航迹角压下来。
+        # 这条不限防御原语：压炮/追逐在低速大航迹角时同样会把飞机顶到
+        # 失速附近的垂直爬升里，统一改成卸载推杆。
+        if (
+            obs.own_gamma > math.radians(45.0)
+            and obs.own_speed_frac < 1.55
+            and self.primitive not in VERTICAL
+            and self.primitive != "COBRA"
+        ):
+            return "SURVIVE", "UNLOAD"
         if (
             self.primitive in self.DEFENSE_SET
             and obs.own_gamma > math.radians(25.0)
@@ -1036,6 +1106,33 @@ class TacticalAgent:
         elif obs.own_speed_frac < 1.20:
             return "SURVIVE", "UNLOAD"
         return None
+
+    def _tactic_press(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """中距弹交完后的压近：主动进入近距弹的格斗距离。
+
+        自己的中距弹已经全部交完（无剩余、无在飞）、也没有来袭弹时，继续
+        在 6 km 外保持横转/偏置只是把对局拖到超时。此时满油门压上去，用
+        机头指向把目标带进近距弹的锁定包线（红外导引头仍要求目标落在视场
+        内），真正贴脸的威胁再交回生存层处理。
+        """
+        # 还有弹在飞（雷达弹按 40 km、红外弹按 9 km 告警）时先让生存层优先。
+        if (
+            obs.incoming_missile_radar
+            or obs.incoming_missile_dist < self.MISSILE_EVADE_DIST
+        ):
+            return None
+        # 只按“自己这边”判定，不再要求对方也打空：对方留着最后一枚中距弹
+        # 却因 NEZ 门限始终等不到发射窗口时，旧条件会让压近永远不触发，
+        # 双方在 6–12 km 上兜圈到超时。对方真发射了，来袭告警会接管。
+        if obs.own_radar_in_flight > 0:
+            return None
+        if obs.own_radar_missiles > 0 and obs.dist > self.BVR_PRESS_DIST:
+            return None
+        if obs.dist <= self.WVR_PRESS_DIST:
+            return None
+        return "PRESS", "PURE"
 
     def _tactic_guns(
         self, sit: _Situation, obs: Observation,
@@ -1693,10 +1790,54 @@ class TacticalAgent:
         act = self._dispatch(primitive, obs)
         act = self._limit_energy(act, obs, primitive)
         act = self._limit_g(act)
+        act.brake = self._brake_demand(obs, primitive)
         pilot_ok = self._gloc_t <= 0.0
         act.launch = pilot_ok and should_launch(obs)
         act.launch_radar = pilot_ok and should_launch_radar(obs)
         return act
+
+    def _brake_demand(self, obs: Observation, primitive: str) -> float:
+        """主动减速开度 0..1（减速板/扰流板/可动鸭翼的等效阻力）。
+
+        只在“当前速度明显高于这个几何需要的角点速度”时才打开：
+        - 咬尾接近率过大，再不改就冲过头；
+        - 近距盘旋/压炮：转弯半径 ∝ v²，减速等于直接缩小回旋半径，
+          用几何换角度，比继续拉满过载更有效；
+        - 对头交汇擦身而过：迎头速度叠加，不减速会直接飞过对方。
+        防御（有来袭弹）与压近阶段不开：那两处都要拿速度换生存/占位。
+        """
+        if primitive == "PRESS":
+            return 0.0
+        if (
+            obs.incoming_missile_radar
+            or obs.incoming_missile_dist < self.SARH_EVADE_DIST
+        ):
+            return 0.0
+        if obs.own_speed_frac < self.BRAKE_SPEED_FRAC:
+            return 0.0
+        # 1) 接近率过大、马上就要冲过头：用“剩余交汇时间”而不是单看
+        # 接近率。3 km 上 90 m/s 的接近率还有 30 多秒，完全不必踩减速板；
+        # 只有 8 s 以内会撞上目标时才值得减速。
+        if obs.closure > 60.0:
+            tgo = obs.dist / obs.closure
+            if tgo < 8.0:
+                return clamp((8.0 - tgo) / 5.0, 0.3, 1.0)
+        # 2) 近距抢角度：盘旋类原语把速度压回角点速度附近。
+        # 门限取 2.1 倍失速（约等于这些机型的角点速度）：原来只要超过 1.6
+        # 倍就开减速板，两架飞机在近距盘旋里会全程踩着减速板，一起掉到
+        # 1.5 倍失速附近，缠斗变成双方都飞不动的慢速绕圈。
+        if obs.dist < 3000.0 and obs.own_speed_frac > self.BRAKE_CORNER_FRAC and (
+            primitive in TURNING
+            or primitive in ("GUN_PRESS", "GUN_LEAD", "SCISSORS",
+                             "HIGH_YOYO", "LOW_YOYO")
+        ):
+            return clamp(
+                (obs.own_speed_frac - self.BRAKE_CORNER_FRAC) / 0.6, 0.0, 0.9,
+            )
+        # 3) 迎头交汇后的近距离高速通过
+        if obs.dist < 1000.0 and obs.closure > 180.0:
+            return 0.7
+        return 0.0
 
     def _limit_energy(
         self, act: Action, obs: Observation, primitive: str = "",
@@ -1753,10 +1894,27 @@ class TacticalAgent:
         }
 
     def _dispatch(self, primitive: str, obs: Observation) -> Action:
+        if primitive == "PURE" and self.tactic == "PRESS":
+            return self._press_turn(obs)
         fn = self._maneuvers.get(primitive)
         if fn is None:
             return aim_action(obs, obs.off_az, obs.off_el)
         return fn(obs)
+
+    def _press_turn(self, obs: Observation) -> Action:
+        """压近转向：用接近瞬时上限的过载把机头拉回目标。
+
+        压近阶段双方常在 7–18 km 上各自画 4 km 半径的大回环（n≈2.8 g、
+        约 4°/s），一次 180° 掉头要 45 s，看起来就是“越追越远”。这里把
+        过载放开到可维持过载的 1.6 倍（仍受 _limit_g 的人体耐受与
+        _limit_energy 的低速保护约束），掉头时间压到 20 s 以内，双方才能
+        真正建立起接近率。
+        """
+        act = aim_action(obs, obs.off_az, obs.off_el, gain=3.0, throttle=1.0)
+        cap = min(obs.own_n_avail, max(obs.own_n_sustain * 1.6, 4.0))
+        if act.n > cap:
+            act.n = cap
+        return act
 
     def _gun_lead(self, obs: Observation) -> tuple[float, float]:
         """航炮提前量：按弹丸飞行时间指向目标的未来位置，返回相对炮线的偏差。
@@ -1806,7 +1964,10 @@ class TacticalAgent:
         回来。这不是放宽炮口门限，而是改变进入炮口解的几何。
         """
         act = pursuit_action(obs, *self._gun_lead(obs), gain=1.6, throttle=0.45)
-        act.n = min(obs.own_n_avail, self.n_pos_tol)
+        if act.n > 0.0:
+            # pursuit_action 已经给出推杆（负过载）时不要再按最大过载覆盖，
+            # 否则“机头高抬 + 低速”的压炮会继续把航迹往上拽。
+            act.n = min(obs.own_n_avail, self.n_pos_tol)
         act.fire = obs.in_gun_trigger
         return act
 
@@ -1815,28 +1976,45 @@ class TacticalAgent:
 
         低空大俯角时必须先把机头拉起来：只给一个 +12° 的目标航迹角，
         在 −70° 俯冲里等于没救（飞机在 1 s 内就掉 250 m），会直接撞地。
+        其余情况只是“余量不够”而不是“马上要撞地”，用中等过载的稳定
+        盘旋或浅爬升就够。原来统一走 aim_action（gain=2.5）会把 4° 的
+        航迹角误差放大成 10°/s，在 360 m/s 上就是 7 g 的竖直分量，
+        恢复动作因此变成 8–9 g 的猛拉——低油量、脱离与恢复互相打断时
+        尤为明显，也就是 HUD 上看到的“莫名其妙高 G 抖动”。
         """
-        el_target = 0.0
+        speed = max(obs.own_speed, 60.0)
         pull_out = obs.own_gamma < math.radians(-15.0)
-        urgent = obs.z_margin_low < max(1200.0, 3.5 * obs.own_speed)
-        if urgent:
-            el_target = math.radians(25.0) if pull_out else math.radians(12.0)
-        elif obs.z_margin_high < 600.0:
-            el_target = math.radians(-12.0)
+        urgent = obs.z_margin_low < max(1200.0, 3.5 * speed)
         if urgent and pull_out:
             # 低空大俯角：先翼平、按可用过载全力拉起。此时再把升力分给
             # “飞向空域中心”的坡度，竖直分量只剩 n·cosφ，就是压不出
             # 足够的 γ̇，人在 1.5 km 边界上看着飞机以 −70° 扎下去。
-            act = aim_action(obs, 0.0, el_target - obs.own_gamma, gain=2.5)
+            act = aim_action(obs, 0.0, math.radians(25.0) - obs.own_gamma, gain=2.5)
             act.bank = 0.0
             act.n = min(obs.own_n_avail, self.n_pos_tol)
             return act
-        return aim_action(
-            obs,
-            wrap_pi(obs.center_az - obs.own_psi),
-            el_target - obs.own_gamma,
-            gain=2.5,
-        )
+        if obs.z_margin_high < 600.0:
+            return level_turn(obs, 0.0, 2.0, gamma_target=math.radians(-8.0))
+        heading = wrap_pi(obs.center_az - obs.own_psi)
+        # 是否还在转向空域中心，用 12°/4° 的回差状态位决定：方位误差在
+        # 5° 上下每拍穿越一次硬门限时，转向侧、坡度（0°↔86°）和过载
+        # （1.6 g↔6 g）都会跟着 0.1 s 翻一次，看上去就是高 G 抖动。
+        if abs(heading) > math.radians(12.0):
+            self._rec_turning = True
+        elif abs(heading) < math.radians(4.0):
+            self._rec_turning = False
+        sign = 0.0
+        if self._rec_turning:
+            sign = 1.0 if heading > 0.0 else -1.0
+        if obs.edge_margin < max(900.0, 8.0 * speed):
+            # 离边界太近：转回空域中心。用 6 g 的协调盘旋——6 g 正好是
+            # 持续耐受上限，长时间拉也不会累积疲劳；高度余量同时不足时
+            # 顺带 5° 浅爬升。
+            climb = math.radians(5.0) if urgent else 0.0
+            n = min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN)
+            return level_turn(obs, sign, n, gamma_target=climb)
+        # 只是离地余量不足：3 g 左右的浅爬升盘旋就够，不需要压满坡度。
+        return level_turn(obs, sign, 3.2, gamma_target=math.radians(2.0))
 
     def _lure(self, obs: Observation) -> Action:
         """迎头诱导：机头对准目标、不做偏置，把交汇几何留给自己。
@@ -2208,9 +2386,15 @@ class TacticalAgent:
         # 用比例式航向控制，航迹角只压到略低于水平。原来不做限制，大坡度
         # 掉头时会先拉 7 g 把速度换成高度，再挂着机头慢慢掉回来，看起来
         # 就是“逃跑时不断爬升、同时掉速”。
+        gamma = math.radians(-5.0)
+        if obs.own_mil_endurance < self.BINGO_ENDURANCE:
+            # Bingo（低油量脱离）期间保持平飞，不再下高：下高只会把飞机
+            # 一路压进恢复门限，切回 RECOVER 拉起几米又切回 EXTEND，
+            # 两族在门限上反复互换（低油量时看到的高 G 抖动正是这样来的）。
+            gamma = 0.0
         return heading_turn(
             obs, away, gain=0.6, max_rate_deg=5.0,
-            gamma_target=math.radians(-5.0),
+            gamma_target=gamma,
         )
 
     def _crank(self, obs: Observation) -> Action:
