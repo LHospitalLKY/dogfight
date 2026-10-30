@@ -96,6 +96,76 @@ def rcs_scale(rcs: float) -> float:
     return (max(rcs, 0.001) / RCS_REF) ** 0.25
 
 
+# ---------- 感知层：传感器等级与视场 ----------
+# 接触质量分四级，战术层只认“能拿到多少信息”：
+# 0 无接触；1 仅探测/告警（只有方位，无距离）；2 稳定跟踪（有距离/角度，
+# 可做 IRST/光电/目视/预警机/侧阵）；3 火控级（本机机头雷达照射，才能
+# 发射雷达制导中距弹）。
+CONTACT_NONE = 0
+CONTACT_DETECT = 1
+CONTACT_TRACK = 2
+CONTACT_FIRE = 3
+
+# 机头雷达火控照射锥（半角）：与 SARH 照射锥同源，但探测可以更宽。
+RADAR_FIRE_FOV = SARH_ILLUM_FOV
+RADAR_DETECT_FOV = math.radians(90.0)
+# Su-57 的侧阵：相对机头 ±35°–145°，探测距离为机头阵的 0.55 倍，
+# 只能形成 track，不能给中距弹提供火控。
+SIDE_ARRAY_MIN = math.radians(35.0)
+SIDE_ARRAY_MAX = math.radians(145.0)
+SIDE_ARRAY_SCALE = 0.55
+# Su-57 的 L 波段襟翼雷达：前向 ±45°，200 km，仅探测。
+LBAND_FOV = math.radians(45.0)
+LBAND_RANGE_REF = 200000.0
+# 红外搜索跟踪（IRST）：被动，±30° 视场；开加力时尾焰更亮，探测距离 ×1.5。
+IRST_FOV = math.radians(30.0)
+IRST_AB_BOOST = 1.5
+# 目视：迎头/尾后约 9 km、侧向约 11 km，全向，给 tally（角度+粗距离）。
+VISUAL_HEAD_TAIL = 9000.0
+VISUAL_SIDE = 11000.0
+# 预警机：400 km @1 m²，10 s 更新一次，只给 track（不能当火控）。
+AWACS_RANGE_REF = 400000.0
+AWACS_UPDATE = 10.0
+# 无目视接触（tally）时机炮仍可开火，但散布 ×2.5，且只允许 600 m 内。
+GUN_NO_TALLY_RANGE = 600.0
+GUN_NO_TALLY_SPREAD = 2.5
+
+
+def directional_rcs(ac: "Aircraft", sensor_pos) -> float:
+    """目标在某个传感器方向上的 RCS（前/侧/后分向）。
+
+    隐身修形主要压前向回波：迎头时 RCS 最小，侧向次之，尾后最大。
+    传感器位于目标机头前方（角度≈0）取 rcs_front，正侧方取 rcs_side，
+    尾后取 rcs_back；三段之间线性过渡，避免方位角抖动导致探测距离跳变。
+    """
+    spec = ac.spec
+    front = spec.rcs_front if spec.rcs_front > 0.0 else spec.rcs
+    side = spec.rcs_side if spec.rcs_side > 0.0 else spec.rcs
+    back = spec.rcs_back if spec.rcs_back > 0.0 else spec.rcs
+    try:
+        nx, ny, nz = nose_direction(ac)
+        dx = sensor_pos[0] - ac.x
+        dy = sensor_pos[1] - ac.y
+        dz = sensor_pos[2] - ac.z
+        d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if d < 1e-6:
+            return front
+        cosang = clamp((nx * dx + ny * dy + nz * dz) / d, -1.0, 1.0)
+    except AttributeError:
+        # 测试里可能传入只有 spec 的假目标：退化为全向 RCS。
+        return front
+    ang = math.acos(cosang)
+    if ang <= math.radians(60.0):
+        return front
+    if ang >= math.radians(120.0):
+        return back
+    if ang <= math.radians(90.0):
+        t = (ang - math.radians(60.0)) / math.radians(30.0)
+        return front + (side - front) * t
+    t = (ang - math.radians(90.0)) / math.radians(30.0)
+    return side + (back - side) * t
+
+
 def military_endurance(spec: "AircraftSpec", fuel: float) -> float:
     """剩余燃油按军用推力折算的可持续秒数（跨机型统一的“还能打多久”口径）。
 
@@ -203,9 +273,14 @@ def notch_quality(ac: "Aircraft", mx: float, my: float, mz: float) -> float:
 # 地面杂波的径向速度把回波从杂波里挑出来。目标正侧方横穿时径向速度
 # 趋近 0，回波落进主瓣杂波凹口，距离再近也看不见——这就是 BVR 里的
 # “多普勒盲区 / notch”，也是三九机动的物理依据。
-MDV_RADAR = 40.0        # m/s，机载雷达最小可检测径向速度
-MDV_SEEKER = 25.0       # m/s，弹载主动导引头（带宽更窄、平台更快）
-NOTCH_BAND = 25.0       # m/s，从完全盲区到稳定跟踪的过渡带宽度
+MDV_RADAR = 30.0        # m/s，机载雷达最小可检测径向速度
+MDV_SEEKER = 15.0       # m/s，弹载主动导引头（带宽更窄、平台更快）
+NOTCH_BAND = 15.0       # m/s，从完全盲区到稳定跟踪的过渡带宽度
+# 盲区不是“一帧丢锁”：目标横穿时回波短暂落进杂波凹口，导引头会丢几拍，
+# 但只要它退出盲区就还能重新捕获；只有连续盲这么久才真正转无控。
+MISSILE_BLIND_MAX = 2.0     # s，主动导引头连续盲区容忍时间
+MISSILE_FOV_MAX = 1.0       # s，连续越出导引头视场的容忍时间
+MISSILE_MIDCOAST_MAX = 2.0  # s，中制导失照后惯导/数据链外推的容忍时间
 # 下视时地面杂波把多普勒谱展宽，等效 MDV 抬高；高差越大越明显。
 LOOKDOWN_MDV_GAIN = 0.55
 LOOKDOWN_REF_DZ = 4000.0
@@ -474,6 +549,17 @@ class AircraftSpec:
     turn_tau: float = 0.45      # 操纵响应时间常数 s
     # 前向雷达散射截面 m²（只影响雷达探测/锁定距离，不影响红外与机炮）。
     rcs: float = 1.0
+    # 分向 RCS：前/侧/后。0 表示沿用 rcs 的全向值。
+    rcs_front: float = 0.0
+    rcs_side: float = 0.0
+    rcs_back: float = 0.0
+
+    # ---- 传感器 ----（感知层：探测距离、视场与火控等级见 sim 顶部常量）
+    radar_range: float = 0.0      # 机头雷达探测距离 @1 m²；0 表示沿用中距弹包线
+    side_array: bool = False      # 侧阵（仅 Su-57）：±35°–145°，0.55×，仅 track
+    lband: bool = False           # L 波段襟翼雷达（仅 Su-57）：±45°，200 km，仅 detect
+    irst_range: float = 0.0       # 机载 IRST 被动跟踪距离 m
+    pod_irst_range: float = 0.0   # 光电吊舱被动跟踪距离 m（F-16V Legion）
 
     # ---- 发动机功率设置与燃油 ----
     thrust_mil: float = 0.0     # 军用推力 N；0 表示按 0.62×thrust_max 估算
@@ -688,6 +774,9 @@ class Action:
     roll_rate: float = 0.0
     # 主动减速：0..1 的减速板/扰流板开度，直接叠加额外零升阻力。
     brake: float = 0.0
+    # 机载雷达开关请求：None=保持现状。静默伏击时关掉发射源，
+    # 对方 RWR 收不到告警，本机也拿不到火控级接触（不能发中距弹）。
+    radar_on: bool | None = None
 
 
 @dataclass
@@ -796,6 +885,18 @@ class Observation:
     radar_pk_est: float = 0.0
     radar_nez: bool = False
 
+    # ---- 感知层 ----
+    # contact: 0 无接触 / 1 仅探测或告警（只有方位）/ 2 稳定跟踪 / 3 火控级。
+    # 只有 quality>=2 时上面的 foe_* 几何才有效；quality<2 时给搜索方位。
+    contact: int = 0
+    contact_quality: int = 0
+    tally: bool = False            # 目视接触（决定机炮精度）
+    rwr: bool = False              # 对方雷达正在照射本机（只有方位）
+    rwr_az: float = 0.0            # RWR 告警相对机头的方位
+    radar_on: bool = True          # 本机雷达当前是否开机
+    foe_radar_on: bool = False     # 对方雷达是否开机（RWR 可推断）
+    gun_accuracy: float = 1.0      # 机炮散布倍率；无目视接触时 >1
+
 
 @dataclass
 class Aircraft:
@@ -857,6 +958,15 @@ class Aircraft:
     # 越过验证高度上限只记录一次事件，不再判定“解体”。
     ceiling_warned: bool = False
 
+    # ---- 感知层状态（World._update_sensors 每步写入） ----
+    radar_on: bool = True          # 机载雷达是否开机（会暴露给对手 RWR）
+    contact: int = 0               # 对目标的接触等级 0/1/2/3
+    tally: bool = False            # 是否目视接触
+    rwr: bool = False              # 是否收到对方雷达照射告警
+    rwr_az: float = 0.0            # 告警方位（相对本机机头）
+    last_known: tuple[float, float, float] | None = None   # 最后已知目标位置
+    last_known_t: float = -1e9     # 最后接触时刻
+
     @property
     def energy(self) -> float:
         """比能量 (J/kg)：高度与速度的统一记账单位。"""
@@ -902,6 +1012,10 @@ class Missile:
     # 被干扰物诱骗：decoy 是诱饵点（箔条云/热诱弹），decoy_t 归零后导弹转无控。
     decoy: tuple[float, float, float] | None = None
     decoy_t: float = 0.0
+    # 短暂失锁的计时：盲区/出视场/中制导失照都先按“外推”处理，超时才真丢。
+    blind_t: float = 0.0         # s，主动导引头连续处于多普勒盲区的时长
+    fov_t: float = 0.0           # s，连续越出导引头视场的时长
+    mid_t: float = 0.0           # s，中制导失去载机照射/数据链的时长
     # 自动驾驶仪状态：当前实际建立的横向加速度 N，按一阶滞后跟踪制导指令。
     gx: float = 0.0
     gy: float = 0.0
@@ -1136,7 +1250,11 @@ def launch_envelope(ac: "Aircraft", mspec: MissileSpec,
     if mspec.is_radar:
         # RCS 决定雷达截面积，多普勒盲区决定“看没看见”：目标横穿掉进
         # 速度凹口时，雷达既锁不住也支持不了中制导，包线直接归零。
-        reach *= rcs_scale(foe.spec.rcs) * radar_visibility(ac, foe)
+        # 分向 RCS：迎头看前向、尾追看尾后；隐身机前向的收益最大。
+        reach *= (
+            rcs_scale(directional_rcs(foe, (ac.x, ac.y, ac.z)))
+            * radar_visibility(ac, foe)
+        )
     return mspec.min_range, min(mspec.max_range, reach)
 
 
@@ -1155,6 +1273,7 @@ class World:
         dof: int = 6,
         y_offset: float = 100.0,
         x_offset: float = 1500.0,
+        awacs: bool = True,
     ) -> None:
         if dof not in (2, 3, 6):
             raise ValueError("dof 只支持 2、3 或 6")
@@ -1162,6 +1281,7 @@ class World:
         self.dt = dt
         self.arena = arena
         self.time_limit = time_limit
+        self.awacs = awacs
         self.z0 = z0
         self.z_floor = z_floor
         self.z_ceiling = z_ceiling
@@ -1188,6 +1308,10 @@ class World:
             "missiles_launched": [0, 0],
             "missiles_hit": [0, 0],
         }
+        # 感知层实验用的时间戳：首次获得稳定跟踪、首次开火。
+        self.first_track_t: list[float | None] = [None, None]
+        self.first_fire_contact_t: list[float | None] = [None, None]
+        self.first_fire_t: list[float | None] = [None, None]
         # 在飞格斗弹；命中/寿命结束后 alive=False，保留在身上供渲染层读数。
         self.missiles: list[Missile] = []
         # 在飞机炮弹丸：按真实初速/散布/阻力飞行，线段-球判定命中。
@@ -1235,6 +1359,123 @@ class World:
         for ac in self.acs:
             if ac.rigid:
                 ac.quat = quat_from_euler(ac.phi, ac.theta, ac.psi)
+        # 开局先算一次传感器状态，保证第一拍 observe 就带 contact。
+        self._update_sensors()
+
+    # ---------- 感知层 ----------
+
+    def _update_sensors(self) -> None:
+        """每个物理步更新双方的接触等级、RWR 与最后已知位置。
+
+        传感器是“被动/主动”的混合：
+        - 机头雷达（主动，需 radar_on）：火控级（可发中距弹），受分向 RCS
+          与多普勒盲区约束；
+        - 侧阵/L 波段（Su-57 专有）：只做 track/detect，不能火控；
+        - IRST/光电吊舱（被动）：track，不受 RCS 影响，但受视场与距离限制；
+        - 目视：tally，迎头/尾后 9 km、侧向 11 km；
+        - 预警机：400 km 级 track（按 RCS 缩放），不能当火控。
+        RWR 只给“被谁照射”的方位，没有距离。
+        """
+        for i, ac in enumerate(self.acs):
+            foe = self.acs[1 - i]
+            ac.contact = CONTACT_NONE
+            ac.tally = False
+            ac.rwr = False
+            ac.rwr_az = 0.0
+            if not ac.alive or not foe.alive:
+                continue
+
+            dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < 1e-6:
+                continue
+            ux, uy, uz = dx / dist, dy / dist, dz / dist
+            nx, ny, nz = nose_direction(ac)
+            nose_ang = math.acos(clamp(ux * nx + uy * ny + uz * nz, -1.0, 1.0))
+            nose_az = math.atan2(ny, nx)
+            los_az = math.atan2(dy, dx)
+
+            # ---- RWR：对方机头雷达对着本机开机 ----
+            if foe.radar_on and foe.spec.radar_range > 0.0:
+                fnx, fny, fnz = nose_direction(foe)
+                # 从对方看本机的方位，判断本机是否落在对方火控照射锥内。
+                bx, by, bz = -ux, -uy, -uz
+                foe_ang = math.acos(clamp(bx * fnx + by * fny + bz * fnz, -1.0, 1.0))
+                if foe_ang <= RADAR_FIRE_FOV:
+                    ac.rwr = True
+                    ac.rwr_az = wrap_pi(los_az - nose_az)
+
+            quality = CONTACT_NONE
+            # ---- 本机机头雷达（主动）----
+            if ac.radar_on and ac.spec.radar_range > 0.0:
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = (
+                    ac.spec.radar_range
+                    * rcs_scale(rcs)
+                    * radar_visibility(ac, foe)
+                )
+                if dist <= reach:
+                    if nose_ang <= RADAR_FIRE_FOV:
+                        quality = CONTACT_FIRE
+                    elif nose_ang <= RADAR_DETECT_FOV:
+                        quality = CONTACT_DETECT
+            # ---- 侧阵：±35°–145°，0.55×，只 track ----
+            if ac.spec.side_array and (
+                SIDE_ARRAY_MIN <= nose_ang <= SIDE_ARRAY_MAX
+            ):
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = (
+                    ac.spec.radar_range * SIDE_ARRAY_SCALE
+                    * rcs_scale(rcs) * radar_visibility(ac, foe)
+                )
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+            # ---- L 波段襟翼雷达：±45°，200 km，只 detect ----
+            if ac.spec.lband and nose_ang <= LBAND_FOV:
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = LBAND_RANGE_REF * rcs_scale(rcs)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_DETECT)
+            # ---- IRST / 光电吊舱（被动）----
+            irst = max(ac.spec.irst_range, ac.spec.pod_irst_range)
+            if irst > 0.0 and nose_ang <= IRST_FOV:
+                reach = irst * (IRST_AB_BOOST if foe.ab > 0.05 else 1.0)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+            # ---- 目视：全向，给 tally ----
+            fnx, fny, fnz = nose_direction(foe)
+            # 对方机头与“对方→本机”视线的夹角：0/180 为迎头/尾后，90 为侧向。
+            foe_off = math.acos(clamp(
+                (fnx * -ux + fny * -uy + fnz * -uz), -1.0, 1.0
+            ))
+            visual = (
+                VISUAL_HEAD_TAIL
+                if (foe_off < math.radians(45.0) or foe_off > math.radians(135.0))
+                else VISUAL_SIDE
+            )
+            if dist <= visual:
+                ac.tally = True
+                quality = max(quality, CONTACT_TRACK)
+            # ---- 预警机（track，不能火控）----
+            if self.awacs:
+                # 预警机大多从侧上方看目标，取侧向/尾向里较大的值。
+                rcs = max(
+                    directional_rcs(foe, (ac.x, ac.y, ac.z)),
+                    foe.spec.rcs,
+                )
+                reach = AWACS_RANGE_REF * rcs_scale(rcs)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+
+            ac.contact = quality
+            if quality >= CONTACT_TRACK:
+                ac.last_known = (foe.x, foe.y, foe.z)
+                ac.last_known_t = self.t
+                if self.first_track_t[i] is None:
+                    self.first_track_t[i] = self.t
+            if quality >= CONTACT_FIRE and self.first_fire_contact_t[i] is None:
+                # 火控级接触（本机机头雷达照射）：才允许发射雷达中距弹。
+                self.first_fire_contact_t[i] = self.t
 
     # ---------- 对外接口 ----------
 
@@ -1466,7 +1707,7 @@ class World:
         else:
             # 2DOF 没有高度约束，给一个大余量让 Agent 的高度逻辑自然失效
             z_low = z_high = 1e9
-        return Observation(
+        obs = Observation(
             dist=dist,
             dist_h=dist_h,
             dz=dz,
@@ -1559,12 +1800,89 @@ class World:
             radar_nez=radar_nez,
             foe_radar_missiles=foe.radar_missiles,
             foe_radar_locked=foe_radar_locked,
+            contact=me.contact,
+            contact_quality=me.contact,
+            tally=me.tally,
+            rwr=me.rwr,
+            rwr_az=me.rwr_az,
+            radar_on=me.radar_on,
+            foe_radar_on=foe.radar_on,
+            gun_accuracy=1.0 if me.tally else GUN_NO_TALLY_SPREAD,
         )
+
+        # ---- 感知层降级：没有稳定跟踪时，不给真实几何 ----
+        if me.contact < CONTACT_TRACK:
+            # 只有方位（RWR/L 波段/雷达探测）或什么都没有。搜索方位优先取
+            # 最后已知位置，其次取空域中心（开局双方都朝中心飞）。
+            if me.contact == CONTACT_DETECT and me.rwr:
+                search_az = wrap_pi(obs.own_nose_az + me.rwr_az)
+            elif me.last_known is not None:
+                search_az = math.atan2(
+                    me.last_known[1] - me.y, me.last_known[0] - me.x
+                )
+            else:
+                search_az = math.atan2(-me.y, -me.x)
+            obs.dist = 1e9
+            obs.dist_h = 1e9
+            obs.dz = 0.0
+            obs.los_az = search_az
+            obs.los_el = 0.0
+            obs.off_az = wrap_pi(search_az - nose_az)
+            obs.off_el = 0.0
+            obs.angle_off_nose = abs(obs.off_az)
+            obs.aspect = 0.0
+            obs.foe_off_nose = 0.0
+            obs.closure = 0.0
+            obs.in_gun_range = obs.in_gun_cone = obs.in_gun_trigger = False
+            obs.in_missile_envelope = False
+            obs.missile_nez = False
+            obs.missile_pk_est = 0.0
+            obs.in_radar_envelope = False
+            obs.radar_tracking = False
+            obs.radar_pk_est = 0.0
+            obs.radar_nez = False
+            obs.own_locked = False
+            obs.own_lock_progress = 0.0
+            obs.own_radar_locked = False
+            obs.own_radar_lock_progress = 0.0
+            # 对方状态未知：速度/高度/血量按中性值，避免把真值泄漏给战术层。
+            obs.foe_speed = 0.0
+            obs.foe_alt = me.z
+            obs.foe_psi = 0.0
+            obs.foe_gamma = 0.0
+            obs.foe_hp = 0.0
+            obs.foe_hp_frac = 0.0
+            obs.foe_missiles = 0
+            obs.foe_radar_missiles = 0
+            obs.foe_locked = False
+            obs.foe_lock_progress = 0.0
+            obs.foe_radar_locked = False
+            obs.energy_diff = 0.0
+
+        # 没有火控级接触（雷达没开机 / 目标在盲区外）：中距弹通道整体关闭。
+        if me.contact < CONTACT_FIRE:
+            obs.own_radar_locked = False
+            obs.own_radar_lock_progress = 0.0
+            obs.in_radar_envelope = False
+            obs.radar_tracking = False
+            obs.radar_pk_est = 0.0
+            obs.radar_nez = False
+
+        # 被锁定告警需要“看得见”或“RWR 被照射”，否则静默伏击方无从得知。
+        if me.contact < CONTACT_TRACK and not me.rwr:
+            obs.foe_locked = False
+            obs.foe_lock_progress = 0.0
+            obs.foe_radar_locked = False
+        return obs
 
     def step(self, actions: list[Action]) -> None:
         if self.result is not None:
             return
+        for ac, act in zip(self.acs, actions):
+            if act.radar_on is not None:
+                ac.radar_on = bool(act.radar_on)
         self._integrate(actions)
+        self._update_sensors()
         self._update_lock()
         self._weapons(actions)
         self._integrate_bullets()
@@ -1949,6 +2267,10 @@ class World:
             if mspec is None or ac.missiles <= 0:
                 ac.locked = False
                 ac.lock_timer = 0.0
+            elif ac.contact < CONTACT_TRACK:
+                # 红外导引头也要先“看见”目标（IRST/目视/雷达跟踪均可）。
+                ac.locked = False
+                ac.lock_timer = 0.0
             else:
                 lo, hi = launch_envelope(ac, mspec, foe)
                 inside = lo <= dist <= hi and ang <= mspec.gimbal
@@ -1959,6 +2281,11 @@ class World:
 
             rspec = ac.spec.radar_missile
             if rspec is None or ac.radar_missiles <= 0:
+                ac.radar_locked = False
+                ac.radar_lock_timer = 0.0
+            elif not ac.radar_on or ac.contact < CONTACT_FIRE:
+                # 静默（雷达关机）或只有 IRST/预警机/侧阵的 track，都拿不到
+                # 火控级照射，中距弹无法装订诸元。
                 ac.radar_locked = False
                 ac.radar_lock_timer = 0.0
             else:
@@ -1991,6 +2318,19 @@ class World:
                 ac.firing = False
                 ac.gun_pending = 0.0
                 continue
+            # 没有目视接触时仍允许开火（靠跟踪数据压炮），但只打 600 m 内，
+            # 且散布 ×2.5。越远越像“对着大概方向泼弹”，是真实的浪费。
+            spread = spec.gun_spread * (
+                1.0 if ac.tally else GUN_NO_TALLY_SPREAD
+            )
+            if not ac.tally:
+                dd = math.sqrt(
+                    (foe.x - ac.x) ** 2 + (foe.y - ac.y) ** 2 + (foe.z - ac.z) ** 2
+                )
+                if dd > GUN_NO_TALLY_RANGE:
+                    ac.firing = False
+                    ac.gun_pending = 0.0
+                    continue
 
             ac.gun_pending += spec.rounds_per_sec * self.dt
             n_new = int(ac.gun_pending)
@@ -2001,6 +2341,8 @@ class World:
             ac.ammo = max(0.0, ac.ammo - n_new)
             self.stats["rounds_fired"] += n_new
             self.stats["bullets_fired"] += n_new
+            if self.first_fire_t[i] is None:
+                self.first_fire_t[i] = self.t
 
             nx, ny, nz = nose_direction(ac)
             # 与机头垂直的两个基向量，用来把高斯散布叠加到炮线上。
@@ -2020,8 +2362,8 @@ class World:
             damage = spec.gun_dps / max(spec.rounds_per_sec, 1e-6)
             muzzle = spec.muzzle_speed
             for _ in range(n_new):
-                sx = self._rng.gauss(0.0, spec.gun_spread)
-                sy = self._rng.gauss(0.0, spec.gun_spread)
+                sx = self._rng.gauss(0.0, spread)
+                sy = self._rng.gauss(0.0, spread)
                 dx = nx + ux * sx + wx * sy
                 dy = ny + uy * sx + wy * sy
                 dz = nz + uz * sx + wz * sy
@@ -2171,6 +2513,12 @@ class World:
         locked = ac.radar_locked if radar else ac.locked
         if count <= 0 or not locked:
             return
+        # 发射门控：中距弹必须火控级接触（雷达开机且锁定）；近距弹至少要有
+        # 跟踪（IRST/目视/雷达均可）。
+        if radar and (not ac.radar_on or ac.contact < CONTACT_FIRE):
+            return
+        if not radar and ac.contact < CONTACT_TRACK:
+            return
         foe = self.acs[1 - i]
         if not foe.alive:
             return
@@ -2225,6 +2573,8 @@ class World:
         ac.mass = max(1.0, ac.mass - mspec.mass)
         self.stats["missiles_fired"] += 1
         self.stats["missiles_launched"][i] += 1
+        if self.first_fire_t[i] is None:
+            self.first_fire_t[i] = self.t
         self.events.append((self.t, f"{ac.spec.name} 发射 {mspec.name}"))
 
     def _update_countermeasures(self) -> None:
@@ -2424,8 +2774,15 @@ class World:
                             and sang <= SARH_ILLUM_FOV
                             and radar_visibility(shooter, target) >= 0.5
                         )
-                    if not illum:
-                        m.guided = False
+                    # 失照不立刻丢弹：弹上惯导/数据链可以按最后一次诸元外推，
+                    # 目标短暂横穿（notch）后恢复照射还能接上；连续失照超过
+                    # MISSILE_MIDCOAST_MAX 才真正转无控。
+                    if illum:
+                        m.mid_t = 0.0
+                    else:
+                        m.mid_t += dt
+                        if m.mid_t > MISSILE_MIDCOAST_MAX:
+                            m.guided = False
 
             # 推进剂质量流失：质量流与当前推力成正比（恒定比冲），
             # 弹重随时间下降，加速度 a=T/m 因此逐渐变大；燃料耗尽后熄火。
@@ -2476,14 +2833,19 @@ class World:
             # 截获之后才真正靠自己的导引头，视场越界即丢失目标。
             midcourse = m.spec.is_arh and not m.active
             # 截获之后弹自己的导引头一样受多普勒盲区限制：目标横穿、弹目
-            # 相对径向速度落进凹口，弹就丢了这帧目标，转成无控弹道。
+            # 相对径向速度落进凹口，弹就丢了这帧目标。但横穿是暂时的，
+            # 只要目标退出盲区，导引头还能重新捕获——所以这里只累积计时，
+            # 连续盲区超过 MISSILE_BLIND_MAX 才真正转无控弹道。
             seeker_blind = m.active and doppler_visibility(
                 (m.x, m.y, m.z), (target.x, target.y, target.z),
                 world_velocity(target), mdv=MDV_SEEKER,
             ) <= 0.0
-            if (ang_seeker > m.spec.gimbal and not midcourse) or seeker_blind:
+            m.blind_t = m.blind_t + dt if seeker_blind else 0.0
+            fov_bad = ang_seeker > m.spec.gimbal and not midcourse
+            m.fov_t = m.fov_t + dt if fov_bad else 0.0
+            if m.blind_t > MISSILE_BLIND_MAX or m.fov_t > MISSILE_FOV_MAX:
                 m.guided = False
-            else:
+            elif not seeker_blind and not fov_bad:
                 # 弹体轴转向目标视线：弹体可以转得比速度矢量快，二者之差
                 # 就是迎角（气动舵面因此建立升力）。但迎角受气动极限约束，
                 # 超出后翼面失速；这里把弹体轴投影回迎角锥内。
@@ -2523,7 +2885,12 @@ class World:
                     m.nz = uz * ca + nzp * sa
 
             cmd_x = cmd_y = cmd_z = 0.0     # 本拍制导指令（横向加速度 N）
-            if m.guided and dist > 1.0:
+            # 盲区/出视场/中制导失照期间导引头拿不到新的视线数据，弹按惯导
+            # 外推飞行（指令清零、由自动驾驶仪滞后衰减），恢复后再接上 PN。
+            if (
+                m.guided and dist > 1.0
+                and not seeker_blind and not fov_bad and m.mid_t <= 0.0
+            ):
                 if decoy is not None:
                     tvx = tvy = tvz = 0.0   # 诱饵随风飘落，按静止目标处理
                 else:

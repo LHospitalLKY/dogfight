@@ -414,27 +414,39 @@ def should_launch(obs: Observation) -> bool:
     )
 
 
+# 双发补射门限：首发落在 NEZ 边缘、命中概率本就不高时，等冷却结束后再补
+# 一发；最多允许两发中距弹同时在空中，避免一次把两发都打光。
+RADAR_SALVO_PK = 0.80
+
+
 def should_launch_radar(obs: Observation) -> bool:
     """雷达制导中距弹（主动弹）的发射条件：只在不可逃逸区内发射。
 
-    中距弹的价值在超视距，太近时不如留着红外弹；也不能一次把两发都打光，
-    先打一发、等命中或丢锁后再补射。主动弹在中制导段仍需要载机雷达
-    保持跟踪与数据链，末段自主截获后即可脱离，因此这里同样要求速度余量。
+    中距弹的价值在超视距，太近时不如留着红外弹。首发要求进入 NEZ；
+    已有 1 发在飞且首发本身是“边界射击”（命中概率估计不高）时，允许
+    在冷却后补射第二发，形成双发齐射提高杀伤概率。
+    主动弹在中制导段仍需要载机雷达保持跟踪与数据链，末段自主截获后即可
+    脱离，因此这里同样要求速度余量。
 
     NEZ 之外提前发射实测无效：双方都往前挪同样的距离，首发时间差不变；
     只给隐身机加“对方还看不见我”的窗口也一样，那一发飞到末端已经没有
     能量，SU-57 的命中数从 17 掉到 12。发射规则不是把包线差换成战果的
     地方，问题在弹本身与防御时序。
     """
-    return (
-        obs.own_radar_locked
-        and obs.own_radar_missiles > 0
-        and obs.in_radar_envelope
-        and obs.radar_nez
-        and obs.own_radar_in_flight < 1
-        and obs.own_speed_frac > 1.35
-        and obs.dist > max(obs.radar_min_range, 2500.0)
-    )
+    if (
+        not obs.own_radar_locked
+        or obs.own_radar_missiles <= 0
+        or not obs.in_radar_envelope
+        or not obs.radar_nez
+        or obs.own_speed_frac <= 1.35
+        or obs.dist <= max(obs.radar_min_range, 2500.0)
+        or obs.own_radar_in_flight >= 2
+    ):
+        return False
+    if obs.own_radar_in_flight == 0:
+        return True
+    # 已有一发在飞：只有在首发是低概率的边界射击时才补第二发。
+    return obs.radar_pk_est < RADAR_SALVO_PK
 
 
 @dataclass
@@ -476,6 +488,9 @@ class TacticalAgent:
     LOW_ENERGY_FRAC = 1.55   # 速度低于 1.55 倍当地失速即进入能量保护
     N_MARGIN = 1.25          # 允许短时超出维持过载的倍数，其余能量透支被禁止
     MISSILE_EVADE_DIST = 9000.0  # 来袭格斗弹进入该距离就开始规避
+    # 红外格斗弹不钻多普勒凹口，远距横转/三九对它毫无作用：贴到 2.5 km 内
+    # 才投热诱弹并做高 G 急转/桶滚，靠角速度和诱饵把弹甩掉。
+    IR_EVADE_DIST = 2500.0
     SARH_EVADE_DIST = 16000.0    # 中距弹进入末段（近距）后的硬甩门限
     # 雷达制导中距弹的告警距离。对方最大发射包线约 36.6 km（Su-57 打
     # F-16V，35 km 标称距离 × RCS 四次方根缩放），取 40 km 保证弹一离架
@@ -483,7 +498,7 @@ class TacticalAgent:
     # 弹早就进了末段甚至已经命中，三九/F-pole 在名义上存在、实际不生效。
     BVR_EVADE_DIST = 40000.0
     # 三九凹口的保持门限：|v_r| 低于该值就认为已经进了主瓣杂波凹口
-    # （机载雷达 MDV=40 m/s，留一点余量），此时只做小速率修正，避免
+    # （机载雷达 MDV=30 m/s，留约 14 m/s 余量），此时只做小速率修正，避免
     # 大转弯率把机头甩出凹口、又把径向速度顶回门限以上。
     NOTCH_HOLD_VR = 44.0
     MISSILE_BREAK_DIST = 4500.0  # 更远时用能量友好的横转/俯冲拉长 F-pole
@@ -581,6 +596,18 @@ class TacticalAgent:
     # “返场 + 备降 + 复飞”的油量，约 5–10 分钟。与超时裁决用同一口径。
     BINGO_ENDURANCE = 300.0
 
+    # ---- 雷达策略（auto）----
+    # 目标进入该距离且仍然迎头、自己还有中距弹时，短暂开机建立火控；
+    # 中制导段由 own_radar_support 强制保持，末段自主截获后自动关机。
+    RADAR_AUTO_ON_DIST = 40000.0
+    RADAR_AUTO_BURST = 4.0
+    # 红外格斗弹来袭时的规避池：只做急转/桶滚/破 S，不做三九/横转/俯冲。
+    # 红外导引头不看多普勒凹口，雷达弹那套规避对它无效。
+    IR_DEFENSE = (
+        "HIGH_G_BREAK", "BREAK", "HIGH_G_BARREL", "BARREL",
+        "HIGH_G_SPLIT_S", "SPLIT_S",
+    )
+
     def __init__(
         self,
         aggression: float = 0.5,
@@ -588,10 +615,17 @@ class TacticalAgent:
         decision_dt: float = 0.1,
         seed: int | None = None,
         lure: bool = False,
+        radar_policy: str = "always",
     ) -> None:
         self.aggression = aggression
         self.energy_pref = energy_pref
         self.dt = decision_dt
+        # 雷达策略：always 常开 / silent 全程静默 / auto 静默+短时开机。
+        # auto 只在需要火控（有中距弹且目标进入 40 km 迎头）时开机，
+        # 中制导段（own_radar_support）强制保持，末段自主截获后立即关掉。
+        self.radar_policy = radar_policy
+        self._radar_on = radar_policy == "always"
+        self._radar_burst_t = 0.0
         # 是否执行“诱导对手先手”（见 _tactic_lure）。只有愿意用空间换对方
         # 弹药的一方该打开：它放弃了继续压上，换对方把两发中距弹在自包线
         # 最外沿打掉。
@@ -812,7 +846,43 @@ class TacticalAgent:
         self._scissor_t -= self.dt
         act = self._execute(self.primitive, obs)
         self._set_power(act, obs)
+        act.radar_on = self._radar_decision(obs)
         return act
+
+    def _radar_decision(self, obs: Observation) -> bool:
+        """按策略决定本拍雷达开关（会同步暴露给对手 RWR）。
+
+        always：常开。
+        silent：全程关机，只靠 IRST/光电吊舱/目视/预警机；因此拿不到火控，
+                不能发射雷达中距弹。
+        auto：默认关机；目标进入 40 km 迎头且自己还有中距弹时短暂开机建立
+              火控，中制导段（own_radar_support）保持照射，主动弹末段截获后
+              立刻关掉，回到静默。
+        """
+        if self.radar_policy == "always":
+            self._radar_on = True
+            return True
+        if self.radar_policy == "silent":
+            self._radar_on = False
+            return False
+        need = (
+            obs.contact_quality >= 2
+            and obs.own_radar_missiles > 0
+            and obs.own_radar_in_flight == 0
+            and obs.dist <= self.RADAR_AUTO_ON_DIST
+            and obs.aspect > math.radians(90.0)
+        )
+        if need:
+            self._radar_burst_t = max(self._radar_burst_t, self.RADAR_AUTO_BURST)
+        # 中制导段：主动弹还没进入末段自主截获，必须保持照射/数据链。
+        if obs.own_radar_support and obs.radar_tracking:
+            self._radar_burst_t = max(self._radar_burst_t, self.dt * 2.0)
+        if self._radar_burst_t > 0.0:
+            self._radar_burst_t -= self.dt
+            self._radar_on = True
+        else:
+            self._radar_on = False
+        return self._radar_on
 
     def _set_power(self, act: Action, obs: Observation) -> None:
         """发动机功率：进入交战前按巡航功率飞，交战与防御时再点加力。
@@ -916,6 +986,7 @@ class TacticalAgent:
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
+            self._tactic_search,
             self._tactic_press,
             self._tactic_guns,
             self._tactic_lure,
@@ -1062,34 +1133,37 @@ class TacticalAgent:
         # 来袭格斗弹优先：远距先做能量友好的横转/俯冲拉长 F-pole，
         # 只有进入近距才用最大过载急转硬甩。
         # 雷达制导中距弹（含主动弹）在超视距阶段就要开始偏置/横转；
-        # 红外弹只有进入近距才需要硬甩。
+        # 红外弹没有多普勒凹口可钻，远距横转/三九/俯冲对它完全无效，
+        # 贴到 2.5 km 内才投热诱弹并做高 G 急转/桶滚。
         evade_dist = (
             self.BVR_EVADE_DIST
             if obs.incoming_missile_radar
-            else self.MISSILE_EVADE_DIST
+            else self.IR_EVADE_DIST
         )
         if (
             obs.incoming_missile_dist < evade_dist
             and obs.own_speed_frac > 1.25
         ):
-            # 矢量喷口的过失速反制：来弹已经贴脸、自己还有速度时，
-            # 拉眼镜蛇把速度矢量“刹住”，让弹从下方冲过去。
-            # 只在 6DOF 且装矢量喷口的机型上可用。
-            if (
-                obs.own_tvc
-                and obs.dof >= 6
-                and not obs.incoming_missile_radar
-                and obs.incoming_missile_dist < self.COBRA_DIST
-                and obs.own_speed_frac > 1.90
-                and obs.z_margin_low > 1200.0
-            ):
-                return "SURVIVE", "COBRA"
+            if not obs.incoming_missile_radar:
+                # 矢量喷口的过失速反制：来弹已经贴脸、自己还有速度时，
+                # 拉眼镜蛇把速度矢量“刹住”，让弹从下方冲过去。
+                # 只在 6DOF 且装矢量喷口的机型上可用。
+                if (
+                    obs.own_tvc
+                    and obs.dof >= 6
+                    and obs.incoming_missile_dist < self.COBRA_DIST
+                    and obs.own_speed_frac > 1.90
+                    and obs.z_margin_low > 1200.0
+                ):
+                    return "SURVIVE", "COBRA"
+                return "SURVIVE", self._pick_defense(
+                    obs, vs_missile=True, ir=True
+                )
             # 雷达制导中距弹按 FC3 手册的超视距防御流程处理：
             # 自己的弹先到就 F-pole 偏置，否则三九下高。
-            if obs.incoming_missile_radar:
-                anti = self._anti_radar(obs)
-                if anti is not None:
-                    return "SURVIVE", anti
+            anti = self._anti_radar(obs)
+            if anti is not None:
+                return "SURVIVE", anti
             # 自己的雷达弹还处在需要照射/数据链的中制导段：远距先保持机头
             # 指向把弹导完；主动弹一旦末段截获就不再需要（own_radar_support）。
             keep_illum = (
@@ -1161,6 +1235,19 @@ class TacticalAgent:
         if obs.dist <= self.WVR_PRESS_DIST:
             return None
         return "PRESS", "PURE"
+
+    def _tactic_search(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """搜索：没有任何稳定跟踪时，朝最后已知位置/空域中心飞。
+
+        这一档排在生存之后、进攻之前：看不见目标就不该做进攻判断。
+        observe 已经把 off_az 换成搜索方位，PURE 会自然把机头压过去；
+        预警机/IRST/光电吊舱一旦重新建立 track，就交回交战族。
+        """
+        if obs.contact_quality >= 2:
+            return None
+        return "SEARCH", "PURE"
 
     def _tactic_guns(
         self, sit: _Situation, obs: Observation,
@@ -1679,19 +1766,26 @@ class TacticalAgent:
             return False            # 先把自己的弹打出去，下一拍再评估
         return True
 
-    def _pick_defense(self, obs: Observation, vs_missile: bool) -> str:
+    def _pick_defense(
+        self, obs: Observation, vs_missile: bool, ir: bool = False,
+    ) -> str:
         """在防御候选池里按成功率选择规避动作，全程保持同一转向侧。
 
         远距优先横转消耗弹能量、中距保持横转并做高 G 修正、近距才切硬甩，
         这些战术倾向由 `_maneuver_prob` 的概率项表达，而不是固定的轮换
         顺序；末段刚建立起来的三九/横转姿态也不会被无收益地换掉。
+        红外弹（ir=True）走单独的 IR_DEFENSE 池：导引头不看多普勒凹口，
+        BEAM/NOTCH_DESC/F_POLE 对它无效，只能靠大过载急转或桶滚甩掉。
         """
         if obs.own_speed_frac < self.LOW_ENERGY_FRAC:
             return "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
-        pool = self.MISSILE_DEFENSE if vs_missile else self.LOCK_DEFENSE
+        if ir:
+            pool = self.IR_DEFENSE
+        else:
+            pool = self.MISSILE_DEFENSE if vs_missile else self.LOCK_DEFENSE
         cands = [c for c in pool if self._defense_ok(c, obs)]
         if not cands:
-            return "BREAK" if vs_missile else "BEAM"
+            return "BREAK" if (vs_missile or ir) else "BEAM"
         return self._pick_maneuver(cands, None, obs, vs_missile)
 
     def _defense_ok(self, primitive: str, obs: Observation) -> bool:

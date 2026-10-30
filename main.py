@@ -13,18 +13,18 @@ from collections import Counter
 
 from agents import PurePursuit, TacticalAgent
 from sim import (
-    Action, AircraftSpec, MissileSpec, World, air_density, rcs_scale,
+    Action, AircraftSpec, MissileSpec, World, air_density,
     cd0_at, mach_number, body_axes, nose_direction,
 )
 
 PHYSICS_DT = 1.0 / 120.0
 DECIDE_HZ = 10
 STEPS_PER_DECISION = round(1.0 / (DECIDE_HZ * PHYSICS_DT))
-# 初始间距：双方各距空域中心 24000 m，总间距 48 km。
-# 主动弹（R-77-1 / AIM-120C）的载机雷达跟踪距离约 35 km，按隐身缩放后
-# 迎头有效射程不超过约 36 km；48 km 的开局让双方都在弹包线外，还留下
-# 约 10 km 的余量用于开局抢位（预警机已提供对方初始位置，模拟自带全知观测）。
-INITIAL_SPACING = 24000.0
+# 初始间距：双方各距空域中心 60000 m，总间距 120 km。
+# 双方开局都按最高巡航速度接近（Su-57 超巡 M1.30、F-16V M0.95），
+# 120 km 在 300 s 时限内留下足够的超视距交战与近距缠斗时间；
+# 空域同时扩大到 200 km，避免大间距下开局就被判出界。
+INITIAL_SPACING = 60000.0
 # 高 G 机动标注门限：超过人体可持续耐受（6 g）即视为高 G 机动。
 # 高空升力受限时（9–12 km、300 m/s 量级）可用过载本身只有 4–5 g，
 # 因此执行高 G 原语且拉到当地可用过载的 75% 也一并标注，否则轨迹图上
@@ -119,17 +119,21 @@ AIM120C = MissileSpec(
 # 极速 Mach 2.0（约 2135 km/h），不开加力超巡 Mach 1.3（约 1400 km/h），
 # 巡航 Mach 0.95。
 # 挂载：机腹弹舱 2 × R-77-1 中距弹 + 4 × R-73 近距弹，整机质量按满载计。
-# 前向 RCS 取公开估算的量级（0.1–1 m²），这里用 0.5 m²。
+# 分向 RCS：前 0.3 / 侧 1.2 / 后 2.5 m²（隐身修形主要压前向回波）。
+# 机头雷达（N036）对 1 m² 目标 160 km；侧阵 ±35°–145° 只跟踪；
+# L 波段襟翼雷达 ±45°、200 km、只探测；IRST 基线 60 km（±30°）。
 SU57_SPEC = AircraftSpec(
     name="SU-57", mass=24500 + 4 * R73.mass + 2 * R77_1.mass,
     wing_area=78.8, cl_max=1.6, rcs=0.5,
+    rcs_front=0.3, rcs_side=1.2, rcs_back=2.5,
+    radar_range=160000.0, side_array=True, lband=True, irst_range=60000.0,
     # 展弦比按真实机翼几何（翼展 14.1 m / 面积 78.8 m²）取 2.52，不再沿用 3.0；
     # 升力线斜率同步抬到 3.85，否则失速迎角处凑不出 CLmax。
     n_struct=9.0, thrust_max=284000.0, cd0=0.040, aspect_ratio=2.52, oswald=0.80,
     cl_alpha=3.85,
     # AL-41F1：单台军用推力 93 kN、最大加力 142 kN，双发合计 186 / 284 kN。
-    # 巡航速度取 M0.95（不开加力超巡则可达 M1.3），燃油按半箱 5500 kg 计。
-    thrust_mil=186000.0, cruise_mach=0.95, fuel_capacity=5500.0,
+    # 开局按不开加力的最高巡航速度（超巡 M1.30）接近，燃油按半箱 5500 kg 计。
+    thrust_mil=186000.0, cruise_mach=1.30, fuel_capacity=5500.0,
     # 推力衰减按公开升限/速度锚点标定：18 km 起推力悬崖，
     # 使 Ps 在 20 km 附近穿过 0，25 km 仍能维持 M1.1 量级。
     lapse_exp=0.65, ram_r0=0.15, ram_r1=0.20,
@@ -155,16 +159,22 @@ SU57_SPEC = AircraftSpec(
 # F-16V Block 70：空重 9,207 / 最大起飞 21,772 kg，机翼 27.87 m2，1×129 kN。
 # 极速 Mach 2.0–2.05（约 2120–2175 km/h），巡航 Mach 0.8（11 km 约 849 km/h）。
 # 挂载：翼尖导轨 2 × AIM-9X，翼下 2 × AIM-120C 中距弹 + 2 × AIM-9X，共 6 枚。
-# F-16V 没有隐身修形，前向 RCS 取 1.2 m²。
+# 无隐身修形：分向 RCS 前 1.2 / 侧 3.0 / 后 2.0 m²；
+# 机头雷达对 1 m² 目标 70 km；加装光电吊舱（Legion 级）：
+# 被动跟踪 45 km、+250 kg、ΔCd0≈0.002。
 F16V_SPEC = AircraftSpec(
-    # 标定重量 11,429 kg = 半油 + 6 枚弹的作战重量。
-    name="F-16V", mass=10787.4 + 4 * AIM9X.mass + 2 * AIM120C.mass,
+    # 标定重量 11,429 kg = 半油 + 6 枚弹的作战重量；吊舱再 +250 kg。
+    name="F-16V", mass=10787.4 + 4 * AIM9X.mass + 2 * AIM120C.mass + 250.0,
     wing_area=27.87, cl_max=1.5, rcs=1.2,
+    rcs_front=1.2, rcs_side=3.0, rcs_back=2.0,
+    radar_range=70000.0, pod_irst_range=45000.0,
     # cd0 由 0.050 下调到 0.039：旧值在 9 km/M0.9 把推力全吃掉，
     # 既飞不到公开的 M1.6，也和“推力比 0.45–0.55”的锚点矛盾。
-    n_struct=9.0, thrust_max=129000.0, cd0=0.039, aspect_ratio=3.56, oswald=0.85,
-    # F110-GE-129：军用推力 76.3 kN、最大加力 129 kN；巡航 M0.8，半箱油 1,580 kg。
-    thrust_mil=76300.0, cruise_mach=0.80, fuel_capacity=1580.0,
+    # 吊舱带来 ΔCd0≈0.002。
+    n_struct=9.0, thrust_max=129000.0, cd0=0.041, aspect_ratio=3.56, oswald=0.85,
+    # F110-GE-129：军用推力 76.3 kN、最大加力 129 kN；开局按 M0.95 巡航，
+    # 半箱油 1,580 kg。
+    thrust_mil=76300.0, cruise_mach=0.95, fuel_capacity=1580.0,
     # 推力衰减标定：13 km 起降额、尺度 9 km，
     # 使 9 km Vmax ≈ M1.56、12 km ≈ M1.73、18 km ≈ M1.12、升限约 16.5 km。
     lapse_exp=0.90, ram_r0=0.12, ram_r1=0.20,
@@ -197,12 +207,14 @@ def build_world(
     dof: int = 6,
     swap: bool = False,
     y_offset: float = 100.0,
+    awacs: bool = True,
 ) -> World:
     specs = [F16V_SPEC, SU57_SPEC] if swap else [SU57_SPEC, F16V_SPEC]
     return World(
         specs,
         dt=PHYSICS_DT,
-        arena=80000.0,
+        # 120 km 初始间距需要足够大的边界，避免开局就触发出界判负。
+        arena=200000.0,
         time_limit=time_limit,
         dof=dof,
         y_offset=y_offset,
@@ -210,18 +222,23 @@ def build_world(
         z0=9000.0,
         z_floor=1500.0,
         z_ceiling=30000.0,
+        awacs=awacs,
     )
 
 
 def build_agents(
     baseline: bool = False, swap: bool = False, seed: int | None = None,
+    f16_radar: str = "always", su57_radar: str = "always",
 ) -> list:
-    """seed 只用于实验复现；默认 None 表示每次启动随机占位。"""
+    """seed 只用于实验复现；默认 None 表示每次启动随机占位。
+
+    f16_radar / su57_radar：always 常开 / silent 全程静默 / auto 静默+短时开机。
+    """
     if baseline:
         return [PurePursuit(), PurePursuit()]
-    su57 = TacticalAgent(**SU57_AGENT, seed=seed)
+    su57 = TacticalAgent(**SU57_AGENT, seed=seed, radar_policy=su57_radar)
     f16_seed = None if seed is None else seed + 1
-    f16v = TacticalAgent(**F16V_AGENT, seed=f16_seed)
+    f16v = TacticalAgent(**F16V_AGENT, seed=f16_seed, radar_policy=f16_radar)
     return [f16v, su57] if swap else [su57, f16v]
 
 
@@ -255,7 +272,9 @@ def _spec_line(spec: AircraftSpec, z: float = 12000.0) -> str:
         f"12km 满加力 M{m_top:.2f} ({v_top:.0f} m/s)   "
         f"军推 M{m_mil:.2f}   "
         f"过载上限 {spec.n_struct:.1f}g   "
-        f"RCS {spec.rcs:.2f} m2 (x{rcs_scale(spec.rcs):.2f} 探测距离)"
+        f"RCS 前/侧/后 {spec.rcs_front or spec.rcs:.2f}/"
+        f"{spec.rcs_side or spec.rcs:.2f}/{spec.rcs_back or spec.rcs:.2f} m2   "
+        f"雷达 {spec.radar_range / 1000.0:.0f} km @1m2"
     )
 
 
@@ -284,7 +303,8 @@ def print_specs() -> None:
                 f"          中距弹 {spec.radar_missile_count} × {rsl.name} "
                 f"({rsl.mass:.1f} kg, {mode})   "
                 f"射程 {rsl.min_range / 1000.0:.0f}–{rsl.max_range / 1000.0:.0f} km   "
-                f"载机雷达跟踪 {rsl.seeker_range / 1000.0:.0f} km   锁定 {rsl.lock_time:.1f} s"
+                f"机载雷达 {spec.radar_range / 1000.0:.0f} km / "
+                f"弹上截获 {rsl.active_range / 1000.0:.0f} km   锁定 {rsl.lock_time:.1f} s"
             )
             if rsl.is_arh:
                 print(
@@ -309,10 +329,16 @@ def _simulate(
     swap: bool = False,
     y_offset: float = 100.0,
     seed: int | None = None,
+    f16_radar: str = "always",
+    su57_radar: str = "always",
+    awacs: bool = True,
 ):
     """跑一局，返回 (world, agents, 原语统计)。trace=True 时逐秒打印。"""
-    world = build_world(seconds, dof, swap=swap, y_offset=y_offset)
-    agents = build_agents(baseline, swap=swap, seed=seed)
+    world = build_world(seconds, dof, swap=swap, y_offset=y_offset, awacs=awacs)
+    agents = build_agents(
+        baseline, swap=swap, seed=seed,
+        f16_radar=f16_radar, su57_radar=su57_radar,
+    )
     usage = [Counter(), Counter()]
     actions = [Action(), Action()]
     steps = 0
@@ -349,10 +375,13 @@ def _print_usage(usage) -> None:
 
 def run_headless(
     seconds: float, baseline: bool, dof: int = 6, seed: int | None = None,
+    f16_radar: str = "always", su57_radar: str = "always",
+    awacs: bool = True,
 ) -> None:
     print_specs()
     world, _agents, usage = _simulate(
-        dof, seconds, baseline, trace=True, seed=seed
+        dof, seconds, baseline, trace=True, seed=seed,
+        f16_radar=f16_radar, su57_radar=su57_radar, awacs=awacs,
     )
     print()
     print(world.summary())
@@ -506,6 +535,67 @@ def run_ab_suite(seconds: float) -> None:
                 f"  {dof}DOF y={yoff:+4.0f}: 左{a['left']}→{a['winner']:<5}"
                 f"  左{b['left']}→{b['winner']:<5}  {tag}"
             )
+
+
+def _spec_index(world, name: str) -> int:
+    return 0 if world.acs[0].spec.name == name else 1
+
+
+def run_radar_compare(seconds: float, seed: int | None = 3) -> None:
+    """F-16V 三种雷达策略各跑一局，对比“辐射/静默”的战术后果。
+
+    always：雷达常开，能拿火控发 AIM-120，但一开机就被对方 RWR 发现；
+    silent：全程静默，只靠光电吊舱/IRST/目视/预警机，拿不到火控级接触，
+            不能发射中距弹，但对方 RWR 全程无告警；
+    auto：默认静默，目标进入 40 km 迎头且还有中距弹时短时开机，
+          中制导段保持，主动弹末段截获后关机。
+
+    固定 seed，三次模拟除雷达策略外开局占位完全一致，差异只来自辐射。
+    """
+    print_specs()
+    print("F-16V 雷达策略对比（Su-57 雷达常开，seed=%s）" % seed)
+    rows = []
+    for policy in ("always", "silent", "auto"):
+        world, _agents, _usage = _simulate(
+            6, seconds, baseline=False, seed=seed, f16_radar=policy,
+        )
+        fi = _spec_index(world, F16V_SPEC.name)
+        si = 1 - fi
+
+        def fmt(value: float | None) -> str:
+            return "—" if value is None else f"{value:.1f}s"
+
+        left, right = world.acs
+        rows.append({
+            "policy": policy,
+            "winner": _winner_frame(world),
+            "time": world.t,
+            "reason": world.reason_code or "-",
+            "fc": fmt(world.first_fire_contact_t[fi]),
+            "fire": fmt(world.first_fire_t[fi]),
+            "su_fc": fmt(world.first_fire_contact_t[si]),
+            "su_fire": fmt(world.first_fire_t[si]),
+            "msl": f"{world.stats['missiles_fired']:.0f}",
+            "hits": f"{world.stats['missile_hits']}",
+            "hp": (
+                f"{100.0 * left.hp / left.spec.hp_max:.0f}% / "
+                f"{100.0 * right.hp / right.spec.hp_max:.0f}%"
+            ),
+        })
+
+    print()
+    print(
+        f"{'F16雷达':<12}{'胜者':>7}{'用时':>8}{'原因':>10}"
+        f"{'F16火控':>10}{'F16开火':>10}{'SU57火控':>11}{'SU57开火':>11}"
+        f"{'弹发':>6}{'命中':>6}{'HP 左/右':>14}"
+    )
+    print("-" * 101)
+    for r in rows:
+        print(
+            f"{r['policy']:<12}{r['winner']:>7}{r['time']:>7.2f}s{r['reason']:>10}"
+            f"{r['fc']:>10}{r['fire']:>10}{r['su_fc']:>11}"
+            f"{r['su_fire']:>11}{r['msl']:>6}{r['hits']:>6}{r['hp']:>14}"
+        )
 
 
 def _sample_state(world) -> list[tuple]:
@@ -664,6 +754,9 @@ def run_record(
     track_interval: float = 10.0,
     fps: int = 20,
     seed: int | None = None,
+    f16_radar: str = "always",
+    su57_radar: str = "always",
+    awacs: bool = True,
 ) -> None:
     """无窗口渲染并录制视频，同时按固定间隔采样全局轨迹。"""
     import os
@@ -675,8 +768,10 @@ def run_record(
 
     from render import Renderer
 
-    world = build_world(seconds, dof)
-    agents = build_agents(baseline, seed=seed)
+    world = build_world(seconds, dof, awacs=awacs)
+    agents = build_agents(
+        baseline, seed=seed, f16_radar=f16_radar, su57_radar=su57_radar,
+    )
     # 录制要走 SDL dummy 驱动，没有 GL 上下文，直接用 CPU 渲染保证帧可读。
     renderer = Renderer(follow=follow, follow_dist=1200.0, gpu=False)
     steps_per_frame = max(1, round(1.0 / (fps * PHYSICS_DT)))
@@ -748,14 +843,17 @@ def run_record(
 
 def run_window(
     seconds: float, baseline: bool, dof: int = 6, seed: int | None = None,
-    gpu: bool = True,
+    gpu: bool = True, f16_radar: str = "always", su57_radar: str = "always",
+    awacs: bool = True,
 ) -> None:
     import pygame
 
     from render import Renderer
 
-    world = build_world(seconds, dof)
-    agents = build_agents(baseline, seed=seed)
+    world = build_world(seconds, dof, awacs=awacs)
+    agents = build_agents(
+        baseline, seed=seed, f16_radar=f16_radar, su57_radar=su57_radar,
+    )
     renderer = Renderer(gpu=gpu)
     print(f"渲染后端: {'GPU / OpenGL' if renderer.gpu else 'CPU / pygame 软件渲染'}")
     clock = pygame.time.Clock()
@@ -777,8 +875,11 @@ def run_window(
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key == pygame.K_r:
-                    world = build_world(seconds, dof)
-                    agents = build_agents(baseline, seed=seed)
+                    world = build_world(seconds, dof, awacs=awacs)
+                    agents = build_agents(
+                        baseline, seed=seed,
+                        f16_radar=f16_radar, su57_radar=su57_radar,
+                    )
                     renderer.reset()
                     actions = [Action(), Action()]
                     accumulator = 0.0
@@ -827,6 +928,23 @@ def main() -> None:
         "--seed", type=int, default=None,
         help="固定开局随机占位的随机种子（复现实验用；默认每次启动随机）",
     )
+    radar_choices = ("always", "silent", "auto")
+    parser.add_argument(
+        "--f16-radar", choices=radar_choices, default="always",
+        help="F-16V 雷达策略：常开 / 全程静默 / 静默+短时开机（默认 always）",
+    )
+    parser.add_argument(
+        "--su57-radar", choices=radar_choices, default="always",
+        help="Su-57 雷达策略（默认 always）",
+    )
+    parser.add_argument(
+        "--compare-radar", action="store_true",
+        help="F-16V 三种雷达策略各跑一局并对比（默认 seed=3）",
+    )
+    parser.add_argument(
+        "--awacs", action=argparse.BooleanOptionalAction, default=True,
+        help="是否启用预警机（默认开启；--no-awacs 关闭）",
+    )
     parser.add_argument(
         "--no-gpu", action="store_true",
         help="强制使用 CPU 软件渲染（默认尝试 OpenGL，失败自动回退）",
@@ -837,17 +955,27 @@ def main() -> None:
         run_record(
             args.seconds, args.baseline, args.dof, args.record,
             args.track_plot, args.follow, args.track_interval, args.fps,
-            args.seed,
+            args.seed, args.f16_radar, args.su57_radar, args.awacs,
+        )
+    elif args.compare_radar:
+        run_radar_compare(
+            args.seconds, 3 if args.seed is None else args.seed,
         )
     elif args.ab_suite:
         run_ab_suite(args.seconds)
     elif args.ab:
         run_ab(args.seconds)
     elif args.headless:
-        run_headless(args.seconds, args.baseline, args.dof, args.seed)
+        run_headless(
+            args.seconds, args.baseline, args.dof, args.seed,
+            args.f16_radar, args.su57_radar, args.awacs,
+        )
     else:
-        run_window(args.seconds, args.baseline, args.dof, args.seed,
-                   gpu=not args.no_gpu)
+        run_window(
+            args.seconds, args.baseline, args.dof, args.seed,
+            gpu=not args.no_gpu, f16_radar=args.f16_radar,
+            su57_radar=args.su57_radar, awacs=args.awacs,
+        )
 
 
 if __name__ == "__main__":

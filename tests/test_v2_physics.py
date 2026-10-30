@@ -262,7 +262,8 @@ def test_e02_service_ceiling_ranges():
 def test_e03_vmax_peaks_and_nine_km_speed():
     f16_9 = v_max_mach(F16V_SPEC, 9000.0)
     su_9 = v_max_mach(SU57_SPEC, 9000.0)
-    assert 1.45 <= f16_9 <= 1.70, f16_9
+    # 挂载光电吊舱（+250 kg、ΔCd0≈0.002）后 9 km 极速略降，下界相应放宽。
+    assert 1.40 <= f16_9 <= 1.70, f16_9
     assert 1.45 <= su_9 <= 1.65, su_9
     # F-16V：峰值在 11–13.5 km；18 km 已高于实用升限，维持不住平飞。
     f16_12 = v_max_mach(F16V_SPEC, 12000.0)
@@ -318,7 +319,8 @@ def test_e07_sustained_and_instantaneous_turn():
     for spec in (F16V_SPEC, SU57_SPEC):
         ns = spec.n_sustain(v, z, 1.0, spec.mass, 1.0)
         rate = math.degrees(G * math.sqrt(max(ns * ns - 1.0, 0.0)) / v)
-        assert 8.0 <= rate <= 12.0, (spec.name, rate)
+        # F-16V 带光电吊舱（+250 kg）后稳定盘旋率略降，下界放宽到 7.8°/s。
+        assert 7.8 <= rate <= 12.0, (spec.name, rate)
         assert spec.n_available(v, z, spec.mass) > ns * 1.2
 
 
@@ -345,7 +347,8 @@ def test_w02_bullets_feel_gravity():
     w = world6((F16V_SPEC, SU57_SPEC))
     a, b = w.acs
     place(a, 0.0, 0.0, 9000.0, 0.0, 300.0)
-    place(b, 50000.0, 0.0, 9000.0, math.pi, 300.0)
+    # 目标放在炮口正前方 500 m（900 m 扳机窗口内），无论有无 tally 都允许开火。
+    place(b, 500.0, 0.0, 9000.0, math.pi, 300.0)
     for _ in range(3):
         w.step([Action(n=1.0, throttle=0.6, fire=True),
                 Action(n=1.0, throttle=0.0)])
@@ -420,15 +423,25 @@ def test_w05_missile_peak_mach(mspec, shooter, lo, hi):
 
 
 def test_w06_envelope_rcs_handling():
-    """红外弹包线与 RCS 无关；雷达弹按 RCS 的四次方根缩放。"""
-    ac = world6((SU57_SPEC, F16V_SPEC)).acs[0]
-    stealth = dataclasses.replace(F16V_SPEC, rcs=0.1)
+    """红外弹包线与 RCS 无关；雷达弹按分向 RCS 的四次方根缩放。"""
+    w = world6((SU57_SPEC, F16V_SPEC))
+    ac, target = w.acs
+    place(ac, 0.0, 0.0, 9000.0, 0.0, 300.0)
+    place(target, 1500.0, 0.0, 9000.0, math.pi, 300.0)
     plain = dataclasses.replace(F16V_SPEC, rcs=1.0)
-    ir_lo, ir_hi = launch_envelope(ac, R73, dataclasses.replace(plain, rcs=0.001))
-    assert ir_lo == R73.min_range and ir_hi == min(R73.max_range, R73.seeker_range)
-    _, radar_hi = launch_envelope(
-        ac, R77_1, type("F", (), {"spec": stealth})()
+    target.spec = dataclasses.replace(
+        plain, rcs=0.001, rcs_front=0.0, rcs_side=0.0, rcs_back=0.0,
     )
+    ir_lo, ir_hi = launch_envelope(ac, R73, target)
+    assert ir_lo == R73.min_range and ir_hi == min(R73.max_range, R73.seeker_range)
+
+    # 雷达弹走分向 RCS：给一个全向 0.1 m² 的隐身目标，迎头探测距离按
+    # RCS 的四次方根缩放；目标径向速度足够大，多普勒可见度为 1。
+    stealth = dataclasses.replace(
+        F16V_SPEC, rcs=0.1, rcs_front=0.1, rcs_side=0.1, rcs_back=0.1,
+    )
+    target.spec = stealth
+    _, radar_hi = launch_envelope(ac, R77_1, target)
     assert radar_hi == pytest.approx(
         min(R77_1.max_range, R77_1.seeker_range * rcs_scale(stealth.rcs))
     )
