@@ -170,8 +170,8 @@ DEMOS = [
     # 恢复末段绕纵轴滚转（bell）后改平。用 3000 m 离地高度演示。
     demo("KVOCHUR_BELL", "bell", 42.0, speed=220.0, foe="pure", sign=-1.0,
          seq=[("KVOCHUR_BELL", 38.0), ("PURE", 4.0)]),
-    # 同一套拉起/尾滑的另一种翻落：后倒——顶点后反向推杆，机头沿原爬升
-    # 路径倒回来，尾冲后退后改平，退出航向基本不变。
+    # 同一套拉起/尾滑的另一种翻落：后倒——顶点后继续拉杆，机头朝机尾方向
+    # 翻过去，尾冲后翻一整圈再拉平。
     demo("KVOCHUR_BELL_BACK", "bell", 38.0, speed=220.0, foe="pure", sign=-1.0,
          seq=[("KVOCHUR_BELL_BACK", 34.0), ("PURE", 4.0)]),
     # Herbst / J 转弯：拉起 45° → 绕速度矢量横滚 → 机头压回水平。
@@ -399,6 +399,8 @@ def record(name: str, cfg: dict, dof: int,
                             f"z={ac0.z:6.0f} v={ac0.v:5.1f} "
                             # 6DOF 下 theta-gamma 近似迎角（翼平做过失速时最直观）
                             f"a={math.degrees(ac0.theta - ac0.gamma):5.1f} "
+                            f"az={math.degrees(world.observe(0).own_nose_az):6.1f} "
+                            f"el={math.degrees(world.observe(0).own_nose_el):5.1f} "
                             f"sep={seps[-1]:6.0f} foe={foe.primitive}"
                         )
                         next_trace += 1.0

@@ -2192,6 +2192,7 @@ class TacticalAgent:
             self._open_alt0 = None
         if primitive in BELL_PRIMS:
             self._bell_az0 = None
+            self._bell_flipped = False
             self._bell_yaw_acc = 0.0
             self._bell_az_rate = 0.0
             self._bell_t = 0.0
@@ -2733,9 +2734,9 @@ class TacticalAgent:
         """克沃丘尔钟摆（真·尾滑/bell）：近垂直拉起 → 零速尾滑 → 钟摆翻落。
 
         两种翻落方向共用拉起/尾滑时序：
-          - 前倒（back=False）：机头越过顶点继续向前翻落，退出航向约反向；
-          - 后倒（back=True）：顶点后反向推杆，机头沿原爬升路径倒回来，
-            尾冲后退后改平，退出航向基本不变。
+          - 前倒（back=False）：机头越过顶点继续向前翻落；
+          - 后倒（back=True）：顶点后继续拉杆，机头朝机尾方向翻过去，尾冲后翻
+            一整圈（Kulbit 式），再拉平；退出航向基本不变。
 
         与旧实现“边前飞边横转 360°”不同，这里把水平速度真正刹到零：
           1) 高 G 拉起：把机头抬到 80–90°；仰角过 60–70° 就收油门、
@@ -2810,14 +2811,25 @@ class TacticalAgent:
         if self._phase == 2:
             # 钟摆段：机头已甩过地平线。空速还在零附近，舵面几乎没有权限，
             # 真正的“钟摆侧摆”要等空速回来、方向舵有效后在恢复初段给。
+            done = False
             if back:
-                # 后倒：反向推杆，把机头沿原爬升路径压回来。这里不再额外
-                # 偏航，保证改出航向基本不变。
+                # 后倒：继续拉杆，让机头朝机尾方向翻过去（倒扣后翻）。
+                # 机头仰角 el 过了 90° 会重新变小，单看 el 分不清前倒/后倒，
+                # 用机头方位相对初始值是否翻转 180° 来判断翻到了背面。
                 act = Action(
                     bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
                     brake=1.0, fire=False, roll_free=True,
-                    pitch_rate=-0.55,
+                    pitch_rate=0.55,
                     yaw_rate=-0.6 * obs.own_beta,
+                )
+                az_dev = abs(wrap_pi(obs.own_nose_az - self._bell_az0))
+                if az_dev > math.radians(150.0):
+                    self._bell_flipped = True
+                # 一直拉到机头绕机体横轴翻完一整圈（方位先翻 180°、再翻回
+                # 原方向），形成后空翻；随后机头朝前下方，交回常规拉平。
+                done = (
+                    self._bell_flipped and az_dev < math.radians(40.0)
+                    and el < 0.0
                 )
             else:
                 act = Action(
@@ -2825,7 +2837,7 @@ class TacticalAgent:
                     brake=1.0, fire=False, roll_free=True,
                     pitch_rate=0.0, yaw_rate=-0.6 * obs.own_beta,
                 )
-            if el <= math.radians(5.0) or self._bell_t >= 10.0:
+            if (done if back else el <= math.radians(5.0)) or self._bell_t >= 10.0:
                 self._phase, self._bell_t = 3, 0.0
                 self._bell_kicked = False
                 self._bell_kick_t = 0.0
