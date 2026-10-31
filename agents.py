@@ -2731,6 +2731,28 @@ class TacticalAgent:
             self._maneuver_done = True
         return level_out_action(obs)
 
+    def _bell_apex_yaw(self, obs: Observation, el: float) -> float:
+        """顶点/尾滑段的矢量喷口偏航指令。
+
+        这一段空速接近零，方向舵没有任何权限，机头方位只能靠三元矢量喷口
+        给力矩。所以顶点不把机头锁死，而是：
+          1) 机头还在 88° 以上时给一个朝钟摆侧的缓变偏置（78° 起渐入），
+             机头会在顶点像钟摆一样慢慢摆出去，画面上能看到喷口在偏航；
+          2) 仰角回落到 78° 以下把偏置收回——那时空速开始回来、翻落方向
+             由重力与气动决定，再给偏置会把翻落方向带歪；
+          3) 叠加航向保持项，避免顶点摆动把进入航向吃掉。
+        """
+        az0 = self._bell_az0 if self._bell_az0 is not None else obs.own_nose_az
+        err = wrap_pi(obs.own_nose_az - az0)
+        w = clamp(
+            (abs(el) - math.radians(78.0)) / math.radians(10.0), 0.0, 1.0
+        )
+        # 幅度必须小：机头竖直时绕机体竖轴偏航，欧拉角上会直接耦合出滚转，
+        # 给大了会把前倒硬拧成一次横滚+偏航的乱翻（实测 0.55 就会滚到 50° 以上）。
+        bias = -self._def_sign * 0.22 * w
+        fb = clamp(0.8 * err, -0.25, 0.25)
+        return clamp(bias + fb, -0.4, 0.4)
+
     def _kvochur_bell(self, obs: Observation, back: bool = False) -> Action:
         """克沃丘尔钟摆（真·尾滑/bell）：近垂直拉起 → 零速尾滑 → 钟摆翻落。
 
@@ -2764,8 +2786,14 @@ class TacticalAgent:
             self._bell_az0 = obs.own_nose_az
             self._bell_az_prev = obs.own_nose_az
         # 机头方位累计只作诊断：不再用 360° 闭环驱动舵面。
-        self._bell_yaw_acc += wrap_pi(obs.own_nose_az - self._bell_az_prev)
+        d_az = wrap_pi(obs.own_nose_az - self._bell_az_prev)
+        self._bell_yaw_acc += d_az
         self._bell_az_prev = obs.own_nose_az
+        # 航向回收用的反馈量：机头相对进入航向的方位误差与方位角速度。
+        # 注意 own_nose_az 在机头越过垂直（pitch 过 ±90°）时会整翻 180°，
+        # 但翻落段本来就要把机头绕回来，这里按同一个连续量闭环即可。
+        az_err = wrap_pi(obs.own_nose_az - self._bell_az0)
+        az_rate = clamp(d_az / self.dt, -1.2, 1.2)
 
         if self._phase == 0:
             # 拉起：高 G 把机头抬到近垂直。仰角过 60° 或航迹已经过 55°
@@ -2789,10 +2817,16 @@ class TacticalAgent:
             )
 
         if self._phase == 1:
-            # 顶点/尾滑：接近零速，卸载到 n≈1。不要再硬拉杆，否则会在
-            # 失速前缘上停住、而不是自然进入尾滑。
+            # 顶点/尾滑：卸载到 n≈1。不要再硬拉杆，否则会在失速前缘上
+            # 停住、而不是自然进入尾滑。
+            # 翻转点不再等垂直速度掉到零：尾滑还剩约 35 m/s 爬升速度时就
+            # 进入翻落段，靠残余动压和喷口偏航完成翻转，不在顶点挂死几秒。
+            # 只有前倒用这个提前量：后倒（Kulbit）在还有 30 m/s 爬升速度时
+            # 过头翻，机头会带着近 180° 迎角滚过去，翻落段变成螺旋下坠。
+            early = not back and vz < 35.0 and el > math.radians(70.0)
             if (
-                (vz < 4.0 and gamma < math.radians(70.0))
+                early
+                or (vz < 4.0 and gamma < math.radians(70.0))
                 or (el < math.radians(70.0) and speed_frac < 0.55)
                 or self._bell_t >= 16.0
             ):
@@ -2804,9 +2838,13 @@ class TacticalAgent:
                 else 0.08 if el < math.radians(83.0) else 0.0
             )
             return Action(
-                bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                # 顶点保留一点油门：纯尾滑时推力为零，矢量喷口偏转也产生
+                # 不了力矩，画面上看不到偏航。0.3 的军推只占重量的 1/6，
+                # 不影响后面自然掉头，却能让喷口偏航真正起作用。
+                bank=0.0, n=1.0, throttle=0.30, afterburner=0.0,
                 brake=1.0, fire=False, roll_free=True,
                 pitch_rate=pitch, yaw_rate=-0.6 * obs.own_beta,
+                tvc_yaw=self._bell_apex_yaw(obs, el),
             )
 
         if self._phase == 2:
@@ -2838,10 +2876,16 @@ class TacticalAgent:
                 # 原方向），形成后空翻；随后机头朝前下方，交回常规拉平。
                 done = self._bell_flipped and el < math.radians(-50.0)
             else:
+                # 前倒：卸载到 n≈0。这里不能再给 n=1——低速段内回路的
+                # gamma_dot 前馈是 G(n-cosγ)/V，V 只剩几十米每秒时它会把
+                # 机头以 20°/s 往头顶方向推，翻落变成“越顶后空翻”，
+                # 方位整翻 180°，改出段再花十几秒转回来。n≈0 时前馈反向，
+                # 机头在还带着爬升速度时就朝前下方掉（真正的尾滑钟摆）。
                 act = Action(
-                    bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                    bank=0.0, n=0.0, throttle=0.30, afterburner=0.0,
                     brake=1.0, fire=False, roll_free=True,
                     pitch_rate=0.0, yaw_rate=-0.6 * obs.own_beta,
+                    tvc_yaw=self._bell_apex_yaw(obs, el),
                 )
             if (done if back else el <= math.radians(5.0)) or self._bell_t >= 10.0:
                 self._phase, self._bell_t = 3, 0.0
@@ -2854,20 +2898,37 @@ class TacticalAgent:
             # 把航迹从近垂直俯冲拉回来（不在 q≈0 时猛拉）。
             act = level_out_action(obs, throttle=0.9)
             act.afterburner = 0.0
-            # 下坠初段的一次性方向舵 kick：顶点附近空速接近零、方向舵没有
-            # 权限，必须先等空速回到约 0.62 倍失速，再给一次明确输入，
-            # 机头才会像钟摆一样绕竖轴摆出去；之后交回中立方向舵。
-            # 后倒变体不踢舵，保持退出航向基本不变。
+            # 越过垂直、机头开始往下压时就用偏航力矩把航向收回进入方向：
+            # 低速段方向舵几乎没有权限，靠三元矢量喷口的偏航通道补。
+            # 等到机头压到近地面、已经拉平再压坡度转回来，就变成“先平飞
+            # 再转向”，机头不可能在转平那一刻就指向前方。
+            # 近垂直下坠段空速极低、迎角很大，这时上大偏航会把机体拧成
+            # 尾旋（后倒变体尤其明显），因此按空速给权限包络：机头离
+            # 垂直 60° 以内直接用满，还在陡直下坠时随空速恢复线性放开。
+            if abs(obs.own_nose_el) < math.radians(60.0):
+                authority = 1.0
+            else:
+                authority = clamp((obs.own_speed - 60.0) / 80.0, 0.0, 1.0)
+            # 方位误差 + 方位角速度（预测式阻尼）：角速度项在机头已经往
+            # 目标方向快速扫过时先把指令收回来，避免冲过头再来回摆。
+            fb = clamp(2.6 * az_err + 1.2 * az_rate, -0.9, 0.9) * authority
+            # 下坠初段的偏航 kick 做成随时间线性收回的脉冲，不再是一个
+            # 2.2 s 的恒值。原来恒值段会跟航向反馈硬顶，机头被甩出 40° 以上
+            # 再拉回来（就是看得见的那次超调）；改成脉冲后侧摆由 kick 起头、
+            # 由反馈收尾，摆出去再平滑地绕回来。
             if not back and not self._bell_kicked and speed_frac > 0.62:
                 self._bell_kicked = True
                 self._bell_kick_t = 2.2
             if not back and self._bell_kicked and self._bell_kick_t > 0.0:
                 self._bell_kick_t = max(0.0, self._bell_kick_t - self.dt)
-                # 混控里还会叠加 0.6β 的侧滑对齐项，低速恢复段 β 很大，
-                # 不扣掉它舵令会被抵消掉一部分；扣掉后才是真正打满 ±0.9。
-                act.yaw_rate = clamp(
-                    yaw_sign * 0.9 - 0.6 * obs.own_beta, -0.9, 0.9
-                )
+                kick = yaw_sign * 0.9 * (self._bell_kick_t / 2.2)
+                yaw_cmd = clamp(kick + fb, -0.9, 0.9)
+            else:
+                yaw_cmd = fb
+            # 混控里还会叠加 0.6β 的侧滑对齐项，低速恢复段 β 很大，
+            # 不扣掉它舵令会被抵消掉一部分；扣掉后才是真正打满 ±0.9。
+            act.yaw_rate = clamp(yaw_cmd - 0.6 * obs.own_beta, -0.9, 0.9)
+            act.tvc_yaw = clamp(yaw_cmd / 0.9, -1.0, 1.0) * 0.35
             # 航迹回到 −20° 附近、空速回到 1.15 倍失速以上，舵面重新有效，
             # 这时才是“恢复最后 1/4 段”的 bell 滚转。
             if (
@@ -2882,22 +2943,35 @@ class TacticalAgent:
             return act
 
         # 第 4 段：bell 的滚转 + 改平。
+        # 航向全程靠偏航（方向舵 + 三元矢量）保持，不再压坡度转弯：bell 的
+        # 滚转和拉平本身会带出十几度漂移，边滚边偏航才能在机翼放平的那一刻
+        # 机头已经指回进入航向，而不是“先平飞、再转向”。
+        yaw_cmd = clamp(2.6 * az_err + 1.2 * az_rate, -0.9, 0.9)
+        yaw_cmd = clamp(yaw_cmd - 0.6 * obs.own_beta, -0.9, 0.9)
+        yaw_tvc = clamp(yaw_cmd / 0.9, -1.0, 1.0) * 0.35
         if self._bell_roll_t > 0.0:
             self._bell_roll_t = max(0.0, self._bell_roll_t - self.dt)
-            if abs(obs.own_bank) < math.radians(46.0):
+            if abs(obs.own_bank) < math.radians(38.0):
+                # 滚转段只给很小的过载（1.4g）：带坡度拉杆会在方位上把机头
+                # 拽向坡度的方向，过载越大拽得越狠，航向反馈压不住就变成
+                # 滚转过程中的来回摆。用接近 1g 的纯滚转，方位漂移只有几度。
                 return Action(
-                    bank=0.0, n=2.4, throttle=0.9, afterburner=0.0,
-                    fire=False, roll_rate=sign * 0.60,
+                    bank=0.0, n=1.4, throttle=0.9, afterburner=0.0,
+                    fire=False, roll_rate=sign * 0.55,
+                    yaw_rate=yaw_cmd, tvc_yaw=yaw_tvc,
                 )
-            # 到位即停：达到约 45° 后不再继续滚，交给下面的改平段。
+            # 到位即停：达到约 38° 后不再继续滚，交给下面的改平段。
             self._bell_roll_t = 0.0
         act = level_out_action(obs, throttle=0.95)
         act.afterburner = 0.4 if speed_frac > 1.10 else 0.0
+        act.yaw_rate = yaw_cmd
+        act.tvc_yaw = yaw_tvc
         if (
             abs(gamma) < math.radians(12.0)
             and abs(obs.own_bank) < math.radians(30.0)
+            and abs(az_err) < math.radians(12.0)
             and speed_frac > 1.05
-        ) or self._bell_t >= 8.0:
+        ) or self._bell_t >= 18.0:
             self._maneuver_done = True
         return act
 

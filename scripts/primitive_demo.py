@@ -168,12 +168,15 @@ DEMOS = [
     # 克沃丘尔钟摆（真·尾滑/bell）：高 G 拉起至近垂直 → 收油 + 减速板把
     # 空速打到零附近 → 卸载进入尾滑、机头自然翻落 → 下坠初段方向舵 kick →
     # 恢复末段绕纵轴滚转（bell）后改平。用 3000 m 离地高度演示。
-    demo("KVOCHUR_BELL", "bell", 42.0, speed=220.0, foe="pure", sign=-1.0,
-         seq=[("KVOCHUR_BELL", 38.0), ("PURE", 4.0)]),
+    demo("KVOCHUR_BELL", "bell", 48.0, speed=220.0, foe="pure", sign=-1.0,
+         seq=[("KVOCHUR_BELL", 44.0), ("PURE", 4.0)]),
     # 同一套拉起/尾滑的另一种翻落：后倒——顶点后继续拉杆，机头朝机尾方向
-    # 翻过去，尾冲后翻一整圈再拉平。
-    demo("KVOCHUR_BELL_BACK", "bell", 38.0, speed=220.0, foe="pure", sign=-1.0,
-         seq=[("KVOCHUR_BELL_BACK", 34.0), ("PURE", 4.0)]),
+    # 翻过去，尾冲后翻一整圈再拉平。蓝方只平飞掠过当参照：如果让它继续
+    # 咬尾追击，本机零速翻落时它会跟着做一次大角度回旋，把机动本身盖住；
+    # 速度取 160 让双方在 50 s 内都留在镜头里。
+    demo("KVOCHUR_BELL_BACK", "bell", 54.0, speed=220.0, foe="level",
+         foe_speed=160.0, sign=-1.0,
+         seq=[("KVOCHUR_BELL_BACK", 50.0), ("PURE", 4.0)]),
     # Herbst / J 转弯：拉起 45° → 绕速度矢量横滚 → 机头压回水平。
     demo("HERBST", "attacked", 18.0, speed=300.0, foe="pure", sign=-1.0,
          seq=[("HERBST", 14.0), ("PURE", 4.0)]),
