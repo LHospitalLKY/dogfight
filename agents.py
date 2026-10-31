@@ -72,8 +72,11 @@ DEF_REVERSE_TIME = 1.5
 VERTICAL = frozenset((
     "SPLIT_S", "HIGH_G_SPLIT_S", "IMMELMANN", "LOOP",
     "BARREL", "HIGH_G_BARREL", "DIVE_BREAK", "DIVE_OFFSET",
-    "KVOCHUR_BELL", "HERBST",
+    "KVOCHUR_BELL", "KVOCHUR_BELL_BACK", "HERBST",
 ))
+# 钟摆家族：拉起 → 零速尾滑 → 顶点翻落。前倒（过顶）与后倒（退回原航向）
+# 共用同一套拉起/尾滑时序，只在翻落段的俯仰指令上分叉。
+BELL_PRIMS = ("KVOCHUR_BELL", "KVOCHUR_BELL_BACK")
 # 盘旋类原语：把机头拉到 80° 坡度需要约 1.5 s，最短驻留若只有 0.7 s，
 # 刚滚一半就被切走，下一次若转向侧相反又要反向滚 140°，画面里就成了
 # “回旋时一直在抖”。这类原语给更长的驻留时间，让每个转弯真正做出来。
@@ -144,6 +147,12 @@ MANEUVERS: dict[str, Maneuver] = {
     # 进入尾滑，机头自然甩过地平线，恢复末段加一次绕纵轴滚转（6DOF+TVC）。
     "KVOCHUR_BELL": Maneuver(
         "KVOCHUR_BELL", "COUNTER", min_speed_frac=1.60,
+        low_alt_need=2400.0, high_alt_need=2800.0,
+    ),
+    # 后倒变体：顶点后反向推杆，机头沿原爬升路径倒回来，尾冲后退后改平，
+    # 退出航向基本不变；只用于演示/能量管理，不进战术反击池。
+    "KVOCHUR_BELL_BACK": Maneuver(
+        "KVOCHUR_BELL_BACK", "DEFENSIVE", min_speed_frac=1.60,
         low_alt_need=2400.0, high_alt_need=2800.0,
     ),
     # Herbst / J 转弯：拉起 55° 后绕速度矢量横滚，反向压机头完成 180° 反转。
@@ -987,7 +996,7 @@ class TacticalAgent:
         if self.primitive in VERTICAL:
             # 钟摆是“拉起 → 尾滑 → 翻落 → 改出”的完整时序，全程近四十秒；
             # 沿用 14 s 的通用兜底会在恢复段把动作提前切走。
-            vertical_limit = 46.0 if self.primitive == "KVOCHUR_BELL" else 14.0
+            vertical_limit = 46.0 if self.primitive in BELL_PRIMS else 14.0
             if self._phase_t >= vertical_limit:
                 self._maneuver_done = True
             # 已经压住扳机、目标就在炮口窗口里时，不必把这次反转做完：
@@ -1114,7 +1123,7 @@ class TacticalAgent:
         """
         # 钟摆的油门是机动时序的一部分（建立上仰后必须收油刹车），
         # 通用功率策略里的“低速/来弹就补加力”会把尾滑直接顶掉。
-        if self.primitive == "KVOCHUR_BELL":
+        if self.primitive in BELL_PRIMS:
             return
         if obs.own_fuel_frac <= 0.02:
             act.afterburner = 0.0
@@ -2083,7 +2092,7 @@ class TacticalAgent:
             return False
         # 钟摆和 Herbst 都靠“绕速度矢量横滚 + 大迎角”改变指向：没有矢量
         # 喷口（或不在 6DOF 内核）时做不出这个姿态，退化成一次普通爬升。
-        if primitive == "KVOCHUR_BELL" and not (obs.own_tvc and obs.dof >= 6):
+        if primitive in BELL_PRIMS and not (obs.own_tvc and obs.dof >= 6):
             return False
         if primitive == "HERBST" and obs.dof < 6:
             return False
@@ -2181,7 +2190,7 @@ class TacticalAgent:
         self._los_az_prev = None
         if primitive == "POSITION":
             self._open_alt0 = None
-        if primitive == "KVOCHUR_BELL":
+        if primitive in BELL_PRIMS:
             self._bell_az0 = None
             self._bell_yaw_acc = 0.0
             self._bell_az_rate = 0.0
@@ -2197,7 +2206,8 @@ class TacticalAgent:
             "BREAK", "BEAM", "SPLIT_S", "BARREL", "IMMELMANN", "LOOP",
             "CRANK", "NOTCH_DESC", "F_POLE",
             "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
-            "DIVE_BREAK", "DIVE_OFFSET", "KVOCHUR_BELL", "HERBST",
+            "DIVE_BREAK", "DIVE_OFFSET", "KVOCHUR_BELL", "KVOCHUR_BELL_BACK",
+            "HERBST",
         ) and not self._def_engaged:
             self._def_engaged = True
             if obs.incoming_missile_dist < self.BVR_EVADE_DIST:
@@ -2236,7 +2246,7 @@ class TacticalAgent:
         act = self._limit_g(act)
         # 钟摆要自己按分段控制减速板（顶点前切开、尾滑段全开），
         # 不能被通用的 _brake_demand 覆盖。
-        if primitive != "KVOCHUR_BELL":
+        if primitive not in BELL_PRIMS:
             act.brake = self._brake_demand(obs, primitive)
         pilot_ok = self._gloc_t <= 0.0
         act.launch = pilot_ok and should_launch(obs)
@@ -2329,6 +2339,7 @@ class TacticalAgent:
             "DIVE_BREAK": self._dive_break,
             "DIVE_OFFSET": self._dive_offset,
             "KVOCHUR_BELL": self._kvochur_bell,
+            "KVOCHUR_BELL_BACK": self._kvochur_bell_back,
             "HERBST": self._herbst,
             "BARREL": self._barrel,
             "IMMELMANN": self._immelmann,
@@ -2718,8 +2729,13 @@ class TacticalAgent:
             self._maneuver_done = True
         return level_out_action(obs)
 
-    def _kvochur_bell(self, obs: Observation) -> Action:
+    def _kvochur_bell(self, obs: Observation, back: bool = False) -> Action:
         """克沃丘尔钟摆（真·尾滑/bell）：近垂直拉起 → 零速尾滑 → 钟摆翻落。
+
+        两种翻落方向共用拉起/尾滑时序：
+          - 前倒（back=False）：机头越过顶点继续向前翻落，退出航向约反向；
+          - 后倒（back=True）：顶点后反向推杆，机头沿原爬升路径倒回来，
+            尾冲后退后改平，退出航向基本不变。
 
         与旧实现“边前飞边横转 360°”不同，这里把水平速度真正刹到零：
           1) 高 G 拉起：把机头抬到 80–90°；仰角过 60–70° 就收油门、
@@ -2792,14 +2808,23 @@ class TacticalAgent:
             )
 
         if self._phase == 2:
-            # 钟摆段：机头已甩过地平线。这里只做小幅方向舵阻尼——空速还在
-            # 零附近，舵面几乎没有权限，真正的“钟摆侧摆”要等空速回来、
-            # 方向舵有效后在恢复初段给（见下一段）。
-            act = Action(
-                bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
-                brake=1.0, fire=False, roll_free=True,
-                pitch_rate=0.0, yaw_rate=-0.6 * obs.own_beta,
-            )
+            # 钟摆段：机头已甩过地平线。空速还在零附近，舵面几乎没有权限，
+            # 真正的“钟摆侧摆”要等空速回来、方向舵有效后在恢复初段给。
+            if back:
+                # 后倒：反向推杆，把机头沿原爬升路径压回来。这里不再额外
+                # 偏航，保证改出航向基本不变。
+                act = Action(
+                    bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                    brake=1.0, fire=False, roll_free=True,
+                    pitch_rate=-0.55,
+                    yaw_rate=-0.6 * obs.own_beta,
+                )
+            else:
+                act = Action(
+                    bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                    brake=1.0, fire=False, roll_free=True,
+                    pitch_rate=0.0, yaw_rate=-0.6 * obs.own_beta,
+                )
             if el <= math.radians(5.0) or self._bell_t >= 10.0:
                 self._phase, self._bell_t = 3, 0.0
                 self._bell_kicked = False
@@ -2814,12 +2839,17 @@ class TacticalAgent:
             # 下坠初段的一次性方向舵 kick：顶点附近空速接近零、方向舵没有
             # 权限，必须先等空速回到约 0.62 倍失速，再给一次明确输入，
             # 机头才会像钟摆一样绕竖轴摆出去；之后交回中立方向舵。
-            if not self._bell_kicked and speed_frac > 0.62:
+            # 后倒变体不踢舵，保持退出航向基本不变。
+            if not back and not self._bell_kicked and speed_frac > 0.62:
                 self._bell_kicked = True
-                self._bell_kick_t = 1.2
-            if self._bell_kicked and self._bell_kick_t > 0.0:
+                self._bell_kick_t = 2.2
+            if not back and self._bell_kicked and self._bell_kick_t > 0.0:
                 self._bell_kick_t = max(0.0, self._bell_kick_t - self.dt)
-                act.yaw_rate = yaw_sign * 0.9
+                # 混控里还会叠加 0.6β 的侧滑对齐项，低速恢复段 β 很大，
+                # 不扣掉它舵令会被抵消掉一部分；扣掉后才是真正打满 ±0.9。
+                act.yaw_rate = clamp(
+                    yaw_sign * 0.9 - 0.6 * obs.own_beta, -0.9, 0.9
+                )
             # 航迹回到 −20° 附近、空速回到 1.15 倍失速以上，舵面重新有效，
             # 这时才是“恢复最后 1/4 段”的 bell 滚转。
             if (
@@ -2852,6 +2882,10 @@ class TacticalAgent:
         ) or self._bell_t >= 8.0:
             self._maneuver_done = True
         return act
+
+    def _kvochur_bell_back(self, obs: Observation) -> Action:
+        """钟摆后倒变体：顶点后反向推杆，机头沿原爬升路径倒回来。"""
+        return self._kvochur_bell(obs, back=True)
 
     def _herbst(self, obs: Observation) -> Action:
         """Herbst / J 转弯：拉起 55°、绕速度矢量横滚 160°，再反向压机头。

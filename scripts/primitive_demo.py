@@ -170,6 +170,10 @@ DEMOS = [
     # 恢复末段绕纵轴滚转（bell）后改平。用 3000 m 离地高度演示。
     demo("KVOCHUR_BELL", "bell", 42.0, speed=220.0, foe="pure", sign=-1.0,
          seq=[("KVOCHUR_BELL", 38.0), ("PURE", 4.0)]),
+    # 同一套拉起/尾滑的另一种翻落：后倒——顶点后反向推杆，机头沿原爬升
+    # 路径倒回来，尾冲后退后改平，退出航向基本不变。
+    demo("KVOCHUR_BELL_BACK", "bell", 38.0, speed=220.0, foe="pure", sign=-1.0,
+         seq=[("KVOCHUR_BELL_BACK", 34.0), ("PURE", 4.0)]),
     # Herbst / J 转弯：拉起 45° → 绕速度矢量横滚 → 机头压回水平。
     demo("HERBST", "attacked", 18.0, speed=300.0, foe="pure", sign=-1.0,
          seq=[("HERBST", 14.0), ("PURE", 4.0)]),
@@ -250,7 +254,7 @@ class Pilot:
         act = self.core._execute(self.primitive, obs)
         # 钟摆的加力/收油是机动时序的一部分（建立上仰后必须收油刹车），
         # 演示脚本不能按油门反推加力把它覆盖掉。
-        if self.primitive != "KVOCHUR_BELL":
+        if self.primitive not in ("KVOCHUR_BELL", "KVOCHUR_BELL_BACK"):
             act.afterburner = 1.0 if act.throttle > 0.9 else 0.0
         return act
 
