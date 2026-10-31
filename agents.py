@@ -22,7 +22,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sim import G, MAX_BANK, Action, Observation, clamp, wrap_pi
+from sim import G, MAX_BANK, Action, Observation, clamp, predict_path, wrap_pi
 
 # 期望角速度的软上限，避免目标突然跳到正后方时拉出离谱的指令。
 MAX_GAMMA_DOT = math.radians(20.0)
@@ -32,6 +32,14 @@ GAMMA_CAP = math.radians(55.0)
 GAMMA_FLOOR = math.radians(-60.0)
 # 倒扣滚转指令：Action.bank 以 MAX_BANK(80°) 为单位，倒扣需要 180°/80°。
 BANK_INVERT = math.pi / MAX_BANK
+# 破 S 横偏变体（DIVE_OFFSET）在俯冲段保留的偏转角：比完全倒扣少 40°，
+# 升力矢量同时有向下与侧向分量，机体一边下高一边朝对手转弯的内侧偏。
+# 这不是 DIVE_BREAK：DIVE_BREAK 全程与标准破 S 共用 _split_s_impl，差别
+# 只在改出段——先压一个坡度再拉平（横滚 + 拉杆）来偏出航向。
+DIVE_OFFSET_BANK = math.radians(40.0) / MAX_BANK
+# 破 S 偏转（DIVE_BREAK）：改出段先压这个坡度，再在坡上拉杆把航迹拉平，
+# 升力矢量的侧向分量把机头带向一侧，改出航向在 180° 反向之外再偏出几十度。
+DIVE_BREAK_BANK = math.radians(45.0) / MAX_BANK
 
 # ---------- 人体过载耐受模型 ----------
 # 飞行员在抗荷服 + 抗荷动作下可以长期承受约 6 g，短时（数秒）极限约 9 g；
@@ -63,7 +71,8 @@ DEF_REVERSE_TIME = 1.5
 # 否则画面里只会看到一次莫名其妙的摆翼，然后标签就被换掉。
 VERTICAL = frozenset((
     "SPLIT_S", "HIGH_G_SPLIT_S", "IMMELMANN", "LOOP",
-    "BARREL", "HIGH_G_BARREL",
+    "BARREL", "HIGH_G_BARREL", "DIVE_BREAK", "DIVE_OFFSET",
+    "KVOCHUR_BELL", "HERBST",
 ))
 # 盘旋类原语：把机头拉到 80° 坡度需要约 1.5 s，最短驻留若只有 0.7 s，
 # 刚滚一半就被切走，下一次若转向侧相反又要反向滚 140°，画面里就成了
@@ -120,6 +129,26 @@ MANEUVERS: dict[str, Maneuver] = {
     ),
     "HIGH_G_SPLIT_S": Maneuver(
         "HIGH_G_SPLIT_S", "DEFENSIVE", high_g=True, low_alt_need=2200.0,
+    ),
+    # 破 S 横偏变体：俯冲段保留 40° 坡度，边下高边横偏（见 _dive_offset）。
+    # 比标准破 S 少掉一点高度，离地余量门限可以更低。
+    "DIVE_OFFSET": Maneuver(
+        "DIVE_OFFSET", "DEFENSIVE", min_speed_frac=1.40, low_alt_need=3000.0,
+    ),
+    # 破 S + 机头偏转：与标准破 S 共用 _split_s_impl，只在改出段先压 45°
+    # 坡度再拉平（横滚 + 拉杆），侧向升力把机头带偏，改出航向不走纯反向。
+    "DIVE_BREAK": Maneuver(
+        "DIVE_BREAK", "DEFENSIVE", min_speed_frac=1.40, low_alt_need=3000.0,
+    ),
+    # 克沃丘尔钟摆：近垂直拉起后横转，机头从另一侧摆落（6DOF + 矢量喷口）。
+    "KVOCHUR_BELL": Maneuver(
+        "KVOCHUR_BELL", "DEFENSIVE", min_speed_frac=1.60,
+        low_alt_need=1800.0, high_alt_need=2200.0,
+    ),
+    # Herbst / J 转弯：拉起 55° 后绕速度矢量横滚，反向压机头完成 180° 反转。
+    "HERBST": Maneuver(
+        "HERBST", "COUNTER", min_speed_frac=1.60,
+        low_alt_need=2000.0, high_alt_need=2000.0,
     ),
     "BARREL": Maneuver("BARREL", "DEFENSIVE", min_speed_frac=1.35),
     "HIGH_G_BARREL": Maneuver(
@@ -230,13 +259,14 @@ def pursuit_action(
 
 
 def lead_point(obs: Observation, t_scale: float) -> tuple[float, float]:
-    """预测目标的未来位置，返回相对本机的指向偏差 (方位, 仰角)。"""
+    """预测目标的未来位置，返回相对本机的指向偏差 (方位, 仰角)。
+
+    目标位置按它当前的航迹角速度 ψ̇/γ̇ 积分（见 sim.predict_path），而不是
+    只沿速度切线外推：速度方向永远只是轨迹的切线，目标正在回旋时切线会
+    一路甩到圆外，提前量越算越偏。直线飞行时预测退化为匀速外推。
+    """
     ce = math.cos(obs.los_el)
     ux, uy, uz = ce * math.cos(obs.los_az), ce * math.sin(obs.los_az), math.sin(obs.los_el)
-    cg = math.cos(obs.foe_gamma)
-    fvx = obs.foe_speed * cg * math.cos(obs.foe_psi)
-    fvy = obs.foe_speed * cg * math.sin(obs.foe_psi)
-    fvz = obs.foe_speed * math.sin(obs.foe_gamma)
 
     # 前置量按“交汇时间”估计，而不是“距离/本机速度”：咬尾时目标同向逃跑，
     # 后者会把交汇时间高估三四倍，在 1 km 内把机头按 30° 以上的前置角甩到
@@ -248,9 +278,11 @@ def lead_point(obs: Observation, t_scale: float) -> tuple[float, float]:
     else:
         t_go = 0.2
     t_go *= t_scale
-    lx = ux * obs.dist + fvx * t_go
-    ly = uy * obs.dist + fvy * t_go
-    lz = uz * obs.dist + fvz * t_go
+    lx, ly, lz = predict_path(
+        (ux * obs.dist, uy * obs.dist, uz * obs.dist),
+        obs.foe_speed, obs.foe_track_psi, obs.foe_track_gamma,
+        obs.foe_psi_rate, obs.foe_gamma_rate, t_go,
+    )
 
     az = math.atan2(ly, lx)
     el = math.atan2(lz, math.hypot(lx, ly))
@@ -287,6 +319,7 @@ def heading_turn(
     max_rate_deg: float = 3.0,
     gamma_target: float = 0.0,
     throttle: float = 1.0,
+    rate_ff: float = 0.0,
 ) -> Action:
     """按航向误差做“比例式”转弯：坡度随误差连续变化，过零时不跳变。
 
@@ -299,10 +332,13 @@ def heading_turn(
     这里先对期望转弯率限幅（默认 3°/s），再由 tanφ = v·ψ̇/G 反解坡度：
     绕速度矢量的协调转弯满足 n·sinφ = v·ψ̇·cosγ/G、n·cosφ = a，
     因此坡度与转弯率一一对应，误差变小坡度就自动变小，不会过冲。
+    rate_ff 是前馈转弯率：目标视线本身在旋转时（目标正在转弯），
+    本机必须以同样的角速度跟着转，否则只剩比例项、永远追不上，
+    误差会在偏置角两侧持续振荡。
     """
     v = max(obs.own_speed, 40.0)
     psi_dot = clamp(
-        heading_error * gain,
+        rate_ff + heading_error * gain,
         -math.radians(max_rate_deg), math.radians(max_rate_deg),
     )
     phi = math.atan2(v * psi_dot, G)
@@ -376,6 +412,47 @@ def level_turn(
     )
 
 
+def level_out_action(obs: Observation, throttle: float = 0.9) -> Action:
+    """垂直机动改出：先把机翼滚回水平，再小增益、限幅地把航迹角拉平。
+
+    破 S / Herbst 这类动作结束时坡度还停在 130°–180°，此时用
+    aim_action(gain=1.6) 直接追“航迹角回零”会出事：倒扣状态下正过载
+    的升力指向地面，拉杆反而把 γ 往负方向顶；每拍算出的俯仰需求在
+    0.1 g 与 9 g 之间来回翻，坡度还没滚回来，机体就先抖成一片。
+    这里按两段拆开：
+      1) |bank|>30° 时只给“保持当前航迹角”的过载并滚回水平——倒扣时
+         该过载自然是负的（推杆保持平飞），不会把飞机往地面拽；
+      2) 机翼回中后再用 10°/s 的限幅目标角速度拉平航迹，避免高速下
+         一度误差就顶到 9 g 的过冲。
+    """
+    v = max(obs.own_speed, 40.0)
+    # 第一段：坡度还大，先滚平。cos(φ)<0 说明升力矢量朝下，按“维持航迹”
+    # 反解出的过载就是负值（推杆），限制在人体短时负过载以内。
+    if abs(obs.own_bank) > math.radians(30.0):
+        n_hold = math.cos(obs.own_gamma) / max(math.cos(obs.own_bank), 0.25)
+        return Action(
+            bank=0.0,
+            n=clamp(n_hold, G_NEG_SUSTAIN, 2.5),
+            throttle=throttle,
+            fire=obs.in_gun_trigger,
+        )
+    # 第二段：机翼已回中，限幅航迹角速度拉平。上限 10°/s 对应 300 m/s
+    # 下约 5.7 g，从 −45° 俯冲拉平约 4–5 s；比例增益取 0.9，误差变小过载
+    # 自动回落，不会像 gain=1.6 那样冲过平飞再反向推杆。
+    gd = clamp(-obs.own_gamma * 0.9,
+               -math.radians(10.0), math.radians(10.0))
+    a = math.cos(obs.own_gamma) + v * gd / G
+    # 从 12° 的爬升角压回平飞需要短暂的负过载（推杆），若把 n 钳在正侧，
+    # 低速度下每拍只能把航迹压 2–3°/s，飞机就一直挂在爬升角上出不来。
+    n = clamp(a / max(math.cos(obs.own_bank), 0.6), G_NEG_SUSTAIN, G_SUSTAIN)
+    return Action(
+        bank=0.0,
+        n=n,
+        throttle=throttle,
+        fire=obs.in_gun_trigger,
+    )
+
+
 class PurePursuit:
     """M1 基线保留：机头死盯目标，作为战术层的对照。"""
 
@@ -387,7 +464,8 @@ class PurePursuit:
     def act(self, obs: Observation) -> Action:
         act = aim_action(obs, obs.off_az, obs.off_el, gain=self.gain)
         act.launch = should_launch(obs)
-        act.launch_radar = should_launch_radar(obs)
+        # 基线不搞双发节奏：一次只打一发，补射交给战术层的围堵规则。
+        act.launch_radar = should_launch_radar(obs) and obs.own_radar_in_flight == 0
         # 基线也遵守燃油约束：油尽后只剩军推。
         act.afterburner = 1.0 if obs.own_fuel_frac > 0.02 else 0.0
         return act
@@ -414,39 +492,45 @@ def should_launch(obs: Observation) -> bool:
     )
 
 
-# 双发补射门限：首发落在 NEZ 边缘、命中概率本就不高时，等冷却结束后再补
-# 一发；最多允许两发中距弹同时在空中，避免一次把两发都打光。
-RADAR_SALVO_PK = 0.80
+# 中距弹发射门限（按当前几何估计的命中概率）：不再要求目标已经进入 NEZ。
+# 0.22 约对应有效包线的 0.7–0.8，弹离架后要先飞 5–8 s 中制导段才进入末段
+# 自主截获，载机因此有真实的引导/照射过程；门限再高就退回 NEZ 内发射，
+# 弹一离架就截获，等于没有中制导。更低的门限则是远距乱射，弹飞到末端
+# 已经没有能量。
+RADAR_LAUNCH_PK = 0.22
+
+# 中距弹发射离轴上限。雷达能在 60° 锥内“锁定”，但从 40° 以上的偏置姿态
+# （F-pole/CRANK 的 40° 偏置）打出去的弹，要先花好几秒把速度矢量掰向目标，
+# 末段能量全耗在初始转弯上；更常见的是弹还没转过来，目标已经出了导引头
+# 视场。20° 要求机头基本压住目标才开火——旧值 30° 仍放行了 28° 的补射，
+# 正是“抬头显示器里目标已经贴边、还按发射”的那种浪费弹药的情形。
+RADAR_LAUNCH_ANGLE = math.radians(20.0)
 
 
 def should_launch_radar(obs: Observation) -> bool:
-    """雷达制导中距弹（主动弹）的发射条件：只在不可逃逸区内发射。
+    """雷达制导中距弹的通用发射门限：几何、包线、能量与弹量。
 
-    中距弹的价值在超视距，太近时不如留着红外弹。首发要求进入 NEZ；
-    已有 1 发在飞且首发本身是“边界射击”（命中概率估计不高）时，允许
-    在冷却后补射第二发，形成双发齐射提高杀伤概率。
-    主动弹在中制导段仍需要载机雷达保持跟踪与数据链，末段自主截获后即可
-    脱离，因此这里同样要求速度余量。
-
-    NEZ 之外提前发射实测无效：双方都往前挪同样的距离，首发时间差不变；
-    只给隐身机加“对方还看不见我”的窗口也一样，那一发飞到末端已经没有
-    能量，SU-57 的命中数从 17 掉到 12。发射规则不是把包线差换成战果的
-    地方，问题在弹本身与防御时序。
+    这里只管“这一发此刻有没有意义”，双发节奏由 TacticalAgent
+    「围追堵截」的补射规则决定（见 TacticalAgent._radar_launch_ok）。
     """
     if (
         not obs.own_radar_locked
         or obs.own_radar_missiles <= 0
         or not obs.in_radar_envelope
-        or not obs.radar_nez
         or obs.own_speed_frac <= 1.35
         or obs.dist <= max(obs.radar_min_range, 2500.0)
         or obs.own_radar_in_flight >= 2
+        # 发射纪律一：机头偏离目标太远（正在偏置/防御）时不开火。
+        or obs.angle_off_nose > RADAR_LAUNCH_ANGLE
+        # 发射纪律二：只在弹上导引头能很快自主截获的距离内发射。远于
+        # active_range 的弹要在载机照射下飞一大段中制导，对手一横转/三九
+        # 就打断照射，弹随即转无控——这就是 20–25 km 发射全部落空的原因。
+        or (obs.radar_active_range > 0.0 and obs.dist > obs.radar_active_range)
     ):
         return False
-    if obs.own_radar_in_flight == 0:
-        return True
-    # 已有一发在飞：只有在首发是低概率的边界射击时才补第二发。
-    return obs.radar_pk_est < RADAR_SALVO_PK
+    # 已经进 NEZ 当然可以打；没进 NEZ 时按命中概率估计放行，允许打一段
+    # 真正的超视距中制导。
+    return obs.radar_nez or obs.radar_pk_est >= RADAR_LAUNCH_PK
 
 
 @dataclass
@@ -511,6 +595,10 @@ class TacticalAgent:
     # 压下来、让自己脱离对方当时发射线，又不至于丢掉随后的补射窗口。
     POST_LAUNCH_CRANK_TIME = 8.0
     COBRA_DIST = 1800.0          # 矢量喷口机型的过失速反制距离：来弹贴脸才用
+    # 克沃丘尔钟摆的启动距离：比眼镜蛇稍远，因为钟摆是先拉起再横摆机头，
+    # 需要一点时间把速度矢量刹住；冷却用来避免同一个缠斗里反复做。
+    BELL_DIST = 2200.0
+    BELL_COOLDOWN = 8.0
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
     OPENING_DIST = 20000.0       # 开局占位阶段：距离大于该值时不直冲对头
     MERGE_START = 5000.0     # 进入该距离开始领先转弯，抢交汇角度
@@ -542,11 +630,13 @@ class TacticalAgent:
     # 高 G 变体只在速度与过载耐受都允许时才会被 _defense_ok 放行。
     MISSILE_DEFENSE = (
         "BEAM", "HIGH_G_BREAK", "BREAK", "HIGH_G_SPLIT_S",
-        "BARREL", "HIGH_G_BARREL", "SPLIT_S",
+        "BARREL", "HIGH_G_BARREL", "SPLIT_S", "DIVE_BREAK",
+        "DIVE_OFFSET",
     )
     LOCK_DEFENSE = (
         "BEAM", "HIGH_G_BREAK", "BREAK", "SCISSORS",
         "HIGH_G_SPLIT_S", "SPLIT_S", "IMMELMANN", "LOOP",
+        "DIVE_BREAK", "DIVE_OFFSET", "HERBST",
     )
     # 中距弹的进攻性防御也纳入“立即抢占”与能量保护。
     DEFENSE_SET = frozenset(
@@ -605,8 +695,40 @@ class TacticalAgent:
     # 红外导引头不看多普勒凹口，雷达弹那套规避对它无效。
     IR_DEFENSE = (
         "HIGH_G_BREAK", "BREAK", "HIGH_G_BARREL", "BARREL",
-        "HIGH_G_SPLIT_S", "SPLIT_S",
+        "HIGH_G_SPLIT_S", "SPLIT_S", "DIVE_BREAK", "DIVE_OFFSET",
+        "KVOCHUR_BELL",
     )
+
+    # ---- 中距弹“围追堵截”补射纪律 ----
+    # 两发不再同时压出去：首发先飞，把对手逼进转弯/横转的防御航线；等它
+    # 已经转出这个角度（或退到空域边缘、逃逸空间被压缩）、首发也进入末段
+    # 不再需要中制导时，再从新的方位补一发，堵住它转出去的那条线。转向
+    # 角门限取 45°：“被逼转”必须是肉眼可见的大幅规避，25° 的扰动来自
+    # 正常瞄准修正，两发几乎同弹道，谈不上夹击。
+    RADAR_CUTOFF_TURN = math.radians(45.0)
+    # 首发离架后的最小间隔：给对手留出做出反应的时间。实测首发后 5 s 内
+    # 对手就开始压坡度，若这时跟着补第二发，两发仍在同一段弹道上。这里
+    # 要求间隔 ≥10 s，让首发先把对手的规避姿态逼出来再补。
+    RADAR_CUTOFF_MIN_GAP = 10.0
+    # 首发进入末段（剩余命中时间小于该值）才补射：首发还在中段时补第二发
+    # 只是沿同一条弹道重复；等它压到末段，对手被迫做最后一次规避，第二发
+    # 再从新的方位切入，才真正形成“前堵后追”。
+    RADAR_CUTOFF_TTG = 18.0
+    # 对手离水平边界小于该距离时，视为空间已被压缩，即使没转够角度也补射。
+    RADAR_CUTOFF_EDGE = 8000.0
+
+    # ---- 偏置（CRANK / F-pole）的转向侧 ----
+    # 偏置方向必须跟着目标的机动方向走：目标向右转时若本机向左偏，目标
+    # 相对机头的方位会按“目标转速 + 本机转速”叠加张开，几秒内就掉出 60°
+    # 照射锥，载机随即丢火控（也就无法补射）。改为同向偏置后，方位变化
+    # 被本机转向抵消，靶标稳定停在 40° 附近。门限带滞回，避免平飞时抖。
+    CRANK_TURN_RATE = math.radians(2.0)   # 目标航向变化率门限 rad/s
+    # 视线方位角速度死区：低于该值认为目标在平飞，保持上一次的偏置侧，
+    # 避免 20 km 外目标轻微摇摆就把 40° 偏置从左侧翻到右侧。
+    CRANK_SIDE_DEADBAND = math.radians(0.15)
+    # 偏置角附近的“比例项渐变带”：进入该带后比例项按余弦平滑收敛到 0，
+    # 与视线角速度前馈无缝衔接（见 _crank）。不能直接置零，否则坡指令跳变。
+    CRANK_AZ_BLEND = math.radians(4.0)
 
     def __init__(
         self,
@@ -717,6 +839,35 @@ class TacticalAgent:
         # 窗口内用 CRANK 保持照射/数据链并拉开几何，窗口结束立刻回到进攻。
         self._post_launch_t = 0.0
         self._prev_radar_in_flight = 0
+        # 首发射出时目标的航向：补射（围堵）时用它与当前航向做差，判断目标
+        # 是否已经被首发逼着转出了角度。
+        self._shot_foe_psi = 0.0
+        # 首发离架到现在的时间，用作补射的最小间隔。
+        self._radar_shot_age = 0.0
+        # 目标航向变化率（低通）：只用于破 S 横偏变体的评分；偏置转向侧
+        # 由 _crank 直接按视线角速度维护（见 _update_crank_side）。
+        self._foe_psi_prev: float | None = None
+        self._foe_turn_rate = 0.0
+        # 偏置转向侧（+1 = 靶标停在机头左侧 40°，-1 = 右侧）与低通的
+        # 视线方位角速度。初值取 +1，表示靶标偏在机头左侧；一旦观察到
+        # 目标横向漂移就立刻跟过去。
+        self._crank_sign = 1.0
+        self._los_rate = 0.0
+        # 上一次的视线方位：偏置侧靠它差分出视线角速度；换原语后要清空，
+        # 否则中途隔了几秒再算一次差分会被当成“视线突然转了几十度”。
+        self._los_az_prev: float | None = None
+        # 克沃丘尔钟摆的冷却：这个动作把机头竖到近垂直，再横摆落下，
+        # 连续做会把能量抽干，所以做完要等一段时间再评估。
+        self._bell_cd = 0.0
+        # 钟摆机动进入时的机头方位，改出段靠它把航向带回原来的指向。
+        self._bell_az0: float | None = None
+        # 机头方位累计量：钟摆要求偏航一直在同一个方向转到 360°，
+        # 靠这个连续展开的累计值做闭环，避免 ±π 处跳变导致方向判断错乱。
+        self._bell_az_prev: float = 0.0
+        self._bell_yaw_acc: float = 0.0
+        # 机头方位角速度（世界系，限幅滤波）：改出段用它判断飞机当前正往
+        # 哪边偏，保证改平是顺着偏航走而不是反向掰回来。
+        self._bell_az_rate: float = 0.0
 
     # ---------- 主入口 ----------
 
@@ -725,7 +876,25 @@ class TacticalAgent:
         # 先手偏置窗口：中距弹数量增加说明刚有一发离架。
         if obs.own_radar_in_flight > self._prev_radar_in_flight:
             self._post_launch_t = self.POST_LAUNCH_CRANK_TIME
+            if self._prev_radar_in_flight == 0:
+                # 只记首发的基准航向：第二发是在首发把人逼转之后才补的。
+                self._shot_foe_psi = obs.foe_psi
+                self._radar_shot_age = 0.0
         self._prev_radar_in_flight = obs.own_radar_in_flight
+        self._radar_shot_age += self.dt
+        # 目标航向变化率：只用于破 S 横偏变体的评分。偏置侧不再按机头
+        # 航向的差分来定——机头朝向和“往哪飞”在 6DOF 下能差出一整个
+        # 迎角，且低通阈值会让侧别反复翻转；改为在 _crank 里按视线角速度
+        # 直接维护（演示脚本绕过 act() 时也能生效）。
+        if obs.contact_quality >= 2:
+            if self._foe_psi_prev is not None:
+                rate = wrap_pi(obs.foe_psi - self._foe_psi_prev) / self.dt
+                self._foe_turn_rate = (
+                    0.85 * self._foe_turn_rate + 0.15 * rate
+                )
+            self._foe_psi_prev = obs.foe_psi
+        else:
+            self._foe_psi_prev = None
         self._post_launch_t = max(0.0, self._post_launch_t - self.dt)
         self._counter_cd = max(0.0, self._counter_cd - self.dt)
         if self._counter_commit > 0.0:
@@ -735,6 +904,7 @@ class TacticalAgent:
                 self._counter_plan = None
                 self._counter_cd = self.COUNTER_COOLDOWN
         self._yoyo_cd = max(self._yoyo_cd - self.dt, 0.0)
+        self._bell_cd = max(0.0, self._bell_cd - self.dt)
         # 航炮计时：按上一拍实际在执行的原语累计，离开 GUN_PRESS 即清零。
         self._gun_press_cd = max(0.0, self._gun_press_cd - self.dt)
         if self.tactic == "GUNS" and self.primitive == "GUN_PRESS":
@@ -812,7 +982,7 @@ class TacticalAgent:
         # 滚转 + 拉杆，被 0.7 s 的最短驻留切走就只剩一次莫名其妙的摆翼。
         # 只有边界/能量这类安全原语可以打断；超时兜底防止卡在某个分段。
         if self.primitive in VERTICAL:
-            if self._phase_t >= 10.0:
+            if self._phase_t >= 14.0:
                 self._maneuver_done = True
             # 已经压住扳机、目标就在炮口窗口里时，不必把这次反转做完：
             # 破 S 是“没射击机会时换角度”的动作，有射击机会就该先打掉。
@@ -855,9 +1025,15 @@ class TacticalAgent:
         always：常开。
         silent：全程关机，只靠 IRST/光电吊舱/目视/预警机；因此拿不到火控，
                 不能发射雷达中距弹。
-        auto：默认关机；目标进入 40 km 迎头且自己还有中距弹时短暂开机建立
-              火控，中制导段（own_radar_support）保持照射，主动弹末段截获后
-              立刻关掉，回到静默。
+        auto：默认关机，只靠预警机/IRST/侧阵拿到 track；只有当目标已经进
+              入自己的中距弹不可逃逸区（或 Pk 足够高）、开机就能打时才短暂
+              开机。中制导段（own_radar_support）保持照射，主动弹末段截获
+              后立刻关掉，回到静默。
+              原先固定“目标进 40 km 就开机”会把双方的开机距离抹平：
+              Su-57 的雷达和隐身优势（对 F-16 的 NEZ 约 20 km，而 F-16 对
+              它的 NEZ 只有约 14 km）完全体现不出来，还会让隐身机在 40 km
+              外先照射、主动暴露。改成按自己的 NEZ 判据后，雷达开机时间
+              由机体的探测/武器性能决定，隐身与雷达优势才真正落到战术上。
         """
         if self.radar_policy == "always":
             self._radar_on = True
@@ -868,9 +1044,13 @@ class TacticalAgent:
         need = (
             obs.contact_quality >= 2
             and obs.own_radar_missiles > 0
-            and obs.own_radar_in_flight == 0
+            # 首发已经在飞时也要允许重新开机：补射（围堵）是先前的弹把对手
+            # 逼转之后才打的，不能因为发射架上还有一发就永远不再照射。
+            and obs.own_radar_in_flight < 2
             and obs.dist <= self.RADAR_AUTO_ON_DIST
             and obs.aspect > math.radians(90.0)
+            # 现在开机就能形成有效射击：已进 NEZ 或 Pk 已足够高。
+            and (obs.radar_nez or obs.radar_pk_est >= RADAR_LAUNCH_PK)
         )
         if need:
             self._radar_burst_t = max(self._radar_burst_t, self.RADAR_AUTO_BURST)
@@ -883,6 +1063,40 @@ class TacticalAgent:
         else:
             self._radar_on = False
         return self._radar_on
+
+    def _radar_launch_ok(self, obs: Observation) -> bool:
+        """中距弹发射纪律：首发按几何打，第二发只在“围堵”时机补。
+
+        不做无脑双发：一进包线就把两发都压出去，两发沿同一条弹道飞，对手
+        只要做一个横转/急转就能同时甩掉。改为把第二发留到更好的时机——
+        - 首发已经进入末段、不再需要载机中制导（own_radar_support 为假）；
+        - 首发已离架至少 RADAR_CUTOFF_MIN_GAP，对手来得及做反应；
+        - 对手已经被首发逼着转出 RADAR_CUTOFF_TURN，或者被边界压得没有
+          横向逃逸空间；
+        这时再从当前几何补一发，弹从另一个方位切入对手转出去的那条航线，
+        形成夹击。若对手一直没被逼转、也没被边界压缩，就留着这一发不浪费。
+        """
+        if not should_launch_radar(obs):
+            return False
+        n = obs.own_radar_in_flight
+        if n == 0:
+            return True
+        if n >= 2:
+            return False
+        # 首发还在中制导段：先把它导好，照射中断会直接把它变成无控弹道。
+        if obs.own_radar_support:
+            return False
+        # 首发刚离架：先让对手有时间做反应，避免两发挤在同一条弹道上。
+        if self._radar_shot_age < self.RADAR_CUTOFF_MIN_GAP:
+            return False
+        # 首发还在中段：这时补射只是沿同一条弹道再飞一枚，没有夹击意义。
+        # 等到首发压进末段（对手必须做最后一次规避）再补，第二发才从
+        # 新的方位切进它的逃逸线。
+        if obs.own_radar_ttg > self.RADAR_CUTOFF_TTG:
+            return False
+        turned = abs(wrap_pi(obs.foe_psi - self._shot_foe_psi)) >= self.RADAR_CUTOFF_TURN
+        boxed = obs.foe_edge_margin < self.RADAR_CUTOFF_EDGE
+        return turned or boxed
 
     def _set_power(self, act: Action, obs: Observation) -> None:
         """发动机功率：进入交战前按巡航功率飞，交战与防御时再点加力。
@@ -1156,6 +1370,20 @@ class TacticalAgent:
                     and obs.z_margin_low > 1200.0
                 ):
                     return "SURVIVE", "COBRA"
+                # 克沃丘尔钟摆：来弹稍远一点（2.2 km 内）时，先把机头竖起来
+                # 刹住速度矢量，再横摆落下，让弹从侧后方冲过去。距离再近
+                # 就交给上面的眼镜蛇，那个动作的瞬态减速更狠。
+                if (
+                    obs.own_tvc
+                    and obs.dof >= 6
+                    and obs.incoming_missile_dist < self.BELL_DIST
+                    and obs.own_speed_frac > 1.70
+                    and obs.z_margin_low > 1500.0
+                    and obs.z_margin_high > 2500.0
+                    and self._bell_cd <= 0.0
+                ):
+                    self._bell_cd = self.BELL_COOLDOWN
+                    return "SURVIVE", "KVOCHUR_BELL"
                 return "SURVIVE", self._pick_defense(
                     obs, vs_missile=True, ir=True
                 )
@@ -1354,6 +1582,14 @@ class TacticalAgent:
             and obs.energy_diff > -15000.0
             and obs.z_margin_low > self._split_s_room(obs)
         ):
+            # Herbst 比破 S 更快把机头转回来：只拉 55° 就开始绕速度矢量
+            # 横滚，不必把整个垂直面画完。6DOF 且高度余量足够时优先用它。
+            if (
+                obs.dof >= 6
+                and obs.own_speed_frac > 1.60
+                and obs.z_margin_high > 2000.0
+            ):
+                return self._start_counter("COUNTER_HEADON", "HERBST")
             return self._start_counter("COUNTER_HEADON", "SPLIT_S")
         # 反咬：距离很近、速度允许时剪刀是唯一能立刻抢角度的动作。
         # 这里不再要求比能量占优——被咬尾时本来就常年能量吃亏，
@@ -1657,7 +1893,14 @@ class TacticalAgent:
         if name == "BEAM":
             # 横转是可持续的规避姿态：被锁定（弹还没出）时也应保持，
             # 只有弹进入末段（ttg 很小）才让位给高 G 硬甩。
-            return 0.62 + 0.08 * clamp(ttg / 10.0, 0.0, 1.0)
+            p = 0.62 + 0.08 * clamp(ttg / 10.0, 0.0, 1.0)
+            if not vs_missile:
+                # 只有雷达锁定、对方弹还没出手时，横转的收益主要是压制对方的
+                # 多普勒跟踪，不必像真被弹追时那样牢牢占住第一名；让出一部分
+                # 分差，垂直面掉头（殷麦曼）这类能立刻改变交会几何的动作才有
+                # 机会被选中。
+                p -= 0.12
+            return p
         if name == "HIGH_G_BREAK":
             p = 0.40 + 0.12 * energy + 0.12 * nfrac
             if vs_missile and ttg <= 4.0:
@@ -1678,9 +1921,32 @@ class TacticalAgent:
                 p += 0.10
             return p
         if name == "IMMELMANN":
-            return 0.34 + 0.14 * high
+            # 殷麦曼是“垂直面掉头”：拉起 → 过顶 → 改出后机头反向、净升高。
+            # 被锁定但对方弹还没出手时，它能立刻把迎头/尾追关系翻过来，比
+            # 横转或平转更快重置几何；代价是几秒内速度掉得厉害，只在高度
+            # 余量、能量都富余（本就是它的准入条件）时才值得，并随目标越近
+            # 越优先——远距时垂直面掉头只会把自己挂在天上等对方补射。
+            close = clamp((6000.0 - obs.dist) / 4000.0, 0.0, 1.0)
+            return 0.42 + 0.18 * high + 0.10 * energy + 0.16 * close
         if name == "LOOP":
             return 0.32 + 0.16 * high
+        if name == "DIVE_OFFSET":
+            # 对手正在横向转弯时，边俯冲边横偏比纯垂直破 S 更早咬回内侧：
+            # 这正是它存在的理由，此时评分要明显压过标准破 S / 急转。
+            p = 0.44 + 0.10 * low
+            if abs(self._foe_turn_rate) >= self.CRANK_TURN_RATE:
+                p += 0.16
+            return p
+        if name == "DIVE_BREAK":
+            # 破 S + 机头偏转：比纯破 S 多甩开一段航向，对手转弯时更值。
+            p = 0.46 + 0.12 * low
+            if abs(self._foe_turn_rate) >= self.CRANK_TURN_RATE:
+                p += 0.08
+            return p
+        if name == "KVOCHUR_BELL":
+            return 0.36 + 0.12 * near + 0.12 * high
+        if name == "HERBST":
+            return 0.38 + 0.14 * high + 0.06 * near
         if name == "COBRA":
             return 0.40 + 0.10 * near
         return 0.45
@@ -1805,6 +2071,12 @@ class TacticalAgent:
             obs.z_margin_low <= self._split_s_room(obs)
         ):
             return False
+        # 钟摆和 Herbst 都靠“绕速度矢量横滚 + 大迎角”改变指向：没有矢量
+        # 喷口（或不在 6DOF 内核）时做不出这个姿态，退化成一次普通爬升。
+        if primitive == "KVOCHUR_BELL" and not (obs.own_tvc and obs.dof >= 6):
+            return False
+        if primitive == "HERBST" and obs.dof < 6:
+            return False
         if m.low_alt_need and obs.z_margin_low <= m.low_alt_need:
             return False
         if m.high_alt_need and obs.z_margin_high <= m.high_alt_need:
@@ -1895,8 +2167,14 @@ class TacticalAgent:
         # 分段状态每次进入都要重置，否则上一次破 S 的 _dived 会漏进来。
         self._dived = False
         self._maneuver_done = primitive not in VERTICAL
+        # 视线角速度的差分基准也要清空：新原语的第一拍只记录方位、不差分。
+        self._los_az_prev = None
         if primitive == "POSITION":
             self._open_alt0 = None
+        if primitive == "KVOCHUR_BELL":
+            self._bell_az0 = None
+            self._bell_yaw_acc = 0.0
+            self._bell_az_rate = 0.0
         # 防御转向只在本次威胁的第一次防御动作时定一次侧：取威胁所在的一侧。
         # 之后由 act() 的计时器统一维护，只在威胁持续位于反侧 1.5 s 才换向。
         # 原来“每次进入防御都按瞬时方位重算”，在盘旋缠斗里方位角常年超过
@@ -1905,6 +2183,7 @@ class TacticalAgent:
             "BREAK", "BEAM", "SPLIT_S", "BARREL", "IMMELMANN", "LOOP",
             "CRANK", "NOTCH_DESC", "F_POLE",
             "HIGH_G_BREAK", "HIGH_G_SPLIT_S", "HIGH_G_BARREL",
+            "DIVE_BREAK", "DIVE_OFFSET", "KVOCHUR_BELL", "HERBST",
         ) and not self._def_engaged:
             self._def_engaged = True
             if obs.incoming_missile_dist < self.BVR_EVADE_DIST:
@@ -1944,7 +2223,7 @@ class TacticalAgent:
         act.brake = self._brake_demand(obs, primitive)
         pilot_ok = self._gloc_t <= 0.0
         act.launch = pilot_ok and should_launch(obs)
-        act.launch_radar = pilot_ok and should_launch_radar(obs)
+        act.launch_radar = pilot_ok and self._radar_launch_ok(obs)
         return act
 
     def _brake_demand(self, obs: Observation, primitive: str) -> float:
@@ -2030,6 +2309,10 @@ class TacticalAgent:
             "GUN_PRESS": self._gun_press,
             "BREAK": self._break,
             "SPLIT_S": self._split_s,
+            "DIVE_BREAK": self._dive_break,
+            "DIVE_OFFSET": self._dive_offset,
+            "KVOCHUR_BELL": self._kvochur_bell,
+            "HERBST": self._herbst,
             "BARREL": self._barrel,
             "IMMELMANN": self._immelmann,
             "LOOP": self._loop,
@@ -2074,6 +2357,8 @@ class TacticalAgent:
         段时间里飞 150–250 m（在 900 m 上就是 10–15°）。纯追踪永远把弹丸
         打在自己后面，所以这里按真实飞行时间 T = 距离 / 弹丸地速 给提前量，
         而不是用 lead_point 里那个按接近率估算、并夹在 1.5 s 的 t_go。
+        目标未来位置同样按 ψ̇/γ̇ 积分：0.7 s 里做 6 g 回旋的目标能偏出
+        一个转弯半径的量级，沿切线预测会把弹丸打到圆弧外侧。
         """
         v_bullet = max(obs.own_speed + 600.0, 800.0)
         t_go = clamp(obs.dist / v_bullet, 0.0, 1.2)
@@ -2081,13 +2366,11 @@ class TacticalAgent:
         ux = ce * math.cos(obs.los_az)
         uy = ce * math.sin(obs.los_az)
         uz = math.sin(obs.los_el)
-        cg = math.cos(obs.foe_gamma)
-        fvx = obs.foe_speed * cg * math.cos(obs.foe_psi)
-        fvy = obs.foe_speed * cg * math.sin(obs.foe_psi)
-        fvz = obs.foe_speed * math.sin(obs.foe_gamma)
-        lx = ux * obs.dist + fvx * t_go
-        ly = uy * obs.dist + fvy * t_go
-        lz = uz * obs.dist + fvz * t_go
+        lx, ly, lz = predict_path(
+            (ux * obs.dist, uy * obs.dist, uz * obs.dist),
+            obs.foe_speed, obs.foe_track_psi, obs.foe_track_gamma,
+            obs.foe_psi_rate, obs.foe_gamma_rate, t_go,
+        )
         az = math.atan2(ly, lx)
         el = math.atan2(lz, math.hypot(lx, ly))
         return wrap_pi(az - obs.own_nose_az), el - obs.own_nose_el
@@ -2317,7 +2600,8 @@ class TacticalAgent:
         n = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK)
         return self._split_s_impl(obs, n)
 
-    def _split_s_impl(self, obs: Observation, n_max: float) -> Action:
+    def _split_s_impl(self, obs: Observation, n_max: float,
+                      deflect: float = 0.0) -> Action:
         """破 S 标准三段：半滚倒扣 → 副翼中立拉杆过垂直 → 拉平改出。
 
         旧实现只把坡度命令到 80°（Action.bank=±1 的满刻度），从来没有真正
@@ -2326,6 +2610,13 @@ class TacticalAgent:
         连续下俯（否则内回路会把滚转角拽回地平线、根本过不了垂直）。
         用 own_gamma（asin 表示，±90°）判段：越过 −70° 后再回到 0 附近，
         说明半圈已经拉完，机头回到水平、航向反转。
+
+        deflect（Action.bank 单位，可选）：改出段先滚到这个坡度，再在坡上
+        拉杆把航迹从俯冲里拉平——用“横滚 + 拉杆”的侧向升力把机头带偏，
+        改出航向就在 180° 反向之外再偏出几十度（DIVE_BREAK 用它）。偏转
+        不能靠方向舵直接偏航：倒扣俯冲里蹬舵会诱发螺旋下降；也不能在机头
+        接近垂直时压坡度，那时欧拉滚转角是奇异的，滚转指令会把破 S 拧成
+        一圈放不下来的下降螺旋。
         """
         sign = self._def_sign
         if self._phase == 0:
@@ -2337,14 +2628,219 @@ class TacticalAgent:
         if self._phase == 1:
             if obs.own_gamma <= math.radians(-70.0):
                 self._dived = True
-            if self._dived and abs(obs.own_gamma) < math.radians(18.0):
+            # 偏转型要早一点进入改出段（45°），给“压坡度 + 拉杆”留出时间；
+            # 标准破 S 到 18° 才切，避免拉平过冲。
+            if self._dived and abs(obs.own_gamma) < (
+                math.radians(45.0) if deflect > 0.0 else math.radians(18.0)
+            ):
                 self._phase, self._phase_t = 2, 0.0
             return Action(bank=0.0, n=n_max, throttle=1.0, fire=False,
                           roll_free=True)
+        if deflect > 0.0:
+            # 偏转型改出：航迹还压着就压坡度拉杆，机头在拉平的同时被带向
+            # 一侧；拉平后再滚回水平收尾。
+            if abs(obs.own_gamma) >= math.radians(10.0):
+                return Action(
+                    bank=sign * deflect,
+                    n=min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN),
+                    throttle=1.0, fire=False,
+                )
+            if abs(obs.own_bank) < math.radians(30.0):
+                self._maneuver_done = True
+            return level_out_action(obs)
         # 改出：坡度归零、航迹拉平，确认回到平飞后结束整个机动。
         if abs(obs.own_gamma) < math.radians(8.0) and abs(obs.own_bank) < math.radians(30.0):
             self._maneuver_done = True
-        return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6, throttle=0.9)
+        return level_out_action(obs)
+
+    def _dive_break(self, obs: Observation) -> Action:
+        """破 S + 机头偏转（dive break）：与标准破 S 共用同一套三段实现。
+
+        区别只在改出段：拉平航迹时先压一个坡度，靠“横滚 + 拉杆”的侧向
+        升力把机头带偏，改出航向相对进入方向不只是 180° 反向，还额外偏出
+        几十度，脱离线斜着让开对手的追击方向。不再给方向舵偏航指令——
+        倒扣俯冲里蹬舵会诱发螺旋下降，拉不回水平。
+        """
+        n_max = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK)
+        return self._split_s_impl(obs, n_max, deflect=DIVE_BREAK_BANK)
+
+    def _dive_offset(self, obs: Observation) -> Action:
+        """破 S 横偏变体：倒下高时保留 40° 偏转，边俯冲边朝内侧横偏。
+
+        标准破 S 是纯垂直面的半滚倒转，航向只反转、不产生侧向位移；对手
+        正在横向转弯时，尾部机动照样能甩开，但机头最后指的是一条和对手
+        转向相反、需要重新修正的线。这里在俯冲段故意不倒扣到底：滚到
+        140°（倒扣少 40°）就拉杆，升力矢量同时有向下和侧向分量，机体在
+        掉高度的同时朝对手转弯的内侧偏，出俯冲时航向已经提前压向对手，
+        省掉改出后那一次大转弯。最后仍改平回原航向，属于“绕一下再回来”。
+        """
+        sign = self._def_sign
+        n_max = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK)
+        bank_cmd = sign * (BANK_INVERT - DIVE_OFFSET_BANK)
+        if self._phase == 0:
+            # 直接滚到 140°：旧实现先滚到 180° 再回滚 40°，那一次反向滚
+            # （约 1.5 s、坡度从 180° 掉回 140°）正是“拖动发抖”的来源。
+            if abs(obs.own_bank) >= math.radians(120.0) or self._phase_t >= 3.5:
+                self._phase, self._phase_t = 1, 0.0
+                self._dived = False
+            return Action(bank=bank_cmd, n=1.0, throttle=1.0, fire=False)
+        if self._phase == 1:
+            # 俯冲段保持 140° 坡度：cos<0 分量负责下高，sin 分量负责横偏。
+            if obs.own_gamma <= math.radians(-45.0):
+                self._dived = True
+            if (self._dived and self._phase_t >= 2.0) or self._phase_t >= 6.0:
+                self._phase, self._phase_t = 2, 0.0
+            return Action(
+                bank=bank_cmd,
+                n=n_max, throttle=1.0, fire=False,
+            )
+        if (
+            abs(obs.own_gamma) < math.radians(12.0)
+            and abs(obs.own_bank) < math.radians(30.0)
+        ) or self._phase_t >= 6.0:
+            self._maneuver_done = True
+        return level_out_action(obs)
+
+    def _kvochur_bell(self, obs: Observation) -> Action:
+        """克沃丘尔钟摆（Kulbit）：机头绕过顶一整圈，回到原航向。
+
+        真实过程（按飞行员描述）：
+          1) 拉起，同时带一点舵面偏转，机头抬到 90° 左右，速度掉光、失速；
+          2) 越过垂直后舵面失效，机体靠惯性继续向后倒扣（机头指向后方），
+             偏转不停，机头在"朝上 → 朝下"之间横摆出约 180° 方位变化；
+          3) 恢复操纵后继续拉杆抬头，偏转仍然继续，再摆出剩下的一半；
+          4) 完全可控时把机身转平，机头指向机动前的飞行方向。
+
+        偏航闭环用累计量：整个机动里机头方位朝同一个方向转满 360°
+        （分两半，每半约 180°），这样改出时机头方位自然回到进入方向，
+        而不是像只靠俯仰那样在垂直面里翻一圈、航向却原地不动。
+        """
+        sign = self._def_sign
+        # _def_sign=+1 表示左转（bank>0 为左滚），而 yaw_rate>0 是机头右偏，
+        # 两者符号相反，这里统一成偏航指令方向。
+        yaw_sign = -sign
+        if self._bell_az0 is None:
+            self._bell_az0 = obs.own_nose_az
+            self._bell_az_prev = obs.own_nose_az
+            self._bell_yaw_acc = 0.0
+            self._bell_az_rate = 0.0
+        # 方位累计：用相邻拍的差分做连续展开，跨越 ±π 时不会跳回。
+        d_az = wrap_pi(obs.own_nose_az - self._bell_az_prev)
+        self._bell_yaw_acc += d_az
+        self._bell_az_prev = obs.own_nose_az
+        # 机头方位角速度：过顶时方位角在极点上是奇异的（相邻拍可以跳几十度），
+        # 只在机头离垂直方向还有余量时更新，避免把极点噪声当成真实偏航方向。
+        if abs(obs.own_nose_el) <= math.radians(75.0):
+            az_rate = clamp(d_az / max(self.dt, 1e-6), -2.0, 2.0)
+            self._bell_az_rate += 0.4 * (az_rate - self._bell_az_rate)
+        el = obs.own_nose_el
+        # 目标总偏航 360°，方向由 yaw_sign 决定；剩余量决定偏航指令大小。
+        err_yaw = yaw_sign * math.pi * 2.0 - self._bell_yaw_acc
+
+        if self._phase == 0:
+            # 拉起 + 轻微舵偏：机翼保持水平，把机头快速抬到接近垂直。
+            # 这里必须用角速度指令——按过载拉杆受失速迎角限制，机头最多到
+            # 失速迎角 + 航迹角，永远抬不到 90°。
+            if el >= math.radians(80.0) or self._phase_t >= 2.6:
+                self._phase, self._phase_t = 1, 0.0
+            return Action(
+                bank=0.0, n=1.0, throttle=1.0, fire=False,
+                pitch_rate=0.85, yaw_rate=yaw_sign * 0.10,
+            )
+        if self._phase == 1:
+            # 过顶惯性段：迎角过失速、平尾进入尾流，机头靠惯性继续向后倒，
+            # 同时偏航一直在同一方向，把机头从"朝上"横摆到"朝下"。
+            if el <= math.radians(-50.0) or self._phase_t >= 4.5:
+                self._phase, self._phase_t = 2, 0.0
+            return Action(
+                bank=0.0, n=1.0, throttle=0.55, fire=False, roll_free=True,
+                pitch_rate=0.55,
+                yaw_rate=yaw_sign * clamp(1.2 * abs(err_yaw), 0.55, 0.95),
+            )
+        if self._phase == 2:
+            # 恢复操纵后拉杆抬头，偏航继续同向摆完剩下的一半，直到机头
+            # 方位接近转满一圈。收得太早会停在偏离进入方向几十度的位置，
+            # 所以退出条件看累计偏航而不是单纯看仰角。
+            if (
+                abs(err_yaw) < math.radians(35.0)
+                and el >= math.radians(-15.0)
+            ) or self._phase_t >= 4.0:
+                self._phase, self._phase_t = 3, 0.0
+            return Action(
+                bank=0.0, n=1.0, throttle=1.0, fire=False, roll_free=True,
+                pitch_rate=0.70,
+                yaw_rate=clamp(1.5 * err_yaw, -0.80, 0.80),
+            )
+        # 改出：滚平并拉平航迹。
+        # 偏航只做“顺着机头当前方位转动方向”的助推，不做反向闭环刹车。
+        # 另外必须扣掉舵面混控里的侧滑对齐项（0.6β）：改出段机体接近横着飞，
+        # β 能到 ±60° 以上，混控会把 0.6β 叠到目标偏航角速度上、把它推过零，
+        # 方向舵实际就打到与机体当前偏航相反的方向——表现出来的就是
+        # “机头正往前方扫、舵却反着打”。先扣掉这一项，舵令才会顺着转向。
+        err_az = wrap_pi(obs.own_nose_az - self._bell_az0)
+        act = level_out_action(obs)
+        if self._maneuver_done:
+            return act
+        taper = clamp(abs(err_az) / math.radians(50.0), 0.0, 1.0)
+        r_des = -0.8 * self._bell_az_rate * taper
+        act.yaw_rate = clamp(r_des - 0.6 * obs.own_beta, -0.9, 0.9)
+        # 完成判据：航迹、坡度回中，机头方位接近进入方向，且方位角速度已经
+        # 衰减下来。只看方位不看角速度会在机头高速扫过正前方时就判完成。
+        if (
+            abs(obs.own_gamma) < math.radians(12.0)
+            and abs(obs.own_bank) < math.radians(30.0)
+            and abs(err_az) < math.radians(12.0)
+            and abs(self._bell_az_rate) < math.radians(12.0)
+        ) or self._phase_t >= 8.0:
+            self._maneuver_done = True
+        return act
+
+    def _herbst(self, obs: Observation) -> Action:
+        """Herbst / J 转弯：拉起 55°、绕速度矢量横滚 160°，再反向压机头。
+
+        和破 S 的差别在于不做完整半滚：只拉到大迎角，机体绕速度矢量转了
+        大半圈后，升力矢量的方向已经翻到另一侧，此时继续拉杆，机头会沿
+        一个新的方向压下来，航向在很小的空间里反转。用于被咬尾时把
+        尾追瞬间变成迎头。
+        """
+        sign = self._def_sign
+        n_pull = min(obs.own_n_avail, self.n_pos_tol, HIGH_G_N)
+        # 横滚目标：120° 而不是 180°。完全倒扣时 sinφ≈0，拉杆只会在垂直面内
+        # 下坠、航向几乎不变（那就退化成一次破 S）；保留 60° 的“未倒扣余量”
+        # 让升力同时有很强的侧向分量，拉杆时航向才会在小空间里真正掉头。
+        bank_turn = sign * (math.radians(120.0) / MAX_BANK)
+        if self._phase == 0:
+            if obs.own_gamma >= math.radians(45.0) or self._phase_t >= 3.5:
+                self._phase, self._phase_t = 1, 0.0
+            return Action(bank=0.0, n=n_pull, throttle=1.0, fire=False, roll_free=True)
+        if self._phase == 1:
+            # 绕速度矢量横滚到目标坡度。旧实现按固定 2.0 s 计时结束，
+            # 实际转过的角度随速度/滚转速率变化（常只到 130°），下一段
+            # “反拉”的方向也就跟着变，看起来时好时坏。改成坡度到位才换段。
+            if abs(obs.own_bank) >= math.radians(110.0) or self._phase_t >= 2.5:
+                self._phase, self._phase_t = 2, 0.0
+            return Action(
+                bank=bank_turn,
+                n=2.0, throttle=1.0, fire=False,
+            )
+        if self._phase == 2:
+            # 反转段：保持横滚后的坡度，升力矢量既有向下分量又有侧向分量，
+            # 拉杆时机头一边俯冲一边横转，航向在小空间里掉头。旧实现用
+            # roll_free 让坡度自由演化，实际常在中途反向滚回来，导致航迹
+            # 左右摆（观感就是抖）。
+            if obs.own_gamma <= math.radians(-20.0) or self._phase_t >= 5.0:
+                self._phase, self._phase_t = 3, 0.0
+            return Action(
+                bank=bank_turn,
+                n=n_pull, throttle=1.0, fire=False,
+            )
+        # 改平：先滚回水平，再限幅拉平航迹，动作完成。
+        if (
+            abs(obs.own_gamma) < math.radians(12.0)
+            and abs(obs.own_bank) < math.radians(30.0)
+        ) or self._phase_t >= 5.0:
+            self._maneuver_done = True
+        return level_out_action(obs)
 
     def _barrel_impl(self, n_max: float, period: float) -> Action:
         """桶滚：绕速度矢量连续滚转 360°，航迹画成螺旋。
@@ -2557,17 +3053,57 @@ class TacticalAgent:
         方位误差必须是“当前方位 − 期望方位”。aim_action 的输入是
         “还要往哪边转多少”，写成“期望 − 当前”会变成正反馈：飞机一直
         往同一侧压坡度，方位越转越大，最后把机头甩出 60° 照射锥。
+
+        偏置侧跟随目标的飞行方向（见 _update_crank_side），并把视线角速度
+        作为前馈送给 heading_turn：目标在转弯时视线本身就在转，只有跟得
+        上这个转速，靶标才会稳定停在 40° 附近，而不是在偏置角两侧来回摆。
         """
-        az = obs.off_az - self._def_sign * math.radians(40.0)
-        if abs(az) < math.radians(4.0):
-            az = 0.0
+        rate_ff = self._update_crank_side(obs)
+        az = obs.off_az - self._crank_sign * math.radians(40.0)
+        # 偏置角附近让比例项连续地收敛到 0，而不是在 |az|<4° 时整档置零：
+        # 置零会让期望转弯率从“前馈 − 比例”直接跳到“只有前馈”，而坡度是
+        # atan2(v·ψ̇/G) 反解出来的，ψ̇ 一个小台阶就能让坡指令从 −70° 翻到
+        # +40°，实际表现就是临近偏置角时又反向滚一次。
+        if abs(az) < self.CRANK_AZ_BLEND:
+            az *= 0.5 * (
+                1.0
+                - math.cos(math.pi * abs(az) / self.CRANK_AZ_BLEND)
+            )
         # 旧实现限制在 3°/s，从迎头转到 40° 偏置要十几秒，往往弹都进末段了
         # 机头还没偏出去，偏置等于没做。6°/s 既能在 7 s 内建立偏置，又不会
         # 像 aim_action 的 16°/s 那样在偏置角上来回摆振。
         return heading_turn(
             obs, az, gain=0.7, max_rate_deg=6.0,
             gamma_target=math.radians(-3.0),
+            rate_ff=rate_ff,
         )
+
+    def _update_crank_side(self, obs: Observation) -> float:
+        """按视线方位角速度维护偏置侧，并返回前馈转弯率。
+
+        视线方位是**世界系**的（los_az），与机头/航迹的定义无关，对它差分
+        得到的角速度同时包含目标横移与本机平移，正是“保持相对方位不变”
+        所需的转弯率。ω>0 表示视线在向左转、靶标会往机头左侧漂，此时
+        把机头也往左压，靶标就稳定停在左侧 40°；ω<0 反之。
+
+        死区 + 迟滞：平飞时视线轻微摆动不切换偏置侧，避免 40° 偏置整档
+        从左侧翻到右侧——那是一次约 128° 的反向滚，观感就是“机体乱摆”。
+        """
+        if obs.contact_quality < 2 or obs.dist >= 1e6:
+            # 失去跟踪：保持上次的侧别，也不做前馈。
+            self._los_az_prev = None
+            return 0.0
+        if self._los_az_prev is not None:
+            raw = wrap_pi(obs.los_az - self._los_az_prev) / max(self.dt, 1e-3)
+            self._los_rate = 0.85 * self._los_rate + 0.15 * raw
+        self._los_az_prev = obs.los_az
+        if self._los_rate > self.CRANK_SIDE_DEADBAND:
+            self._crank_sign = 1.0
+        elif self._los_rate < -self.CRANK_SIDE_DEADBAND:
+            self._crank_sign = -1.0
+        # 前馈限幅与 heading_turn 的最大转弯率一致，避免近距大角速度把
+        # 坡度指令顶到 86°。
+        return clamp(self._los_rate, -math.radians(6.0), math.radians(6.0))
 
     def _notch_desc(self, obs: Observation) -> Action:
         """三九下高：把对方雷达视线放到正侧方（3/9 线）并下高。

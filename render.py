@@ -15,10 +15,17 @@ import pygame
 from sim import (
     CONTACT_DETECT,
     CONTACT_TRACK,
+    G,
+    RADAR_DETECT_FOV,
     World,
+    air_density,
     body_axes,
     clamp,
     gun_direction,
+    nose_direction,
+    predict_position,
+    rcs_scale,
+    world_velocity,
     wrap_pi,
 )
 
@@ -54,6 +61,11 @@ HIGH_G_MARK_COLOR = (255, 122, 69)
 HIGH_G_LOAD = 6.0
 HIGH_G_REL = 0.75
 HIGH_G_COOLDOWN = 1.5
+
+# 导弹的等效 RCS：弹体只有 3–4 m 长、0.2 m 粗，迎头回波约 0.05 m² 量级。
+# 机载雷达探测距离按 RCS 的四次方根缩放，因此对弹的发现距离只有对 1 m²
+# 目标时的约 0.47 倍（Su-57 约 75 km、F-16V 约 33 km）。
+MISSILE_RCS = 0.05
 
 NEAR = 1.0
 FOV = math.radians(50.0)
@@ -581,6 +593,7 @@ class Renderer:
             self._draw_trails()
             self._draw_gun_envelopes(world)
             self._draw_aircraft(world, agents)
+            self._draw_predictions(world)
             self._draw_missiles(world)
             self._draw_counters(world)
             self._draw_gunfire(world)
@@ -599,6 +612,7 @@ class Renderer:
         self._draw_trails()
         self._draw_gun_envelopes(world)
         self._draw_aircraft(world, agents)
+        self._draw_predictions(world)
         self._draw_missiles(world)
         self._draw_counters(world)
         self._draw_gunfire(world)
@@ -1048,7 +1062,8 @@ class Renderer:
             )
             pygame.draw.circle(self.overlay, (255, 245, 210, 255), s, max(1, int(size * 0.10)))
 
-            if m.fuel > 0.0:
+            # 预点火段（RCS 摆姿态）主发动机没点燃，不画尾焰。
+            if m.ignited and m.fuel > 0.0:
                 flame = size * 0.9
                 tip = (tail[0] - sx * flame, tail[1] - sy * flame)
                 pygame.draw.line(
@@ -1167,6 +1182,42 @@ class Renderer:
             )
             pygame.draw.rect(self.screen, BG, pygame.Rect(tx - 3, ty - 2, tw + 6, th + 4))
             self.screen.blit(label, (tx, ty))
+
+    def _draw_predictions(self, world: World) -> None:
+        """机头前方的轨迹预测点：按当前转弯/爬升率积分，1 s 后的位置。
+
+        连线从机头尖端连到预测点，中间按 0.25 s 采样，所以目标在回旋时
+        这条线会跟着弯，而不是像速度切线那样笔直地伸出去。直线飞行时
+        预测线自然退化成一条与机头方向重合的短线。
+        """
+        horizon = 1.0
+        samples = 4
+        for i, ac in enumerate(world.acs):
+            if not ac.alive:
+                continue
+            nx, ny, nz = nose_direction(ac)
+            half = 0.5 * ac.spec.length
+            pts = [(ac.x + nx * half, ac.y + ny * half, ac.z + nz * half)]
+            for k in range(1, samples + 1):
+                pts.append(predict_position(ac, horizon * k / samples, steps=4))
+            screen = [self.to_screen(p) for p in pts]
+            color = TEAM_COLORS[i]
+            dim = _mix(color, BG, 0.35)
+            for a, b in zip(screen, screen[1:]):
+                if a is None or b is None:
+                    continue
+                pygame.draw.line(self.screen, dim, a, b, 1)
+                pygame.draw.circle(self.screen, color, (int(b[0]), int(b[1])), 2)
+            end = screen[-1]
+            if end is None:
+                continue
+            # 1 s 后的落点：外圈 + 中心点，和航迹上的事件标记区分开。
+            pygame.draw.circle(
+                self.screen, color, (int(end[0]), int(end[1])), 7, 1,
+            )
+            pygame.draw.circle(
+                self.screen, color, (int(end[0]), int(end[1])), 2,
+            )
 
     def _draw_flames(self, ac, team: int, frame) -> None:
         """GPU 模式下尾焰仍画在 2D 层：屏幕空间锥形，叠在机体之上。"""
@@ -1783,9 +1834,59 @@ class Renderer:
             lab = self.font_small.render("NO CONTACT", True, dim)
             self.screen.blit(lab, (cx - lab.get_width() / 2, cy + radius - 4))
 
-        # 来袭导弹：只在边缘画红色测向楔形，不给距离
+        # ---- 导弹回波 ----
+        # 机载雷达同样能扫到弹体，只是弹体 RCS 小，发现距离按四次方根缩水。
+        # 只在雷达开机、弹在机头探测锥内、且距离在探测范围内时显示。
+        incoming_seen = False
+        if ac.radar_on and ac.spec.radar_range > 0.0:
+            nnx, nny, nnz = nose_direction(ac)
+            msl_reach = ac.spec.radar_range * rcs_scale(MISSILE_RCS)
+            for m in world.missiles:
+                if not m.alive:
+                    continue
+                mx, my, mz = m.x - ac.x, m.y - ac.y, m.z - ac.z
+                md = math.sqrt(mx * mx + my * my + mz * mz)
+                if md < 1e-6 or md > msl_reach:
+                    continue
+                if math.acos(clamp(
+                    (mx * nnx + my * nny + mz * nnz) / md, -1.0, 1.0
+                )) > RADAR_DETECT_FOV:
+                    continue
+                az = wrap_pi(math.atan2(my, mx) - ac.psi)
+                rr = clamp(md / rng, 0.0, 0.96) * radius
+                bx = cx + rr * math.sin(az)
+                by = cy - rr * math.cos(az)
+                # 弹的速度矢量方向（屏幕上机头朝上），用来画指向小三角。
+                hdg = wrap_pi(math.atan2(m.vy, m.vx) - ac.psi)
+                fx, fy = math.sin(hdg), -math.cos(hdg)
+                px, py = math.cos(hdg), math.sin(hdg)
+                if m.target == i:
+                    incoming_seen = True
+                    col = (255, 96, 88)
+                    pygame.draw.polygon(
+                        self.screen, col,
+                        [(bx + 6 * fx, by + 6 * fy),
+                         (bx - 4 * fx + 3.5 * px, by - 4 * fy + 3.5 * py),
+                         (bx - 4 * fx - 3.5 * px, by - 4 * fy - 3.5 * py)],
+                    )
+                    tag = self.font_small.render(f"{md / 1000:.1f}", True, col)
+                    self.screen.blit(tag, (bx + 8, by - 16))
+                else:
+                    # 己方在飞弹：浅绿空心点 + 一小段速度矢量（不用队伍色，
+                    # 否则红方的己方弹会和来袭弹的红色三角混在一起）。
+                    own_msl = (116, 232, 150)
+                    pygame.draw.circle(
+                        self.screen, own_msl, (int(bx), int(by)), 3, 1
+                    )
+                    pygame.draw.line(
+                        self.screen, own_msl,
+                        (bx, by), (bx + 7 * fx, by + 7 * fy), 1,
+                    )
+
+        # 来袭导弹：雷达没扫到（关机 / 在探测锥外 / 太远）时只在边缘画红色
+        # 测向楔形，不给距离——这时的方位来自 RWR，而不是雷达回波。
         threat = self._missile_threat(world, i)
-        if threat is not None:
+        if threat is not None and not incoming_seen:
             az = threat[0]
             for sgn in (-1.0, 1.0):
                 a = az + sgn * math.radians(3.0)
@@ -1798,10 +1899,11 @@ class Renderer:
             self.screen.blit(lab, (rect.x + 4, rect.bottom - 19))
 
     def _draw_fwd_hud(self, world: World, i: int, rect: pygame.Rect) -> None:
-        """抬头/头瞄视野：地平线、俯仰梯、目标框、炮口准星与来袭告警。
+        """抬头/头瞄视野：地平线、俯仰梯、目标框、机炮落点框与来袭告警。
 
-        地平线与俯仰梯随本机俯仰/滚转滚动；跟踪目标在视场内画框，出视场时
-        退化为左右边缘的头瞄指引，和真实 HMD 的用法一致。
+        地平线与整条俯仰梯作为一个刚体随本机滚转旋转，横线端点连线始终与
+        横线垂直（长方形而不是平行四边形）；跟踪目标在视场内画框，出视场
+        时退化为左右边缘的头瞄指引，和真实 HMD 的用法一致。
         """
         ac = world.acs[i]
         foe = world.acs[1 - i]
@@ -1809,44 +1911,59 @@ class Renderer:
         _psi, theta, phi = attitude_of(ac)
         cx, cy = rect.centerx, rect.centery + 4
         px_per_deg = 1.5
-        # 地平线按俯仰姿态（theta）走，而不是航迹角：大迎角时两者会差几度。
-        horizon_y = cy + math.degrees(theta) * px_per_deg
         half = rect.w * 0.5
-        slope = math.tan(phi)
+        # 地平线与整条俯仰梯当作一个刚体，绕 HUD 中心旋转：
+        #   d —— 横线自身的方向（随滚转 φ 转过同样的角）
+        #   n —— 与横线垂直、指向屏幕下方的方向，各格沿它等距排布
+        # 任意点 = 中心 + 横向偏移·d + 俯仰偏移·n。这样相邻横线的端点连线
+        # 永远与横线垂直，滚转时整个梯子保持长方形，不会退化成平行四边形。
+        d_x, d_y = math.cos(phi), math.sin(phi)
+        n_x, n_y = -math.sin(phi), math.cos(phi)
+        # 地平线按俯仰姿态（theta）走，而不是航迹角：大迎角时两者会差几度。
+        pitch = math.degrees(theta)
+
+        def hud_pt(az: float, below: float) -> tuple[float, float]:
+            """HUD 坐标 → 屏幕像素：az 沿横线方向，below 是相对机头基准向下的度数。"""
+            return (
+                cx + az * d_x + below * px_per_deg * n_x,
+                cy + az * d_y + below * px_per_deg * n_y,
+            )
 
         self.screen.set_clip(rect)
         try:
             self._alpha_rect(rect, (20, 36, 55), 70)
             # 地面：地平线以下的半边，随滚转倾斜
+            hx, hy = hud_pt(0.0, pitch)
+            big = max(rect.w, rect.h) * 3.0
+            hl = (hx - big * d_x, hy - big * d_y)
+            hr = (hx + big * d_x, hy + big * d_y)
             self._alpha_poly(
                 rect, (46, 38, 25),
                 [
-                    (rect.left, horizon_y + slope * (rect.left - cx)),
-                    (rect.right, horizon_y + slope * (rect.right - cx)),
-                    (rect.right, rect.bottom),
-                    (rect.left, rect.bottom),
+                    hl, hr,
+                    (hr[0] + big * n_x, hr[1] + big * n_y),
+                    (hl[0] + big * n_x, hl[1] + big * n_y),
                 ], 70,
             )
             # 地平线本体：整条贯穿视野，读起来更像抬头显示器
-            pygame.draw.line(
-                self.screen, (108, 206, 150),
-                (rect.left, horizon_y + slope * (rect.left - cx)),
-                (rect.right, horizon_y + slope * (rect.right - cx)), 1,
-            )
-            # 俯仰梯：每 10° 一格，0° 为地平线
-            pitch = math.degrees(theta)
+            pygame.draw.line(self.screen, (108, 206, 150), hl, hr, 1)
+            # 俯仰梯：每 10° 一格，0° 与地平线重合
             for p in range(-30, 31, 10):
-                y = horizon_y + (pitch - p) * px_per_deg
-                if not rect.top + 14 < y < rect.bottom - 6:
+                mx, my = hud_pt(0.0, pitch - p)
+                if not rect.top + 14 < my < rect.bottom - 6:
                     continue
-                dx, dy = 15.0 * math.cos(phi), 15.0 * math.sin(phi)
                 pygame.draw.line(
                     self.screen, (74, 122, 96),
-                    (cx - dx, y - dy), (cx + dx, y + dy), 1,
+                    (mx - 15.0 * d_x, my - 15.0 * d_y),
+                    (mx + 15.0 * d_x, my + 15.0 * d_y), 1,
                 )
                 if p % 20 == 0:
                     lab = self.font_small.render(f"{p:+d}", True, (86, 150, 112))
-                    self.screen.blit(lab, (cx - dx - 20, int(y - dy) - 8))
+                    self.screen.blit(
+                        lab,
+                        (int(mx - 19.0 * d_x) - lab.get_width() - 4,
+                         int(my - 19.0 * d_y) - 8),
+                    )
 
             # 目标框：视场内按真实方位/仰角投影，出视场退化为头瞄边缘指引
             if ac.contact >= CONTACT_TRACK and foe.alive:
@@ -1855,8 +1972,10 @@ class Renderer:
                 rel = wrap_pi(math.atan2(dy, dx) - ac.psi)
                 elev = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
                 if abs(rel) < math.radians(52.0):
-                    tx = cx + math.tan(rel) / math.tan(math.radians(26.0)) * half * 0.82
-                    ty = horizon_y + (pitch - elev) * px_per_deg
+                    tx, ty = hud_pt(
+                        math.tan(rel) / math.tan(math.radians(26.0)) * half * 0.82,
+                        pitch - elev,
+                    )
                     tx = clamp(tx, rect.left + 12, rect.right - 12)
                     ty = clamp(ty, rect.top + 20, rect.bottom - 12)
                     pygame.draw.rect(
@@ -1864,7 +1983,9 @@ class Renderer:
                         pygame.Rect(int(tx) - 8, int(ty) - 8, 16, 16), 1,
                     )
                     pygame.draw.line(
-                        self.screen, lock_color, (int(tx) - 8, int(ty)), (int(tx) + 8, int(ty)), 1
+                        self.screen, lock_color,
+                        (int(tx) - 8 * d_x, int(ty) - 8 * d_y),
+                        (int(tx) + 8 * d_x, int(ty) + 8 * d_y), 1,
                     )
                     lab = self.font_small.render(f"{dist / 1000:4.1f}", True, lock_color)
                     lx = tx + 10 if tx + 10 + lab.get_width() < rect.right else tx - 10 - lab.get_width()
@@ -1880,6 +2001,28 @@ class Renderer:
                     self.screen.blit(
                         lab, (side - lab.get_width() if rel > 0.0 else side, rect.top + 6)
                     )
+
+            # 机炮火控框：把当前机头指向下的弹丸外弹道前推到目标距离，
+            # 框住炮弹的预计落点。框压住目标框，就说明炮线真的压在目标上。
+            fall = self._gun_fall_point(world, i)
+            if fall is not None:
+                rx, ry, rz = fall[0] - ac.x, fall[1] - ac.y, fall[2] - ac.z
+                g_az = wrap_pi(math.atan2(ry, rx) - ac.psi)
+                g_el = math.degrees(math.atan2(rz, math.hypot(rx, ry)))
+                if abs(g_az) < math.radians(52.0):
+                    gx_, gy_ = hud_pt(
+                        math.tan(g_az) / math.tan(math.radians(26.0)) * half * 0.82,
+                        pitch - g_el,
+                    )
+                    if (rect.left + 10 < gx_ < rect.right - 10
+                            and rect.top + 12 < gy_ < rect.bottom - 12):
+                        pygame.draw.rect(
+                            self.screen, (255, 226, 140),
+                            pygame.Rect(int(gx_) - 6, int(gy_) - 6, 12, 12), 1,
+                        )
+                        pygame.draw.circle(
+                            self.screen, (255, 226, 140), (int(gx_), int(gy_)), 1
+                        )
 
             # 炮口准星 + 速度/高度读数
             pygame.draw.circle(self.screen, (170, 220, 180), (cx, cy), 3, 1)
@@ -1907,6 +2050,51 @@ class Renderer:
                 self.screen.blit(lab, (cx - lab.get_width() / 2, rect.top + 4))
         finally:
             self.screen.set_clip(None)
+
+    def _gun_fall_point(
+        self, world: World, i: int,
+    ) -> tuple[float, float, float] | None:
+        """机炮弹丸在当前机头指向下的预计落点（世界坐标）。
+
+        与 sim._fire_guns / _integrate_bullets 走同一套外弹道：出膛速度取
+        “载机速度 + 炮口初速沿机头”，之后只受二次阻力与重力；阻力系数按
+        出膛高度的大气密度冻结（弹丸在机炮有效射程内只飞 1 s 量级，高度
+        变化对密度的影响可以忽略）。前推距离取当前目标斜距，没有目视接触
+        时按机炮最大射程。
+        """
+        ac = world.acs[i]
+        foe = world.acs[1 - i]
+        spec = ac.spec
+        if foe.alive:
+            dist = math.sqrt(
+                (foe.x - ac.x) ** 2 + (foe.y - ac.y) ** 2 + (foe.z - ac.z) ** 2
+            )
+        else:
+            dist = spec.gun_range
+        dist = clamp(dist, 300.0, spec.gun_range)
+        nx, ny, nz = nose_direction(ac)
+        vx, vy, vz = world_velocity(ac)
+        area = math.pi * (0.5 * spec.bullet_diameter) ** 2
+        drag_k = air_density(ac.z) * 0.30 * area / (2.0 * spec.bullet_mass)
+        bx_ = ac.x + nx * spec.length * 0.5
+        by_ = ac.y + ny * spec.length * 0.5
+        bz_ = ac.z + nz * spec.length * 0.5
+        bvx = vx + spec.muzzle_speed * nx
+        bvy = vy + spec.muzzle_speed * ny
+        bvz = vz + spec.muzzle_speed * nz
+        dt = 1.0 / 120.0
+        for _ in range(240):          # 最多前推 2 s，已超出机炮有效射程
+            sp = math.sqrt(bvx * bvx + bvy * bvy + bvz * bvz)
+            bvx -= drag_k * sp * bvx * dt
+            bvy -= drag_k * sp * bvy * dt
+            bvz -= (drag_k * sp * bvz + G) * dt
+            bx_ += bvx * dt
+            by_ += bvy * dt
+            bz_ += bvz * dt
+            r2 = (bx_ - ac.x) ** 2 + (by_ - ac.y) ** 2 + (bz_ - ac.z) ** 2
+            if r2 >= dist * dist:
+                break
+        return (bx_, by_, bz_)
 
     def _draw_missile_icon(self, x: float, y: float, color) -> None:
         """挂架上的小弹形图标：参考座舱挂载页的白色弹体剪影。"""

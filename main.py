@@ -56,8 +56,26 @@ R73 = MissileSpec(
     # （等效比冲约 150 s），推进剂 40 kg 按恒定比冲烧完，弹重 105→65 kg。
     thrust=4800.0, burn_time=5.0, boost_thrust=30000.0, boost_time=1.4,
     burnout_mass=65.0,
-    cd0=0.9, cd0_wave=1.0, cn_max=10.0, warhead_damage=100.0, lethal_radius=9.0,
-    life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
+    cd0=0.9, cd0_wave=1.0, cn_max=10.0, warhead_damage=100.0, lethal_radius=11.0,
+    pk_decay=0.35,
+    # 格斗弹的大展弦比弹翼把诱导阻力系数压到 0.04 量级；旧模型沿用的
+    # 0.15 是按中距弹的窄小弹翼标的，会让格斗弹在转进大过载时掉速过快。
+    induced_k=0.04,
+    # R-73 是早期的单色制冷红外导引头，没有成像能力，热诱弹一旦进入导引头
+    # 视场就有相当概率把波门抢走；但它的双波门跟踪对突然出现的强辐射源
+    # 有一定剔除能力，诱骗率按 0.6 折算。
+    cm_resist=0.60,
+    life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.07,
+    # R-73 首次在近距弹上采用“推力矢量+气动”复合控制：尾喷口四周的 4 片
+    # 燃气舵在助推段直接偏转喷流，低速大离轴时也能快速转向。这里按 15° 偏转
+    # （侧向力约 0.26 T）建模，只在助推段及熄火后 0.6 s 内有效。
+    guidance_delay=0.08, g_slew=400.0, tvc_frac=0.26, tvc_time=2.0,
+    # 发射程序：离架后先不点主发动机，靠燃气发生器的侧向喷流（RCS）把弹体
+    # 轴甩向目标，对准后再点火。R-73 的离轴能力到 ±60°，以 260°/s 摆头
+    # 约 0.25 s 转到位；0.40 s 是保险解脱后的最长预点火时间，超过就强制
+    # 点火，避免弹在无动力段白掉速度。
+    ignition_delay=0.06, ignition_align=math.radians(20.0),
+    rcs_slew=math.radians(260.0), ignition_timeout=0.40,
     # 对会机动的目标的有效射程。NEZ 判据还会再乘 NEZ_FRACTION(0.55)，
     # 所以这里给 6 km，落地的迎头 NEZ 约 3.3 km、尾追约 1.8 km。
     dogfight_reach=6000.0,
@@ -71,8 +89,21 @@ AIM9X = MissileSpec(
     # 助推 1.2 s / 24 kN，续航 2.8 s / 5.0 kN，总冲约 43 kN·s。
     thrust=5000.0, burn_time=4.0, boost_thrust=24000.0, boost_time=1.2,
     burnout_mass=50.0,
-    cd0=0.9, cd0_wave=1.0, cn_max=12.0, warhead_damage=110.0, lethal_radius=8.0,
-    life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.12,
+    cd0=0.9, cd0_wave=1.0, cn_max=12.0, warhead_damage=110.0, lethal_radius=10.0,
+    pk_decay=0.35,
+    induced_k=0.04,
+    # AIM-9X 使用成像红外（IIR）导引头，能按目标形状/双色比例把热诱弹从
+    # 图像里筛掉，是现役近距弹里抗干扰最好的之一，诱骗率按 0.45 折算。
+    cm_resist=0.45,
+    life=15.0, cooldown=1.5, pn_gain=4.0, autopilot_tau=0.07,
+    # AIM-9X 用燃气舵（jet vane control）实现“直接力+气动”复合控制，公开资料
+    # 说高离轴发射时可达 50–60 g，靠的是喷流偏转的瞬态直接力而不是翼面升力。
+    guidance_delay=0.06, g_slew=400.0, tvc_frac=0.26, tvc_time=1.6,
+    # AIM-9X 的发射程序与 R-73 相同：先靠 RCS 把弹体摆向目标再点火。
+    # 万向支架 ±90°，摆头速率取 320°/s，0.45 s 内能转约 130°，
+    # 足以覆盖最大离轴；超时同样强制点火，避免长时间无动力滑行。
+    ignition_delay=0.05, ignition_align=math.radians(15.0),
+    rcs_slew=math.radians(320.0), ignition_timeout=0.45,
     # AIM-9X 的离轴能力与导引头更强，对机动目标的有效距离略大
     # （落地 NEZ 迎头约 3.5 km、尾追约 1.9 km）。
     dogfight_reach=6400.0,
@@ -86,6 +117,10 @@ AIM9X = MissileSpec(
 #        战斗部 20 kg，最大过载约 40 g，射程约 105 km，主动截获约 18–20 km。
 # seeker_range 在这里表示“载机雷达能稳定跟踪并装订诸元”的距离，
 # 会随目标 RCS 按四次方根缩放；active_range 是弹上导引头的截获距离。
+# 控制方式：AIM-120/R-77/Meteor 都是纯气动（尾舵/格栅舵），没有燃气舵，
+# 因此 tvc_frac 保持 0——中距弹的低速段机动能力就是差，这是设计取舍。
+# 燃气舵在中距弹上只出现在 AIM-260 这类“取消中段弹翼、靠 TVC 补机动缺口”
+# 的新弹上，本项目没有装备，故不建模。
 R77_1 = MissileSpec(
     name="R-77-1", mass=190.0, length=3.60, diameter=0.20,
     max_g=40.0, seeker_fov=math.radians(60.0),
@@ -97,6 +132,7 @@ R77_1 = MissileSpec(
     cd0=0.45, cd0_wave=0.7, cn_max=10.0, warhead_damage=110.0, lethal_radius=11.0,
     life=50.0, cooldown=3.0, pn_gain=4.0, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=20000.0,
+    guidance_delay=0.08, g_slew=400.0,
 )
 
 AIM120C = MissileSpec(
@@ -110,6 +146,7 @@ AIM120C = MissileSpec(
     cd0=0.45, cd0_wave=0.7, cn_max=10.0, warhead_damage=105.0, lethal_radius=10.0,
     life=45.0, cooldown=3.0, pn_gain=4.2, autopilot_tau=0.18,
     guidance="ARH", loft=True, active_range=18000.0,
+    guidance_delay=0.08, g_slew=400.0,
 )
 
 

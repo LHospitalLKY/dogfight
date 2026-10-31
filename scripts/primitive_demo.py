@@ -134,6 +134,12 @@ DEMOS = [
     # ---- 垂直机动 ----
     # 破 S 是防御动作：本机在前被咬尾，半滚倒扣俯冲脱离，对手在上方冲过头。
     demo("SPLIT_S", "attacked", 18.0, foe="pure", sign=-1.0),
+    # 破 S 横偏变体：俯冲段保留 40° 坡度，边下高边朝对手转向的内侧偏，
+    # 最后仍改平回原航向（“绕一下再回来”）。
+    demo("DIVE_OFFSET", "attacked", 18.0, foe="pure", sign=-1.0),
+    # 破 S + 机头偏转：越过垂直后把坡度回压 45°，用横滚加拉杆把机头拉出
+    # 垂直面，改出航向在 180° 反向之外再偏几十度。
+    demo("DIVE_BREAK", "attacked", 18.0, foe="pure", sign=-1.0),
     demo("BARREL", "chase", 10.0, foe="pure"),
     demo("IMMELMANN", "chase", 20.0),
     demo("LOOP", "chase", 34.0),
@@ -156,6 +162,13 @@ DEMOS = [
     # 这才能看出眼镜蛇的“让对手冲过头”的作用。
     demo("COBRA", "pursued", 8.0, speed=130.0, foe="level", foe_speed=300.0,
          seq=[("COBRA", 2.0), ("UNLOAD", 2.0), ("PURE", 4.0)]),
+    # 克沃丘尔钟摆：拉起并带一点舵偏 → 机头到 90° 失速 → 机身倒扣向后（惯性）
+    # → 恢复操纵后继续拉杆抬头、偏转不停 → 转平，机头回到机动前的飞行方向。
+    demo("KVOCHUR_BELL", "attacked", 18.0, speed=320.0, foe="pure", sign=-1.0,
+         seq=[("KVOCHUR_BELL", 14.0), ("PURE", 4.0)]),
+    # Herbst / J 转弯：拉起 45° → 绕速度矢量横滚 → 机头压回水平。
+    demo("HERBST", "attacked", 18.0, speed=300.0, foe="pure", sign=-1.0,
+         seq=[("HERBST", 14.0), ("PURE", 4.0)]),
     demo("EXTEND", "merge_off", 9.0),
     demo("UNLOAD", "merge", 6.0),
 ]
