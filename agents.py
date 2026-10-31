@@ -140,10 +140,11 @@ MANEUVERS: dict[str, Maneuver] = {
     "DIVE_BREAK": Maneuver(
         "DIVE_BREAK", "DEFENSIVE", min_speed_frac=1.40, low_alt_need=3000.0,
     ),
-    # 克沃丘尔钟摆：近垂直拉起后横转，机头从另一侧摆落（6DOF + 矢量喷口）。
+    # 克沃丘尔钟摆（真·尾滑/bell）：高 G 拉起至近垂直，速度降到零附近
+    # 进入尾滑，机头自然甩过地平线，恢复末段加一次绕纵轴滚转（6DOF+TVC）。
     "KVOCHUR_BELL": Maneuver(
-        "KVOCHUR_BELL", "DEFENSIVE", min_speed_frac=1.60,
-        low_alt_need=1800.0, high_alt_need=2200.0,
+        "KVOCHUR_BELL", "COUNTER", min_speed_frac=1.60,
+        low_alt_need=2400.0, high_alt_need=2800.0,
     ),
     # Herbst / J 转弯：拉起 55° 后绕速度矢量横滚，反向压机头完成 180° 反转。
     "HERBST": Maneuver(
@@ -595,10 +596,12 @@ class TacticalAgent:
     # 压下来、让自己脱离对方当时发射线，又不至于丢掉随后的补射窗口。
     POST_LAUNCH_CRANK_TIME = 8.0
     COBRA_DIST = 1800.0          # 矢量喷口机型的过失速反制距离：来弹贴脸才用
-    # 克沃丘尔钟摆的启动距离：比眼镜蛇稍远，因为钟摆是先拉起再横摆机头，
-    # 需要一点时间把速度矢量刹住；冷却用来避免同一个缠斗里反复做。
+    # 克沃丘尔钟摆的启动距离：对手从尾后压到这个距离内时，用一次
+    # “刹停 + 钟摆”诱使对方冲过头（不用于躲导弹——它耗时长、能量代价大）。
     BELL_DIST = 2200.0
-    BELL_COOLDOWN = 8.0
+    # 一套完整钟摆要近四十秒（拉起 → 尾滑 → 翻落 → 恢复 → 滚转改平），
+    # 冷却取同一量级，避免同一场缠斗里连做。
+    BELL_COOLDOWN = 30.0
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
     OPENING_DIST = 20000.0       # 开局占位阶段：距离大于该值时不直冲对头
     MERGE_START = 5000.0     # 进入该距离开始领先转弯，抢交汇角度
@@ -696,7 +699,6 @@ class TacticalAgent:
     IR_DEFENSE = (
         "HIGH_G_BREAK", "BREAK", "HIGH_G_BARREL", "BARREL",
         "HIGH_G_SPLIT_S", "SPLIT_S", "DIVE_BREAK", "DIVE_OFFSET",
-        "KVOCHUR_BELL",
     )
 
     # ---- 中距弹“围追堵截”补射纪律 ----
@@ -856,18 +858,19 @@ class TacticalAgent:
         # 上一次的视线方位：偏置侧靠它差分出视线角速度；换原语后要清空，
         # 否则中途隔了几秒再算一次差分会被当成“视线突然转了几十度”。
         self._los_az_prev: float | None = None
-        # 克沃丘尔钟摆的冷却：这个动作把机头竖到近垂直，再横摆落下，
-        # 连续做会把能量抽干，所以做完要等一段时间再评估。
+        # 克沃丘尔钟摆的冷却：这个动作把速度打到接近零、再让机头翻落，
+        # 整套要近四十秒，连续做会把能量抽干，所以做完要等一段时间。
         self._bell_cd = 0.0
-        # 钟摆机动进入时的机头方位，改出段靠它把航向带回原来的指向。
+        # 钟摆机动进入时的机头方位，仅用于诊断（不再做 360° 方位闭环）。
         self._bell_az0: float | None = None
-        # 机头方位累计量：钟摆要求偏航一直在同一个方向转到 360°，
-        # 靠这个连续展开的累计值做闭环，避免 ±π 处跳变导致方向判断错乱。
         self._bell_az_prev: float = 0.0
         self._bell_yaw_acc: float = 0.0
-        # 机头方位角速度（世界系，限幅滤波）：改出段用它判断飞机当前正往
-        # 哪边偏，保证改平是顺着偏航走而不是反向掰回来。
         self._bell_az_rate: float = 0.0
+        # 分段时间与一次性舵 kick / 末段滚转的计时。
+        self._bell_t: float = 0.0
+        self._bell_kicked: bool = False
+        self._bell_kick_t: float = 0.0
+        self._bell_roll_t: float = 0.0
 
     # ---------- 主入口 ----------
 
@@ -982,7 +985,10 @@ class TacticalAgent:
         # 滚转 + 拉杆，被 0.7 s 的最短驻留切走就只剩一次莫名其妙的摆翼。
         # 只有边界/能量这类安全原语可以打断；超时兜底防止卡在某个分段。
         if self.primitive in VERTICAL:
-            if self._phase_t >= 14.0:
+            # 钟摆是“拉起 → 尾滑 → 翻落 → 改出”的完整时序，全程近四十秒；
+            # 沿用 14 s 的通用兜底会在恢复段把动作提前切走。
+            vertical_limit = 46.0 if self.primitive == "KVOCHUR_BELL" else 14.0
+            if self._phase_t >= vertical_limit:
                 self._maneuver_done = True
             # 已经压住扳机、目标就在炮口窗口里时，不必把这次反转做完：
             # 破 S 是“没射击机会时换角度”的动作，有射击机会就该先打掉。
@@ -1106,6 +1112,10 @@ class TacticalAgent:
         24 km 以外的进入段还没进入交战，按维持巡航马赫所需的军推飞，
         避免一开局油门就顶到军用最大、推力条直接接近满格。
         """
+        # 钟摆的油门是机动时序的一部分（建立上仰后必须收油刹车），
+        # 通用功率策略里的“低速/来弹就补加力”会把尾滑直接顶掉。
+        if self.primitive == "KVOCHUR_BELL":
+            return
         if obs.own_fuel_frac <= 0.02:
             act.afterburner = 0.0
             return
@@ -1370,20 +1380,8 @@ class TacticalAgent:
                     and obs.z_margin_low > 1200.0
                 ):
                     return "SURVIVE", "COBRA"
-                # 克沃丘尔钟摆：来弹稍远一点（2.2 km 内）时，先把机头竖起来
-                # 刹住速度矢量，再横摆落下，让弹从侧后方冲过去。距离再近
-                # 就交给上面的眼镜蛇，那个动作的瞬态减速更狠。
-                if (
-                    obs.own_tvc
-                    and obs.dof >= 6
-                    and obs.incoming_missile_dist < self.BELL_DIST
-                    and obs.own_speed_frac > 1.70
-                    and obs.z_margin_low > 1500.0
-                    and obs.z_margin_high > 2500.0
-                    and self._bell_cd <= 0.0
-                ):
-                    self._bell_cd = self.BELL_COOLDOWN
-                    return "SURVIVE", "KVOCHUR_BELL"
+                # 钟摆不放进导弹规避：整套动作要近四十秒、速度归零，躲不来弹，
+                # 它的价值是在近距格斗里诱使对手冲过头（见 _tactic_counter）。
                 return "SURVIVE", self._pick_defense(
                     obs, vs_missile=True, ir=True
                 )
@@ -1573,6 +1571,18 @@ class TacticalAgent:
         # 反切：对手冲过头。
         if sit.overshoot and obs.dist < 900.0 and obs.own_speed_frac > 1.45:
             return self._start_counter("COUNTER_SNAP", "SCISSORS")
+        # 钟摆的战术用法：对手还在尾后压近（0.9–2.2 km）时，用一次
+        # “近垂直拉起 → 零速尾滑 → 钟摆翻落”把速度钉住，逼他从上方/侧方
+        # 冲过头，再借能量恢复反咬。它不是导弹规避动作。
+        if (
+            tail
+            and 900.0 <= obs.dist < self.BELL_DIST
+            and obs.own_n_avail >= HIGH_G_MIN_AVAIL
+            and self._bell_cd <= 0.0
+            and self._defense_ok("KVOCHUR_BELL", obs)
+        ):
+            self._bell_cd = self.BELL_COOLDOWN
+            return self._start_counter("COUNTER_BELL", "KVOCHUR_BELL")
         # 迎头化：破 S 的 180° 反转需要离地余量，且不能太慢。
         # energy_diff 的单位是 J/kg（v²/2 + g·z）：-15000 约等于 300 m/s 下
         # 20 m/s 的速度亏欠，再差就说明反转做完会被对手直接压住。
@@ -2175,6 +2185,10 @@ class TacticalAgent:
             self._bell_az0 = None
             self._bell_yaw_acc = 0.0
             self._bell_az_rate = 0.0
+            self._bell_t = 0.0
+            self._bell_kicked = False
+            self._bell_kick_t = 0.0
+            self._bell_roll_t = 0.0
         # 防御转向只在本次威胁的第一次防御动作时定一次侧：取威胁所在的一侧。
         # 之后由 act() 的计时器统一维护，只在威胁持续位于反侧 1.5 s 才换向。
         # 原来“每次进入防御都按瞬时方位重算”，在盘旋缠斗里方位角常年超过
@@ -2220,7 +2234,10 @@ class TacticalAgent:
         act = self._dispatch(primitive, obs)
         act = self._limit_energy(act, obs, primitive)
         act = self._limit_g(act)
-        act.brake = self._brake_demand(obs, primitive)
+        # 钟摆要自己按分段控制减速板（顶点前切开、尾滑段全开），
+        # 不能被通用的 _brake_demand 覆盖。
+        if primitive != "KVOCHUR_BELL":
+            act.brake = self._brake_demand(obs, primitive)
         pilot_ok = self._gloc_t <= 0.0
         act.launch = pilot_ok and should_launch(obs)
         act.launch_radar = pilot_ok and self._radar_launch_ok(obs)
@@ -2702,96 +2719,137 @@ class TacticalAgent:
         return level_out_action(obs)
 
     def _kvochur_bell(self, obs: Observation) -> Action:
-        """克沃丘尔钟摆（Kulbit）：机头绕过顶一整圈，回到原航向。
+        """克沃丘尔钟摆（真·尾滑/bell）：近垂直拉起 → 零速尾滑 → 钟摆翻落。
 
-        真实过程（按飞行员描述）：
-          1) 拉起，同时带一点舵面偏转，机头抬到 90° 左右，速度掉光、失速；
-          2) 越过垂直后舵面失效，机体靠惯性继续向后倒扣（机头指向后方），
-             偏转不停，机头在"朝上 → 朝下"之间横摆出约 180° 方位变化；
-          3) 恢复操纵后继续拉杆抬头，偏转仍然继续，再摆出剩下的一半；
-          4) 完全可控时把机身转平，机头指向机动前的飞行方向。
-
-        偏航闭环用累计量：整个机动里机头方位朝同一个方向转满 360°
-        （分两半，每半约 180°），这样改出时机头方位自然回到进入方向，
-        而不是像只靠俯仰那样在垂直面里翻一圈、航向却原地不动。
+        与旧实现“边前飞边横转 360°”不同，这里把水平速度真正刹到零：
+          1) 高 G 拉起：把机头抬到 80–90°；仰角过 60–70° 就收油门、
+             全开减速板，不再用 100% 加力顶到顶点；
+          2) 空速/VSI 接近零：卸载（n≈1）进入尾滑，机头停在 85° 附近，
+             近零速只用小幅方向舵/矢量抑制偏摆，不做副翼闭环；
+          3) 速度反向、机头自然甩过地平线；空速回到约 0.6 倍失速、方向舵
+             重新有权限时给一次明确的偏航输入，让机头像钟摆一样绕飞机竖轴
+             摆出去；
+          4) 机头下俯、空速回来后平稳加油门，用渐进 G 拉平；在恢复的最后
+             约 1/4 段叠加一次绕纵轴滚转（bell），到位即停、改平。
         """
         sign = self._def_sign
         # _def_sign=+1 表示左转（bank>0 为左滚），而 yaw_rate>0 是机头右偏，
         # 两者符号相反，这里统一成偏航指令方向。
         yaw_sign = -sign
+        el = obs.own_nose_el
+        gamma = obs.own_gamma
+        # 竖直速度分量：负值表示已经在往下掉（尾滑末端）。
+        vz = obs.own_speed * math.sin(gamma)
+        speed_frac = obs.own_speed_frac
+        self._bell_t += self.dt
         if self._bell_az0 is None:
             self._bell_az0 = obs.own_nose_az
             self._bell_az_prev = obs.own_nose_az
-            self._bell_yaw_acc = 0.0
-            self._bell_az_rate = 0.0
-        # 方位累计：用相邻拍的差分做连续展开，跨越 ±π 时不会跳回。
-        d_az = wrap_pi(obs.own_nose_az - self._bell_az_prev)
-        self._bell_yaw_acc += d_az
+        # 机头方位累计只作诊断：不再用 360° 闭环驱动舵面。
+        self._bell_yaw_acc += wrap_pi(obs.own_nose_az - self._bell_az_prev)
         self._bell_az_prev = obs.own_nose_az
-        # 机头方位角速度：过顶时方位角在极点上是奇异的（相邻拍可以跳几十度），
-        # 只在机头离垂直方向还有余量时更新，避免把极点噪声当成真实偏航方向。
-        if abs(obs.own_nose_el) <= math.radians(75.0):
-            az_rate = clamp(d_az / max(self.dt, 1e-6), -2.0, 2.0)
-            self._bell_az_rate += 0.4 * (az_rate - self._bell_az_rate)
-        el = obs.own_nose_el
-        # 目标总偏航 360°，方向由 yaw_sign 决定；剩余量决定偏航指令大小。
-        err_yaw = yaw_sign * math.pi * 2.0 - self._bell_yaw_acc
 
         if self._phase == 0:
-            # 拉起 + 轻微舵偏：机翼保持水平，把机头快速抬到接近垂直。
-            # 这里必须用角速度指令——按过载拉杆受失速迎角限制，机头最多到
-            # 失速迎角 + 航迹角，永远抬不到 90°。
-            if el >= math.radians(80.0) or self._phase_t >= 2.6:
-                self._phase, self._phase_t = 1, 0.0
-            return Action(
-                bank=0.0, n=1.0, throttle=1.0, fire=False,
-                pitch_rate=0.85, yaw_rate=yaw_sign * 0.10,
-            )
-        if self._phase == 1:
-            # 过顶惯性段：迎角过失速、平尾进入尾流，机头靠惯性继续向后倒，
-            # 同时偏航一直在同一方向，把机头从"朝上"横摆到"朝下"。
-            if el <= math.radians(-50.0) or self._phase_t >= 4.5:
-                self._phase, self._phase_t = 2, 0.0
-            return Action(
-                bank=0.0, n=1.0, throttle=0.55, fire=False, roll_free=True,
-                pitch_rate=0.55,
-                yaw_rate=yaw_sign * clamp(1.2 * abs(err_yaw), 0.55, 0.95),
-            )
-        if self._phase == 2:
-            # 恢复操纵后拉杆抬头，偏航继续同向摆完剩下的一半，直到机头
-            # 方位接近转满一圈。收得太早会停在偏离进入方向几十度的位置，
-            # 所以退出条件看累计偏航而不是单纯看仰角。
+            # 拉起：高 G 把机头抬到近垂直。仰角过 60° 或航迹已经过 55°
+            # 就收油门 + 全开减速板，靠阻力/重力减速，而不是继续加力。
+            cut = el >= math.radians(60.0) or gamma >= math.radians(55.0)
             if (
-                abs(err_yaw) < math.radians(35.0)
-                and el >= math.radians(-15.0)
-            ) or self._phase_t >= 4.0:
-                self._phase, self._phase_t = 3, 0.0
-            return Action(
-                bank=0.0, n=1.0, throttle=1.0, fire=False, roll_free=True,
-                pitch_rate=0.70,
-                yaw_rate=clamp(1.5 * err_yaw, -0.80, 0.80),
+                gamma >= math.radians(80.0)
+                or el >= math.radians(86.0)
+                or (el >= math.radians(70.0) and speed_frac < 0.60)
+                or self._bell_t >= 10.0
+            ):
+                self._phase, self._bell_t = 1, 0.0
+            n_pull = clamp(
+                min(obs.own_n_avail * 0.95, self.n_pos_tol), 1.0, 7.5
             )
-        # 改出：滚平并拉平航迹。
-        # 偏航只做“顺着机头当前方位转动方向”的助推，不做反向闭环刹车。
-        # 另外必须扣掉舵面混控里的侧滑对齐项（0.6β）：改出段机体接近横着飞，
-        # β 能到 ±60° 以上，混控会把 0.6β 叠到目标偏航角速度上、把它推过零，
-        # 方向舵实际就打到与机体当前偏航相反的方向——表现出来的就是
-        # “机头正往前方扫、舵却反着打”。先扣掉这一项，舵令才会顺着转向。
-        err_az = wrap_pi(obs.own_nose_az - self._bell_az0)
-        act = level_out_action(obs)
-        if self._maneuver_done:
+            return Action(
+                bank=0.0, n=n_pull,
+                throttle=0.0 if cut else 1.0,
+                afterburner=0.0 if cut else 1.0,
+                fire=False, brake=1.0 if cut else 0.0,
+            )
+
+        if self._phase == 1:
+            # 顶点/尾滑：接近零速，卸载到 n≈1。不要再硬拉杆，否则会在
+            # 失速前缘上停住、而不是自然进入尾滑。
+            if (
+                (vz < 4.0 and gamma < math.radians(70.0))
+                or (el < math.radians(70.0) and speed_frac < 0.55)
+                or self._bell_t >= 16.0
+            ):
+                self._phase, self._bell_t = 2, 0.0
+                self._bell_kicked = False
+                self._bell_kick_t = 0.0
+            pitch = (
+                -0.10 if el > math.radians(85.0)
+                else 0.08 if el < math.radians(83.0) else 0.0
+            )
+            return Action(
+                bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                brake=1.0, fire=False, roll_free=True,
+                pitch_rate=pitch, yaw_rate=-0.6 * obs.own_beta,
+            )
+
+        if self._phase == 2:
+            # 钟摆段：机头已甩过地平线。这里只做小幅方向舵阻尼——空速还在
+            # 零附近，舵面几乎没有权限，真正的“钟摆侧摆”要等空速回来、
+            # 方向舵有效后在恢复初段给（见下一段）。
+            act = Action(
+                bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                brake=1.0, fire=False, roll_free=True,
+                pitch_rate=0.0, yaw_rate=-0.6 * obs.own_beta,
+            )
+            if el <= math.radians(5.0) or self._bell_t >= 10.0:
+                self._phase, self._bell_t = 3, 0.0
+                self._bell_kicked = False
+                self._bell_kick_t = 0.0
             return act
-        taper = clamp(abs(err_az) / math.radians(50.0), 0.0, 1.0)
-        r_des = -0.8 * self._bell_az_rate * taper
-        act.yaw_rate = clamp(r_des - 0.6 * obs.own_beta, -0.9, 0.9)
-        # 完成判据：航迹、坡度回中，机头方位接近进入方向，且方位角速度已经
-        # 衰减下来。只看方位不看角速度会在机头高速扫过正前方时就判完成。
+
+        if self._phase == 3:
+            # 机头已下俯：中立方向舵，平稳加油门，用限幅 10°/s 的渐进 G
+            # 把航迹从近垂直俯冲拉回来（不在 q≈0 时猛拉）。
+            act = level_out_action(obs, throttle=0.9)
+            act.afterburner = 0.0
+            # 下坠初段的一次性方向舵 kick：顶点附近空速接近零、方向舵没有
+            # 权限，必须先等空速回到约 0.62 倍失速，再给一次明确输入，
+            # 机头才会像钟摆一样绕竖轴摆出去；之后交回中立方向舵。
+            if not self._bell_kicked and speed_frac > 0.62:
+                self._bell_kicked = True
+                self._bell_kick_t = 1.2
+            if self._bell_kicked and self._bell_kick_t > 0.0:
+                self._bell_kick_t = max(0.0, self._bell_kick_t - self.dt)
+                act.yaw_rate = yaw_sign * 0.9
+            # 航迹回到 −20° 附近、空速回到 1.15 倍失速以上，舵面重新有效，
+            # 这时才是“恢复最后 1/4 段”的 bell 滚转。
+            if (
+                gamma > math.radians(-20.0) and speed_frac > 1.15
+            ) or self._bell_t >= 12.0:
+                self._phase, self._bell_t = 4, 0.0
+                # bell 的滚转按**角度**收口而不是按时间：低速恢复段滚转
+                # 舵效还在恢复，同一个滚转角速度指令实际只能滚出约一半的
+                # 角速度（0.6 rad/s 指令实测约 0.28 rad/s），若按“45°/速率”
+                # 算时间，只能滚到 25°。这里给 4 s 兜底，滚到约 45° 即停。
+                self._bell_roll_t = 4.0
+            return act
+
+        # 第 4 段：bell 的滚转 + 改平。
+        if self._bell_roll_t > 0.0:
+            self._bell_roll_t = max(0.0, self._bell_roll_t - self.dt)
+            if abs(obs.own_bank) < math.radians(46.0):
+                return Action(
+                    bank=0.0, n=2.4, throttle=0.9, afterburner=0.0,
+                    fire=False, roll_rate=sign * 0.60,
+                )
+            # 到位即停：达到约 45° 后不再继续滚，交给下面的改平段。
+            self._bell_roll_t = 0.0
+        act = level_out_action(obs, throttle=0.95)
+        act.afterburner = 0.4 if speed_frac > 1.10 else 0.0
         if (
-            abs(obs.own_gamma) < math.radians(12.0)
+            abs(gamma) < math.radians(12.0)
             and abs(obs.own_bank) < math.radians(30.0)
-            and abs(err_az) < math.radians(12.0)
-            and abs(self._bell_az_rate) < math.radians(12.0)
-        ) or self._phase_t >= 8.0:
+            and speed_frac > 1.05
+        ) or self._bell_t >= 8.0:
             self._maneuver_done = True
         return act
 
