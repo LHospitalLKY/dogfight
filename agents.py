@@ -74,8 +74,8 @@ VERTICAL = frozenset((
     "BARREL", "HIGH_G_BARREL", "DIVE_BREAK", "DIVE_OFFSET",
     "KVOCHUR_BELL", "KVOCHUR_BELL_BACK", "HERBST",
 ))
-# 钟摆家族：拉起 → 零速尾滑 → 顶点翻落。前倒（过顶）与后倒（退回原航向）
-# 共用同一套拉起/尾滑时序，只在翻落段的俯仰指令上分叉。
+# 钟摆家族：拉起 → 零速尾滑 → 顶点翻落。前倒（过顶）与后倒（顶点后继续
+# 拉杆、机头朝机尾方向翻过去）共用同一套拉起/尾滑时序，只在翻落段分叉。
 BELL_PRIMS = ("KVOCHUR_BELL", "KVOCHUR_BELL_BACK")
 # 盘旋类原语：把机头拉到 80° 坡度需要约 1.5 s，最短驻留若只有 0.7 s，
 # 刚滚一半就被切走，下一次若转向侧相反又要反向滚 140°，画面里就成了
@@ -149,8 +149,9 @@ MANEUVERS: dict[str, Maneuver] = {
         "KVOCHUR_BELL", "COUNTER", min_speed_frac=1.60,
         low_alt_need=2400.0, high_alt_need=2800.0,
     ),
-    # 后倒变体：顶点后反向推杆，机头沿原爬升路径倒回来，尾冲后退后改平，
-    # 退出航向基本不变；只用于演示/能量管理，不进战术反击池。
+    # 后倒变体：顶点后继续拉杆，机头朝机尾方向翻过一整圈、由朝上变朝下，
+    # 同时三元矢量喷口在机体 xy 平面内左右摆出钟摆轨迹；只用于演示/能量
+    # 管理，不进战术反击池。
     "KVOCHUR_BELL_BACK": Maneuver(
         "KVOCHUR_BELL_BACK", "DEFENSIVE", min_speed_frac=1.60,
         low_alt_need=2400.0, high_alt_need=2800.0,
@@ -2816,10 +2817,18 @@ class TacticalAgent:
                 # 后倒：继续拉杆，让机头朝机尾方向翻过去（倒扣后翻）。
                 # 机头仰角 el 过了 90° 会重新变小，单看 el 分不清前倒/后倒，
                 # 用机头方位相对初始值是否翻转 180° 来判断翻到了背面。
+                # 同时让三元矢量喷口在机体 xy 平面内来回摆：近零速方向舵
+                # 没有动压，只有 TVC 能直接给偏航力矩，机头才会像钟摆一样
+                # 一边向后倒、一边左右摆。
+                swing = (
+                    0.35 * math.sin(2.0 * math.pi * self._bell_t / 6.0)
+                    * max(0.0, 1.0 - self._bell_t / 12.0)
+                )
                 act = Action(
-                    bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
+                    bank=0.0, n=1.0, throttle=0.55, afterburner=0.0,
                     brake=1.0, fire=False, roll_free=True,
                     pitch_rate=0.55,
+                    tvc_yaw=yaw_sign * swing,
                     yaw_rate=-0.6 * obs.own_beta,
                 )
                 az_dev = abs(wrap_pi(obs.own_nose_az - self._bell_az0))
@@ -2827,10 +2836,7 @@ class TacticalAgent:
                     self._bell_flipped = True
                 # 一直拉到机头绕机体横轴翻完一整圈（方位先翻 180°、再翻回
                 # 原方向），形成后空翻；随后机头朝前下方，交回常规拉平。
-                done = (
-                    self._bell_flipped and az_dev < math.radians(40.0)
-                    and el < 0.0
-                )
+                done = self._bell_flipped and el < math.radians(-50.0)
             else:
                 act = Action(
                     bank=0.0, n=1.0, throttle=0.0, afterburner=0.0,
@@ -2896,7 +2902,7 @@ class TacticalAgent:
         return act
 
     def _kvochur_bell_back(self, obs: Observation) -> Action:
-        """钟摆后倒变体：顶点后反向推杆，机头沿原爬升路径倒回来。"""
+        """钟摆后倒变体：顶点后继续拉杆，机头向后翻过顶、由朝上变朝下。"""
         return self._kvochur_bell(obs, back=True)
 
     def _herbst(self, obs: Observation) -> Action:

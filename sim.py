@@ -823,6 +823,10 @@ class Action:
     # 与 roll_rate 的区别是它只动方向舵，机体不滚转——克沃丘尔钟摆
     # 那种“机头拉起的同时靠舵面把机头甩向一侧”就靠这一路。
     yaw_rate: float = 0.0
+    # 三元矢量喷口的偏航偏角（归一化 -1..1，正值机头右偏）。近零速段
+    # 方向舵没有动压、给不出偏航力矩，只有 TVC 能直接施加偏航力矩；
+    # 非矢量机型保持 0（退回方向舵）。
+    tvc_yaw: float = 0.0
     # 主动减速：0..1 的减速板/扰流板开度，直接叠加额外零升阻力。
     brake: float = 0.0
     # 机载雷达开关请求：None=保持现状。静默伏击时关掉发射源，
@@ -2318,7 +2322,9 @@ class World:
                 tvc_p = clamp(
                     2.0 * (alpha_cmd - alpha), -spec.tvc, spec.tvc
                 ) * ac.throttle
-        return da, de, dr, tvc_p
+        # 三元矢量偏航：归一化指令直接映射到喷口偏角，推力越小力矩越小。
+        tvc_y = clamp(act.tvc_yaw, -1.0, 1.0) * spec.tvc if spec.tvc > 0.0 else 0.0
+        return da, de, dr, tvc_p, tvc_y
 
     def _integrate_rigid(self, ac: Aircraft, act: Action) -> None:
         """6DOF：刚体六自由度积分（气动力/力矩 + 陀螺耦合 + 欧拉运动学）。"""
@@ -2333,7 +2339,7 @@ class World:
         mach = mach_number(V, ac.z)
         thrust = self._apply_power(ac, act, mach)
 
-        da, de, dr, tvc_p = self._surface_commands(ac, act, V, alpha, qbar)
+        da, de, dr, tvc_p, tvc_y = self._surface_commands(ac, act, V, alpha, qbar)
         ac.tvc_cmd = tvc_p
 
         # 升力曲线：失速后升力快速衰减；矢量喷口机型衰减更慢，
@@ -2409,6 +2415,10 @@ class World:
             spec.cn_beta * beta + spec.cn_r * r_hat
             + spec.cn_dr * dr + spec.cn_da * da
         )
+        if tvc_y != 0.0:
+            # 三元矢量喷口的偏航分量：近零速时舵面无效，这是唯一能给出
+            # 偏航力矩的通道（钟摆在顶点附近的侧摆靠它）。
+            yaw_m += thrust * tvc_y * 0.35 * spec.length
         ixx, iyy, izz = spec.ixx_of(m), spec.iyy_of(m), spec.izz_of(m)
         p_dot = (roll_m + (iyy - izz) * ac.q * ac.r) / ixx
         q_dot = (pitch_m + (izz - ixx) * ac.p * ac.r) / iyy
