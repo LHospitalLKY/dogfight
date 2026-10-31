@@ -69,8 +69,23 @@ def test_cd0_positive_and_finite():
 def test_missile_propellant_and_impulse():
     for spec in (R73, R77_1):
         assert spec.propellant == pytest.approx(spec.mass - spec.burnout_mass)
-        assert spec.mass_flow > 0.0
-        assert spec.thrust * spec.burn_time > 0.0
+        assert spec.thrust_at(0.0) > 0.0
+        assert spec.mass_flow_at(0.0) > 0.0
+        # 两段推力：助推段推力高于续航段，且总冲/总推进剂严格守恒。
+        assert spec.thrust_at(0.0) > spec.thrust
+        n = 2000
+        dt = spec.burn_time / n
+        impulse = 0.0
+        flow = 0.0
+        for i in range(n):
+            t = (i + 0.5) * dt
+            impulse += spec.thrust_at(t) * dt
+            flow += spec.mass_flow_at(t) * dt
+        assert impulse == pytest.approx(
+            spec.boost_thrust * spec.boost_time
+            + spec.thrust * (spec.burn_time - spec.boost_time)
+        )
+        assert flow == pytest.approx(spec.propellant, rel=1e-6)
 
 
 def test_proximity_pk_monotonic():

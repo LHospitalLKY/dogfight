@@ -165,10 +165,11 @@ DEMOS = [
     # 这才能看出眼镜蛇的“让对手冲过头”的作用。
     demo("COBRA", "pursued", 8.0, speed=130.0, foe="level", foe_speed=300.0,
          seq=[("COBRA", 2.0), ("UNLOAD", 2.0), ("PURE", 4.0)]),
-    # 克沃丘尔钟摆：拉起并带一点舵偏 → 机头到 90° 失速 → 机身倒扣向后（惯性）
-    # → 恢复操纵后继续拉杆抬头、偏转不停 → 转平，机头回到机动前的飞行方向。
-    demo("KVOCHUR_BELL", "attacked", 18.0, speed=320.0, foe="pure", sign=-1.0,
-         seq=[("KVOCHUR_BELL", 14.0), ("PURE", 4.0)]),
+    # 克沃丘尔钟摆（真·尾滑/bell）：高 G 拉起至近垂直 → 收油 + 减速板把
+    # 空速打到零附近 → 卸载进入尾滑、机头自然翻落 → 下坠初段方向舵 kick →
+    # 恢复末段绕纵轴滚转（bell）后改平。用 3000 m 离地高度演示。
+    demo("KVOCHUR_BELL", "bell", 42.0, speed=220.0, foe="pure", sign=-1.0,
+         seq=[("KVOCHUR_BELL", 38.0), ("PURE", 4.0)]),
     # Herbst / J 转弯：拉起 45° → 绕速度矢量横滚 → 机头压回水平。
     demo("HERBST", "attacked", 18.0, speed=300.0, foe="pure", sign=-1.0,
          seq=[("HERBST", 14.0), ("PURE", 4.0)]),
@@ -247,7 +248,10 @@ class Pilot:
         self.core._phase_t += self.dt
         self.core._scissor_t -= self.dt
         act = self.core._execute(self.primitive, obs)
-        act.afterburner = 1.0 if act.throttle > 0.9 else 0.0
+        # 钟摆的加力/收油是机动时序的一部分（建立上仰后必须收油刹车），
+        # 演示脚本不能按油门反推加力把它覆盖掉。
+        if self.primitive != "KVOCHUR_BELL":
+            act.afterburner = 1.0 if act.throttle > 0.9 else 0.0
         return act
 
 
@@ -302,10 +306,11 @@ def _make_foe(kind: str, sign: float, gate: float | None = None) -> object:
 def record(name: str, cfg: dict, dof: int,
            dry: bool = False, trace: bool = False) -> dict:
     """录一段演示（dry=True 时只跑物理、不渲染），返回动作统计。"""
-    import imageio
-    import numpy as np
-    import pygame
-    from render import Renderer
+    if not dry:
+        import imageio
+        import numpy as np
+        import pygame
+        from render import Renderer
 
     seconds = cfg["secs"]
     world = World(
