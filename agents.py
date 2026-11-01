@@ -145,8 +145,10 @@ MANEUVERS: dict[str, Maneuver] = {
     ),
     # 克沃丘尔钟摆（真·尾滑/bell）：高 G 拉起至近垂直，速度降到零附近
     # 进入尾滑，机头自然甩过地平线，恢复末段加一次绕纵轴滚转（6DOF+TVC）。
+    # 它是按“近距 + 低速”设计的反击动作，速度门限只卡在失速速度出头一点：
+    # 拉起段按当时可用过载自适应（低速时只有 2–3 g，抬到 60–80° 即可）。
     "KVOCHUR_BELL": Maneuver(
-        "KVOCHUR_BELL", "COUNTER", min_speed_frac=1.60,
+        "KVOCHUR_BELL", "COUNTER", min_speed_frac=1.10,
         low_alt_need=2400.0, high_alt_need=2800.0,
     ),
     # 后倒变体：顶点后继续拉杆，机头朝机尾方向翻过一整圈、由朝上变朝下，
@@ -1441,7 +1443,10 @@ class TacticalAgent:
             # 必须同时满足“速度回来了”和“机头已经压下来”，避免反复抬头
             if obs.own_speed_frac < 1.40 or obs.own_gamma > math.radians(15.0):
                 return "SURVIVE", "UNLOAD"
-        elif obs.own_speed_frac < 1.20:
+        elif obs.own_speed_frac < 1.20 and self.primitive not in BELL_PRIMS:
+            # 钟摆例外：它就是靠“把速度打到失速附近 → 零速尾滑 → 翻落”来
+            # 诱使尾追机冲过头的，低速是动作的一部分而不是失控。恢复段由
+            # 它自己的分段拉平，边界/升限/过载疲劳这些生存判据照旧生效。
             return "SURVIVE", "UNLOAD"
         return None
 
@@ -1567,13 +1572,28 @@ class TacticalAgent:
         # 改判就只剩一个没有收益的抖动。
         if self._counter_commit > 0.0 and self._counter_plan is not None:
             return self._counter_plan
-        if obs.own_speed_frac < 1.35 or self.g_load > 0.85 or self._counter_cd > 0.0:
-            return None
         # “被咬尾”：目标几乎在正后方，而我的机头背离他。
         tail = (
             obs.foe_off_nose < math.radians(50.0)
             and obs.angle_off_nose > math.radians(110.0)
         )
+        # 钟摆的战术用法：对手还在尾后压近时，用一次“拉起上仰 → 零速尾滑
+        # → 钟摆翻落”把速度钉住，逼他从上方/侧方冲过头，再借能量恢复反咬。
+        # 它是按“近距离 + 低速”设计的反击动作：慢速缠斗时破 S / 剪刀那类
+        # 反转动作拉不出可用过载、做完还会直接失速，钟摆反而正好把尾追机
+        # 钉在原地。所以这一档单独放行，不等下面 1.35 倍速度门限；可用过载
+        # 只要求 2 g——拉起段按 own_n_avail 自适应，把机头抬到 60–80° 就够。
+        if (
+            tail
+            and 500.0 <= obs.dist < self.BELL_DIST
+            and obs.own_n_avail >= 2.0
+            and self._bell_cd <= 0.0
+            and self._defense_ok("KVOCHUR_BELL", obs)
+        ):
+            self._bell_cd = self.BELL_COOLDOWN
+            return self._start_counter("COUNTER_BELL", "KVOCHUR_BELL")
+        if obs.own_speed_frac < 1.35 or self.g_load > 0.85 or self._counter_cd > 0.0:
+            return None
         if not tail and sit.name != "DEFENSIVE":
             return None
         if obs.dist > 6000.0:
@@ -1581,18 +1601,6 @@ class TacticalAgent:
         # 反切：对手冲过头。
         if sit.overshoot and obs.dist < 900.0 and obs.own_speed_frac > 1.45:
             return self._start_counter("COUNTER_SNAP", "SCISSORS")
-        # 钟摆的战术用法：对手还在尾后压近（0.9–2.2 km）时，用一次
-        # “近垂直拉起 → 零速尾滑 → 钟摆翻落”把速度钉住，逼他从上方/侧方
-        # 冲过头，再借能量恢复反咬。它不是导弹规避动作。
-        if (
-            tail
-            and 900.0 <= obs.dist < self.BELL_DIST
-            and obs.own_n_avail >= HIGH_G_MIN_AVAIL
-            and self._bell_cd <= 0.0
-            and self._defense_ok("KVOCHUR_BELL", obs)
-        ):
-            self._bell_cd = self.BELL_COOLDOWN
-            return self._start_counter("COUNTER_BELL", "KVOCHUR_BELL")
         # 迎头化：破 S 的 180° 反转需要离地余量，且不能太慢。
         # energy_diff 的单位是 J/kg（v²/2 + g·z）：-15000 约等于 300 m/s 下
         # 20 m/s 的速度亏欠，再差就说明反转做完会被对手直接压住。
