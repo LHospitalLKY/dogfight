@@ -557,6 +557,51 @@ class Renderer:
             b = tuple(b[i] + (a[i] - b[i]) * t for i in range(3))
         return self._screen_of(a), self._screen_of(b)
 
+    @staticmethod
+    def _clip_line_to_rect(p0, p1, w: int, h: int):
+        """Liang-Barsky：把屏幕线段裁到视口内，返回 None 表示整条都在视口外。
+
+        近裁剪面附近的端点投影后会落到几千万像素外（地面网格最远能到
+        8.7e7 px），pygame 仍按整条线做光栅化，单条就要几十毫秒。
+        先在屏幕空间裁掉视口外的部分再画，方向不变，开销几乎为零。
+        """
+        x0, y0 = p0
+        x1, y1 = p1
+        dx, dy = x1 - x0, y1 - y0
+        t0, t1 = 0.0, 1.0
+        for p, q in (
+            (-dx, x0), (dx, w - 1 - x0),
+            (-dy, y0), (dy, h - 1 - y0),
+        ):
+            if p == 0.0:
+                if q < 0.0:
+                    return None
+                continue
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return None
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return None
+                if r < t1:
+                    t1 = r
+        if t0 >= t1:
+            return None
+        return (
+            (x0 + t0 * dx, y0 + t0 * dy),
+            (x0 + t1 * dx, y0 + t1 * dy),
+        )
+
+    def _clipped_line(self, surface, color, p0, p1, width: int = 1) -> None:
+        """画屏幕线段前先裁到 surface 视口，避免超长线拖慢软件光栅化。"""
+        sw, sh = surface.get_size()
+        seg = self._clip_line_to_rect(p0, p1, sw, sh)
+        if seg is not None:
+            pygame.draw.line(surface, color, seg[0], seg[1], width)
+
     def reset(self) -> None:
         self.trails = [[], []]
         self.trail_axes = [[], []]
@@ -790,13 +835,13 @@ class Renderer:
         while x <= half:
             seg = self._clip_segment((x, -half, z_floor), (x, half, z_floor))
             if seg:
-                pygame.draw.line(self.screen, GRID, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, GRID, seg[0], seg[1], 1)
             x += step
         y = -half
         while y <= half:
             seg = self._clip_segment((-half, y, z_floor), (half, y, z_floor))
             if seg:
-                pygame.draw.line(self.screen, GRID, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, GRID, seg[0], seg[1], 1)
             y += step
 
         corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
@@ -805,7 +850,7 @@ class Renderer:
             p1 = (*corners[(i + 1) % 4], z_floor)
             seg = self._clip_segment(p0, p1)
             if seg:
-                pygame.draw.line(self.screen, BORDER, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, BORDER, seg[0], seg[1], 1)
 
     def _draw_trails(self) -> None:
         for i, trail in enumerate(self.trails):
@@ -1306,7 +1351,7 @@ class Renderer:
             ground = self.to_screen((ac.x, ac.y, world.z_floor))
             if ground is not None:
                 dim = tuple(int(c * 0.45) for c in color)
-                pygame.draw.line(self.screen, dim, pos, ground, 1)
+                self._clipped_line(self.screen, dim, pos, ground, 1)
                 pygame.draw.circle(self.screen, dim, ground, max(2, int(4 * size)), 1)
 
             # 机体本身：按 psi/theta/phi 实时旋转，Su-57 与 F-16V 用各自模型。
@@ -1365,7 +1410,7 @@ class Renderer:
             for a, b in zip(screen, screen[1:]):
                 if a is None or b is None:
                     continue
-                pygame.draw.line(self.screen, dim, a, b, 1)
+                self._clipped_line(self.screen, dim, a, b, 1)
                 pygame.draw.circle(self.screen, color, (int(b[0]), int(b[1])), 2)
             end = screen[-1]
             if end is None:
