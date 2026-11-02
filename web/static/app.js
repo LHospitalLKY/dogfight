@@ -81,7 +81,7 @@
   renderer.setSize(window.innerWidth, window.innerHeight, false);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(C.SCENE_BG);
+  scene.background = new THREE.Color(rgbHex(RGB.SCENE_BG));
 
   const camera = new THREE.PerspectiveCamera(
     50, window.innerWidth / window.innerHeight, 1, 1e7
@@ -902,7 +902,7 @@
       setBox(this.radar, rs.radar);
       setBox(this.hud, rs.hud);
       setBox(this.weapon, rs.weapon);
-      const gap = clamp(rs.weapon.h - 76, 24, 34);
+      const gap = clamp(rs.weapon.h - 84, 22, 30);
       this.groupHeadL.style.left = "0px";
       this.groupNameL.style.left = "0px";
       this.groupHeadR.style.right = "0px";

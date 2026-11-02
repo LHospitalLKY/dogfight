@@ -354,6 +354,7 @@ html, body {
   position: absolute;
   font-size: 18px;
   line-height: 22px;
+  white-space: nowrap;
 }
 
 .station .wpn-left { left: 12px; }
