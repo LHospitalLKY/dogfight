@@ -57,7 +57,7 @@ PANEL_EDGE_HI = (72, 75, 84)
 GLASS_TINT = (18, 19, 23)
 GLASS_TINT_LIGHT = (14, 15, 19)
 GLASS_ALPHA_LIGHT = 90
-GLASS_ALPHA_MID = 110
+GLASS_ALPHA_MID = 100
 GLASS_ALPHA_HEAVY = 140
 # 座舱仪表底衬：雷达屏 / 抬头显示仪 / 武器栏三块面板共用同一种近黑深绿，
 # 只靠队伍色边线区分归属；压得够暗，3D 场景透不过来才不会和读数叠字。
@@ -114,6 +114,15 @@ NUM_TAU = 0.12
 
 # 静态件按 2× 预渲染再降采样，得到真正的 1 px 发丝线。
 STATIC_SCALE = 2
+
+# ---------- 透明磨砂玻璃（座舱三块面板） ----------
+# 取面板后方场景做降采样再放大的强模糊：1/8 分辨率即可得到均匀的磨砂感，
+# 又不会让读数和背景细节互相干扰。
+GLASS_BLUR_DIV = 8
+# 描边与顶部高光都压到半透明，玻璃边才不会像金属框那样抢视线。
+GLASS_EDGE_ALPHA = 150
+GLASS_HIGHLIGHT_ALPHA = 54
+GLASS_BAR_ALPHA = 220
 
 
 def ease_out_cubic(t: float) -> float:

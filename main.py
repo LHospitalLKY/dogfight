@@ -795,6 +795,8 @@ def run_record(
     f16_radar: str = "always",
     su57_radar: str = "always",
     awacs: bool = True,
+    start: float = 0.0,
+    size: tuple[int, int] = (1280, 800),
 ) -> None:
     """无窗口渲染并录制视频，同时按固定间隔采样全局轨迹。"""
     import os
@@ -811,7 +813,7 @@ def run_record(
         baseline, seed=seed, f16_radar=f16_radar, su57_radar=su57_radar,
     )
     # 录制要走 SDL dummy 驱动，没有 GL 上下文，直接用 CPU 渲染保证帧可读。
-    renderer = Renderer(follow=follow, follow_dist=1200.0, gpu=False, size=(1280, 800))
+    renderer = Renderer(follow=follow, follow_dist=1200.0, gpu=False, size=size)
     steps_per_frame = max(1, round(1.0 / (fps * PHYSICS_DT)))
     actions = [Action(), Action()]
     steps = 0
@@ -859,9 +861,10 @@ def run_record(
                     high_g_state[i] = hi
                 if world.result is not None:
                     break
-            renderer.draw(world, False, agents)
-            frame = pygame.surfarray.array3d(renderer.screen).swapaxes(0, 1)
-            writer.append_data(np.ascontiguousarray(frame))
+            if world.t >= start:
+                renderer.draw(world, False, agents)
+                frame = pygame.surfarray.array3d(renderer.screen).swapaxes(0, 1)
+                writer.append_data(np.ascontiguousarray(frame))
             while world.t >= next_sample:
                 for i, row in enumerate(_sample_state(world)):
                     samples[i].append(row)
@@ -949,6 +952,20 @@ def run_window(
     pygame.quit()
 
 
+def _parse_size(text: str) -> tuple[int, int]:
+    """解析 WxH（兼容 × 与空格），用于 --record-size。"""
+    norm = text.lower().replace("×", "x").replace(" ", "")
+    try:
+        w, h = (int(v) for v in norm.split("x"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"分辨率格式应为 WxH，例如 1920x1080：{text}"
+        ) from exc
+    if w < 320 or h < 240:
+        raise argparse.ArgumentTypeError(f"分辨率过小：{text}")
+    return w, h
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dogfight M2 6DOF + 战术层")
     parser.add_argument("--headless", action="store_true", help="不打开窗口，直接跑一局")
@@ -971,6 +988,14 @@ def main() -> None:
     )
     parser.add_argument("--track-interval", type=float, default=10.0, help="轨迹采样间隔（秒）")
     parser.add_argument("--fps", type=int, default=20, help="录制帧率")
+    parser.add_argument(
+        "--record-size", default="1280x800", metavar="WxH",
+        help="录制分辨率（默认 1280x800，例如 1920x1080）",
+    )
+    parser.add_argument(
+        "--start", type=float, default=0.0,
+        help="录制起始时间（秒）：之前的时间只跑仿真、不渲染",
+    )
     parser.add_argument(
         "--seed", type=int, default=None,
         help="固定开局随机占位的随机种子（复现实验用；默认每次启动随机）",
@@ -1007,6 +1032,7 @@ def main() -> None:
             args.seconds, args.baseline, args.dof, args.record,
             args.track_plot, args.follow, args.track_interval, args.fps,
             args.seed, args.f16_radar, args.su57_radar, args.awacs,
+            args.start, _parse_size(args.record_size),
         )
     elif args.compare_radar:
         run_radar_compare(

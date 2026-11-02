@@ -54,6 +54,11 @@ from theme import (  # noqa: E402
     FS_H1,
     FS_SMALL,
     FS_TINY,
+    GLASS_ALPHA_MID,
+    GLASS_BAR_ALPHA,
+    GLASS_BLUR_DIV,
+    GLASS_EDGE_ALPHA,
+    GLASS_HIGHLIGHT_ALPHA,
     GLASS_TINT,
     GRID,
     HUD_DIM,
@@ -73,7 +78,6 @@ from theme import (  # noqa: E402
     SCENE_BG,
     SCENE_STRIPE,
     STATIC_SCALE,
-    STATION_ALPHA,
     STATION_FILL,
     STRIPE_ALPHA,
     STRIPE_STEP,
@@ -876,6 +880,8 @@ class Renderer:
         self._vbox_fade: dict[int, tuple[pygame.Surface, pygame.Surface]] = {}
         # 纯色半透明底衬缓存（HUD 玻璃底、雷达屏底、武器页底）。
         self._alpha_cache: dict[tuple, pygame.Surface] = {}
+        # 磨砂玻璃的圆角遮罩与压暗渐变：只与面板尺寸有关，按尺寸缓存。
+        self._glass_cache: dict[tuple, pygame.Surface] = {}
         self._cam_ready = False
         # 跟随模式：相机锁定某架飞机（默认关闭，仍取两机中点）。
         self.follow = follow
@@ -935,6 +941,7 @@ class Renderer:
         self._overlay_dirty.clear()
         self._alpha_cache.clear()
         self._chrome_cache.clear()
+        self._glass_cache.clear()
         self._sil_cache.clear()
         self._backdrop = self._build_backdrop()
 
@@ -2641,18 +2648,22 @@ class Renderer:
         self.screen.blit(surf, rect.topleft)
 
     def _panel_bg(
-        self, rect: pygame.Rect, fill, *, alpha: int | None = None,
+        self, rect: pygame.Rect, fill=None, *, alpha: int | None = None,
         edge=None, radius: int = RADIUS_PANEL,
         bar: tuple[str, tuple, int] | None = None,
     ) -> None:
         """统一的静态面板底：外投影 + 竖向渐变底衬 + 描边 + 内高光 + 强调条。
+
+        fill=None 时只画投影、描边与高光，中心保持透明，供磨砂玻璃面板
+        在模糊底图上叠一层“玻璃边框”。其余情况仍是原来的不透明渐变底衬。
 
         按 STATIC_SCALE 预渲染再 smoothscale：静态件在 1× 下得到真正的
         1 px 发丝线，且同尺寸/同配色的面板直接复用缓存，每帧只做一次 blit。
         外投影与底衬渐变都烘焙在同一份缓存里，逐帧成本为零；阴影让面板
         从场景上“浮”起来，顶亮底暗的底衬则避免大块纯色显得死板。
         """
-        key = (rect.w, rect.h, tuple(fill), alpha, edge, radius, bar, STATIC_SCALE)
+        key = (rect.w, rect.h, None if fill is None else tuple(fill),
+               alpha, edge, radius, bar, STATIC_SCALE)
         surf = self._chrome_cache.get(key)
         if surf is None:
             s = STATIC_SCALE
@@ -2673,23 +2684,33 @@ class Renderer:
                     border_radius=radius * s + grow,
                 )
             # 2) 底衬：竖向渐变按行填充，再用圆角蒙版裁出圆角。
-            a = alpha if alpha is not None else (fill[3] if len(fill) > 3 else 255)
-            c_top = tuple(int(v) for v in fill[:3])
-            c_bot = tuple(int(v * PANEL_GRAD_BOT) for v in fill[:3])
-            grad = pygame.Surface((w, h), pygame.SRCALPHA)
-            for row in range(h):
-                t = row / max(1, h - 1)
-                col = tuple(
-                    int(c_top[i] + (c_bot[i] - c_top[i]) * t) for i in range(3)
+            #    fill=None 时跳过填充，只保留上沿高光给玻璃边框用。
+            hi = (255, 255, 255, GLASS_HIGHLIGHT_ALPHA)
+            if fill is not None:
+                a = alpha if alpha is not None else (
+                    fill[3] if len(fill) > 3 else 255
                 )
-                pygame.draw.line(grad, (*col, a), (0, row), (w, row))
-            mask = pygame.Surface((w, h), pygame.SRCALPHA)
-            pygame.draw.rect(
-                mask, (255, 255, 255, 255), mask.get_rect(),
-                border_radius=radius * s,
-            )
-            grad.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-            big.blit(grad, (m, m))
+                c_top = tuple(int(v) for v in fill[:3])
+                c_bot = tuple(int(v * PANEL_GRAD_BOT) for v in fill[:3])
+                grad = pygame.Surface((w, h), pygame.SRCALPHA)
+                for row in range(h):
+                    t = row / max(1, h - 1)
+                    col = tuple(
+                        int(c_top[i] + (c_bot[i] - c_top[i]) * t)
+                        for i in range(3)
+                    )
+                    pygame.draw.line(grad, (*col, a), (0, row), (w, row))
+                mask = pygame.Surface((w, h), pygame.SRCALPHA)
+                pygame.draw.rect(
+                    mask, (255, 255, 255, 255), mask.get_rect(),
+                    border_radius=radius * s,
+                )
+                grad.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+                big.blit(grad, (m, m))
+                hi = tuple(
+                    min(255, c_top[i] + max(6, int(c_top[i] * 0.18)))
+                    for i in range(3)
+                ) + (a,)
             # 3) 描边：队伍色/中性色 2 px（1× 下即 1 px）。
             if edge is not None:
                 pygame.draw.rect(
@@ -2699,10 +2720,8 @@ class Renderer:
             # 4) 内高光：顶边内侧一条比底衬亮 12% 的实色线，模拟受光的上沿；
             # 这里不用半透明白叠画，因为 pygame.draw 是覆写而非混合，会打穿
             # 底衬的 alpha。
-            hi = tuple(min(255, c_top[i] + max(6, int(c_top[i] * 0.18)))
-                       for i in range(3))
             pygame.draw.line(
-                big, (*hi, a), (m + radius * s, m + 2 * s),
+                big, hi, (m + radius * s, m + 2 * s),
                 (m + w - radius * s, m + 2 * s), s,
             )
             if bar is not None:
@@ -2718,6 +2737,112 @@ class Renderer:
             self._chrome_cache[key] = surf
         self.screen.blit(surf, (rect.x - PANEL_SHADOW_PAD,
                                 rect.y - PANEL_SHADOW_PAD))
+
+    def _glass_panel(
+        self, rect: pygame.Rect, *, edge, bar=None,
+        radius: int = RADIUS_PANEL, alpha: int = GLASS_ALPHA_MID,
+    ) -> None:
+        """透明磨砂玻璃面板：模糊面板后方的场景，再压暗、圆角、描边。
+
+        做法是取屏幕对应区域 → 缩到 1/GLASS_BLUR_DIV → 放大回原尺寸，
+        用降采样-升采样近似高斯模糊（比逐像素卷积便宜一个量级），
+        然后叠一层顶亮底暗的暗色渐变，最后用圆角遮罩裁边。
+        GPU 模式下 HUD 画在透明面、拿不到场景像素，退化为半透明底衬。
+        """
+        if self.gpu:
+            self._panel_bg(
+                rect, GLASS_TINT, alpha=alpha, edge=edge,
+                radius=radius, bar=bar,
+            )
+            return
+        clip = rect.clip(self.screen.get_rect())
+        if clip.w < 8 or clip.h < 8:
+            return
+        region = self.screen.subsurface(clip).copy()
+        div = GLASS_BLUR_DIV
+        small = pygame.transform.smoothscale(
+            region, (max(2, clip.w // div), max(2, clip.h // div))
+        )
+        blur = pygame.Surface(clip.size, pygame.SRCALPHA)
+        blur.blit(pygame.transform.smoothscale(small, clip.size), (0, 0))
+        blur.blit(self._glass_tint(clip.w, clip.h, alpha), (0, 0))
+        blur.blit(self._glass_sheen(clip.w, clip.h), (0, 0))
+        blur.blit(self._glass_noise(clip.w, clip.h), (0, 0))
+        blur.blit(
+            self._glass_mask(clip.w, clip.h, radius), (0, 0),
+            special_flags=pygame.BLEND_RGBA_MULT,
+        )
+        self.screen.blit(blur, clip.topleft)
+        # 投影、描边、上沿高光与队伍色强调条仍走静态 chrome。
+        self._panel_bg(rect, None, edge=edge, radius=radius, bar=bar)
+
+    def _glass_tint(self, w: int, h: int, alpha: int) -> pygame.Surface:
+        """玻璃的压暗渐变：顶部略浅、底部略深，模拟玻璃厚度与受光。"""
+        key = ("tint", w, h, alpha)
+        surf = self._glass_cache.get(key)
+        if surf is None:
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+            a0 = max(0, alpha - 22)
+            a1 = min(255, alpha + 22)
+            for row in range(h):
+                t = row / max(1, h - 1)
+                a = int(a0 + (a1 - a0) * t)
+                pygame.draw.line(
+                    surf, (*GLASS_TINT, a), (0, row), (w, row)
+                )
+            self._glass_cache[key] = surf
+        return surf
+
+    def _glass_sheen(self, w: int, h: int) -> pygame.Surface:
+        """玻璃反光：顶部一抹由亮到暗的高光带 + 一条斜向反光。"""
+        key = ("sheen", w, h)
+        surf = self._glass_cache.get(key)
+        if surf is None:
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+            band = max(6, int(h * 0.42))
+            for row in range(band):
+                t = row / max(1, band - 1)
+                a = int(26 * (1.0 - t))
+                pygame.draw.line(
+                    surf, (255, 255, 255, a), (0, row), (w, row)
+                )
+            pygame.draw.polygon(
+                surf, (255, 255, 255, 13),
+                [(int(w * 0.62), 0), (int(w * 0.86), 0),
+                 (int(w * 0.30), h), (int(w * 0.06), h)],
+            )
+            self._glass_cache[key] = surf
+        return surf
+
+    def _glass_noise(self, w: int, h: int) -> pygame.Surface:
+        """磨砂颗粒：低透明度噪点，让大面积玻璃不至于像一块纯色渐变。"""
+        key = ("noise", w, h)
+        surf = self._glass_cache.get(key)
+        if surf is None:
+            rng = np.random.default_rng(7)
+            gray = rng.integers(128, 192, (h, w, 1), dtype=np.uint8)
+            alpha = rng.integers(4, 10, (h, w, 1), dtype=np.uint8)
+            rgba = np.concatenate((gray, gray, gray, alpha), axis=2)
+            surf = pygame.image.frombuffer(
+                np.ascontiguousarray(rgba).tobytes(), (w, h), "RGBA"
+            )
+            self._glass_cache[key] = surf
+        return surf
+
+    def _glass_mask(self, w: int, h: int, radius: int) -> pygame.Surface:
+        """圆角遮罩：2× 生成再降采样，1× 下边缘也有抗锯齿。"""
+        key = ("mask", w, h, radius)
+        surf = self._glass_cache.get(key)
+        if surf is None:
+            s = STATIC_SCALE
+            big = pygame.Surface((w * s, h * s), pygame.SRCALPHA)
+            pygame.draw.rect(
+                big, (255, 255, 255, 255), big.get_rect(),
+                border_radius=radius * s,
+            )
+            surf = pygame.transform.smoothscale(big, (w, h))
+            self._glass_cache[key] = surf
+        return surf
 
     def _smooth(self, key: str, target: float) -> float:
         """一阶插值（τ=NUM_TAU）：速度/高度/距离平滑过渡。
@@ -2747,11 +2872,12 @@ class Renderer:
 
         # ---- 雷达屏 ----
         # 页头一行交代“谁在看 / 雷达开没开 / 火控到了哪一步”，锁定过程用页头
-        # 下方一条细进度条表示，不额外占一行高度。三块面板用同一种深底，
-        # 只在边线上带队伍色，看起来是一套仪表而不是三张不同的卡片。
-        self._panel_bg(
-            radar, STATION_FILL, alpha=STATION_ALPHA,
-            edge=team, bar=("top", _mix((30, 32, 36), team, 0.30), 3),
+        # 下方一条细进度条表示，不额外占一行高度。三块面板统一用磨砂玻璃底，
+        # 只在边线与顶部强调条上带队伍色，看起来是一套仪表而不是三张卡片。
+        glass_edge = (*_mix(team, (255, 255, 255), 0.40), GLASS_EDGE_ALPHA)
+        self._glass_panel(
+            radar, edge=glass_edge,
+            bar=("top", (*team, GLASS_BAR_ALPHA), 3),
         )
         title = self.font_small.render(
             f"{ac.spec.name} {'RDR ON' if ac.radar_on else 'RDR SIL'}",
@@ -2782,7 +2908,7 @@ class Renderer:
 
         # ---- 抬头显示仪 ----
         # 顶部一条状态带放血量与过载，下面是航向/俯仰/速度/高度。
-        self._panel_bg(hud, STATION_FILL, alpha=STATION_ALPHA, edge=team)
+        self._glass_panel(hud, edge=glass_edge)
         self._draw_hud_status(
             ac, pygame.Rect(hud.x, hud.y, hud.w, self.HUD_STATUS_H)
         )
@@ -2832,7 +2958,7 @@ class Renderer:
         bg = (7, 15, 11)
         grid = (34, 88, 58)
         dim = (86, 170, 118)
-        self._alpha_rect(rect, bg, 90)
+        self._alpha_rect(rect, bg, 55)
         pygame.draw.rect(self.screen, grid, rect, 1)
 
         cx = rect.centerx
@@ -3499,7 +3625,10 @@ class Renderer:
         """
         ac = world.acs[i]
         team = TEAM_COLORS[i]
-        self._panel_bg(rect, STATION_FILL, alpha=STATION_ALPHA, edge=team)
+        self._glass_panel(
+            rect, edge=(*_mix(team, (255, 255, 255), 0.40), GLASS_EDGE_ALPHA),
+            bar=("top", (*team, GLASS_BAR_ALPHA), 2),
+        )
         self.screen.blit(
             self.font_small.render("WPN", True, (104, 202, 150), tracking=1),
             (rect.x + 8, rect.y + 4),
