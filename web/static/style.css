@@ -32,6 +32,12 @@ html, body {
   display: block;
 }
 
+/* 固定分辨率采集：画布按 1920×1080 渲染，预览按原比例内嵌显示 */
+#scene.capture-mode {
+  object-fit: contain;
+  background: #101114;
+}
+
 #stripes {
   position: absolute;
   inset: 0;
@@ -56,6 +62,15 @@ html, body {
   );
 }
 
+/* 3D 场景上的屏幕空间标签（导弹名称、机体旁的战术/机动） */
+#labels {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 #hud {
   position: absolute;
   inset: 0;
@@ -69,9 +84,13 @@ html, body {
 .glass {
   position: absolute;
   border-radius: 12px;
-  background: rgba(5, 15, 11, 0.84);
-  border: 1px solid rgba(82, 96, 114, 0.58);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.30);
+  background: rgba(9, 20, 16, 0.52);
+  border: 1px solid rgba(120, 140, 158, 0.42);
+  box-shadow:
+    0 4px 18px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  -webkit-backdrop-filter: blur(10px) saturate(150%);
+  backdrop-filter: blur(10px) saturate(150%);
   box-sizing: border-box;
 }
 
@@ -98,8 +117,13 @@ html, body {
   height: 218px;
   margin-left: -220px;
   border-radius: 12px;
-  background: rgba(5, 15, 11, 0.84);
-  border: 1px solid rgba(82, 96, 114, 0.58);
+  background: rgba(9, 20, 16, 0.52);
+  border: 1px solid rgba(120, 140, 158, 0.42);
+  -webkit-backdrop-filter: blur(10px) saturate(150%);
+  backdrop-filter: blur(10px) saturate(150%);
+  box-shadow:
+    0 4px 18px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
   box-sizing: border-box;
   overflow: hidden;
 }
@@ -199,8 +223,10 @@ html, body {
   min-width: 120px;
   padding: 5px 16px 7px;
   border-radius: 6px;
-  background: #17181c;
-  border: 1px solid #2b2d33;
+  background: rgba(20, 24, 30, 0.58);
+  border: 1px solid rgba(120, 140, 158, 0.38);
+  -webkit-backdrop-filter: blur(9px) saturate(150%);
+  backdrop-filter: blur(9px) saturate(150%);
   box-sizing: border-box;
   font-size: 14px;
   color: #eef3fa;
@@ -230,10 +256,14 @@ html, body {
 .station {
   position: absolute;
   border-radius: 12px;
-  background: rgba(5, 15, 11, 0.84);
-  border: 1px solid rgba(var(--team-rgb), 0.60);
+  background: rgba(9, 20, 16, 0.50);
+  border: 1px solid rgba(var(--team-rgb), 0.62);
+  -webkit-backdrop-filter: blur(11px) saturate(155%);
+  backdrop-filter: blur(11px) saturate(155%);
   box-sizing: border-box;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  box-shadow:
+    0 4px 18px rgba(0, 0, 0, 0.32),
+    inset 0 1px 0 rgba(255, 255, 255, 0.10);
   overflow: hidden;
 }
 

@@ -50,6 +50,25 @@
   const REF_LENGTH = 20.1;
   const TRAIL_FADE = 12.0;
   const TAU = Math.PI * 2;
+  // 高过载特效阈值；干扰物寿命与 sim.py 的 CHAFF_LIFE / FLARE_LIFE 一致，
+  // 前端只用于视觉包络，不参与物理。
+  const HIGH_G_ON = 4.5;
+  // 暂时关闭高 G 蒸汽特效（翼尖/尾段雾带），改为 true 即可恢复。
+  const HIGH_G_EFFECT = false;
+  const CHAFF_LIFE = 4.0;
+  const FLARE_LIFE = 2.5;
+
+  // ISA 标准大气下的当地声速，用来判断飞机是否从亚音速突破音速。
+  function speedOfSound(alt) {
+    const h = clamp(alt, 0.0, 32000.0);
+    let temp;
+    if (h <= 11000.0) temp = 288.15 - 0.0065 * h;
+    else if (h <= 20000.0) temp = 216.65;
+    else temp = 216.65 + 0.001 * (h - 20000.0);
+    return Math.sqrt(1.4 * 287.053 * temp);
+  }
+  // 迷彩每次加载随机生成一套花纹（同一页面内保持稳定）。
+  const CAMO_SEED = Math.floor(Math.random() * 1e9);
 
   function rgbHex(rgb) {
     return "#" + rgb.map((v) => Math.round(clamp(v, 0, 255)).toString(16).padStart(2, "0")).join("");
@@ -69,6 +88,29 @@
 
   const w2t = (p) => new THREE.Vector3(p[0], p[2], -p[1]);
 
+  // ---------- 1080p 离屏/固定分辨率采集 ----------
+  // 用法：/?capture=1920x1080&frames=90&fps=30&delay=5&name=j1
+  // 采集模式下 WebGL 画布按固定分辨率渲染（与面板像素无关），
+  // 渲染完成后把画面合成到离屏 2D 画布再 POST 给服务端，
+  // 由 /api/capture 落盘、/api/capture/encode 用 ffmpeg 编码 MP4。
+  const CAPTURE = (() => {
+    const q = new URLSearchParams(window.location.search);
+    const raw = q.get("capture") || q.get("res");
+    if (!raw || raw === "0") return null;
+    const m = /^(\d+)[xX×](\d+)$/.exec(raw);
+    const w = m ? +m[1] : 1920;
+    const h = m ? +m[2] : 1080;
+    if (!(w > 0 && h > 0)) return null;
+    return {
+      w, h,
+      delay: Math.max(0.0, parseFloat(q.get("delay") || "0") || 0.0),
+      frames: Math.max(1, parseInt(q.get("frames") || "1", 10) || 1),
+      fps: Math.max(1.0, parseFloat(q.get("fps") || "30") || 30.0),
+      name: (q.get("name") || "shot").replace(/[^\w.-]+/g, "_"),
+      encode: q.get("encode") !== "0",
+    };
+  })();
+
   // ---------- three.js 场景 ----------
   const canvas = document.getElementById("scene");
   const renderer = new THREE.WebGLRenderer({
@@ -77,14 +119,17 @@
     alpha: false,
     powerPreference: "high-performance",
   });
-  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  const VIEW_W = CAPTURE ? CAPTURE.w : window.innerWidth;
+  const VIEW_H = CAPTURE ? CAPTURE.h : window.innerHeight;
+  renderer.setPixelRatio(CAPTURE ? 1 : Math.min(2, window.devicePixelRatio || 1));
+  renderer.setSize(VIEW_W, VIEW_H, false);
+  if (CAPTURE) canvas.classList.add("capture-mode");
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(rgbHex(RGB.SCENE_BG));
 
   const camera = new THREE.PerspectiveCamera(
-    50, window.innerWidth / window.innerHeight, 1, 1e7
+    50, VIEW_W / VIEW_H, 1, 1e7
   );
 
   const ambient = new THREE.AmbientLight(0xffffff, 0.50);
@@ -146,13 +191,41 @@
     "SU-57": "/api/models/su57.obj",
     "F-16V": "/api/models/f16.obj",
   };
+  // 导弹模型由服务端按真实弹长导出：弹头在局部原点、弹体沿 +Z 向弹尾延伸。
+  const MISSILE_URLS = {
+    "R-73": "/api/models/r73.obj",
+    "AIM-9X": "/api/models/aim9.obj",
+    "R-77-1": "/api/models/r77.obj",
+    "AIM-120C": "/api/models/aim120.obj",
+  };
   const MODEL_GEOS = {};
+  const MISSILE_GEOS = {};
   const MODELS_READY = (async () => {
-    const jobs = Object.entries(MODEL_URLS).map(async ([name, url]) => {
-      const res = await fetch(url, { cache: "no-store" });
-      const text = await res.text();
-      MODEL_GEOS[name] = parseOBJ(text);
-    });
+    // 模型 URL 带上服务端导出版本号：MODEL_TAG 一升级，浏览器必定重新取文件，
+    // 不会因为旧缓存继续显示旧模型（例如已修复的透明导弹）。
+    let ver = "";
+    try {
+      const meta = await (await fetch("/api/models/meta.json", { cache: "no-store" })).json();
+      if (meta && meta.version) ver = `?v=${encodeURIComponent(meta.version)}`;
+    } catch (_) {
+      /* 元数据缺失时退回无参数 URL，由服务端 no-store 兜底 */
+    }
+    const jobs = [
+      ...Object.entries(MODEL_URLS).map(async ([name, url]) => {
+        const res = await fetch(url + ver, { cache: "no-store" });
+        const text = await res.text();
+        MODEL_GEOS[name] = parseOBJ(text);
+      }),
+      ...Object.entries(MISSILE_URLS).map(async ([name, url]) => {
+        const res = await fetch(url + ver, { cache: "no-store" });
+        const text = await res.text();
+        const geo = parseOBJ(text);
+        assignMissileUV(geo.body);
+        missileShared.add(geo.body);
+        missileShared.add(geo.canopy);
+        MISSILE_GEOS[name] = geo;
+      }),
+    ];
     await Promise.all(jobs).catch((err) => console.error("模型加载失败", err));
   })();
 
@@ -199,12 +272,246 @@
     return out;
   }
 
-  const bodyMats = RGB.TEAM.map((team) => new THREE.MeshStandardMaterial({
-    color: new THREE.Color(rgbHex(mix(RGB.CLAY_LIT, team, 0.10))),
-    roughness: 0.70,
-    metalness: 0.05,
-    side: THREE.DoubleSide,
-  }));
+  // 导弹贴图用圆柱坐标：u 为周向角、v 为沿弹轴的归一化位置（0 弹头、1 弹尾）。
+  // 弹体本身沿 +Z 生长，包围盒即可给出弹长，无需额外元数据。
+  function assignMissileUV(geo) {
+    geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+    const len = Math.max(1e-6, bb.max.z - bb.min.z);
+    const pos = geo.attributes.position;
+    const uv = new Float32Array(pos.count * 2);
+    for (let i = 0; i < pos.count; i += 1) {
+      const x = pos.getX(i);
+      const y = pos.getY(i);
+      const z = pos.getZ(i);
+      uv[i * 2] = (Math.atan2(y, x) + Math.PI) / TAU;
+      uv[i * 2 + 1] = clamp((z - bb.min.z) / len, 0.0, 1.0);
+    }
+    geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  }
+
+  // ---------- 机体迷彩 ----------
+  // OBJ 没有 UV，用物体空间三平面投影在片元着色器里采样迷彩贴图；
+  // 花纹参考 assets/flighter 的示意图：F-16V 为空优灰蓝软边双色迷彩，
+  // SU-57 为浅灰底 + 蓝灰数码像素迷彩。贴图按机型、随机种子生成，
+  // 机头雷达罩单独压深，保留机体识别特征。
+  const CAMO_TEX_SIZE = 512;
+
+  function camoRng(seed) {
+    let s = (seed >>> 0) || 1;
+    return () => {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  function camoCanvas() {
+    const cv = document.createElement("canvas");
+    cv.width = CAMO_TEX_SIZE;
+    cv.height = CAMO_TEX_SIZE;
+    return cv;
+  }
+
+  // 贴图边缘无缝平铺：同一笔在 3x3 邻域重复绘制。
+  function wrapDraw(ctx, x, y, fn) {
+    for (const dx of [-CAMO_TEX_SIZE, 0, CAMO_TEX_SIZE]) {
+      for (const dy of [-CAMO_TEX_SIZE, 0, CAMO_TEX_SIZE]) {
+        fn(x + dx, y + dy);
+      }
+    }
+  }
+
+  function f16CamoTexture(seed) {
+    const rnd = camoRng(seed);
+    const cv = camoCanvas();
+    const g = cv.getContext("2d");
+    const S = CAMO_TEX_SIZE;
+    g.fillStyle = "#c2cad1";
+    g.fillRect(0, 0, S, S);
+    // 蒙皮细碎色差
+    for (let i = 0; i < 5000; i += 1) {
+      const v = 150 + Math.floor(rnd() * 76);
+      g.fillStyle = `rgba(${v},${v + 4},${v + 9},${0.05 + rnd() * 0.08})`;
+      const w = 1 + rnd() * 5;
+      g.fillRect(rnd() * S, rnd() * S, w, w);
+    }
+    // 深灰蓝大斑块：若干软边圆叠出不规则软边，符合空优双色迷彩
+    for (let i = 0; i < 15; i += 1) {
+      const cx = rnd() * S;
+      const cy = rnd() * S;
+      const scale = 62 + rnd() * 112;
+      const lobes = 5 + Math.floor(rnd() * 5);
+      for (let k = 0; k < lobes; k += 1) {
+        const ox = (rnd() - 0.5) * scale * 1.5;
+        const oy = (rnd() - 0.5) * scale * 1.5;
+        const r = scale * (0.34 + rnd() * 0.36);
+        wrapDraw(g, cx, cy, (x, y) => {
+          const grd = g.createRadialGradient(x + ox, y + oy, r * 0.5, x + ox, y + oy, r);
+          grd.addColorStop(0, "rgba(60, 74, 88, 0.95)");
+          grd.addColorStop(0.70, "rgba(63, 77, 91, 0.82)");
+          grd.addColorStop(1, "rgba(66, 80, 94, 0)");
+          g.fillStyle = grd;
+          g.beginPath();
+          g.arc(x + ox, y + oy, r, 0, TAU);
+          g.fill();
+        });
+      }
+    }
+    // 少量更浅的补块，避免整片深灰
+    for (let i = 0; i < 8; i += 1) {
+      const cx = rnd() * S;
+      const cy = rnd() * S;
+      const r = 36 + rnd() * 78;
+      wrapDraw(g, cx, cy, (x, y) => {
+        const grd = g.createRadialGradient(x, y, r * 0.45, x, y, r);
+        grd.addColorStop(0, "rgba(224, 230, 235, 0.55)");
+        grd.addColorStop(1, "rgba(224, 230, 235, 0)");
+        g.fillStyle = grd;
+        g.beginPath();
+        g.arc(x, y, r, 0, TAU);
+        g.fill();
+      });
+    }
+    // 极淡的蒙皮分块线
+    g.strokeStyle = "rgba(58, 70, 82, 0.16)";
+    g.lineWidth = 1;
+    for (let i = 0; i < 26; i += 1) {
+      const x = rnd() * S;
+      const y = rnd() * S;
+      const len = 30 + rnd() * 90;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(x + (rnd() < 0.5 ? len : 0), y + (rnd() < 0.5 ? len : 0));
+      g.stroke();
+    }
+    return cv;
+  }
+
+  function su57CamoTexture(seed) {
+    const rnd = camoRng(seed);
+    const cv = camoCanvas();
+    const g = cv.getContext("2d");
+    const S = CAMO_TEX_SIZE;
+    g.fillStyle = "#d0d5da";
+    g.fillRect(0, 0, S, S);
+    for (let i = 0; i < 4200; i += 1) {
+      const v = 165 + Math.floor(rnd() * 64);
+      g.fillStyle = `rgba(${v},${v + 4},${v + 8},${0.04 + rnd() * 0.07})`;
+      const w = 1 + rnd() * 4;
+      g.fillRect(rnd() * S, rnd() * S, w, w);
+    }
+    // 数码像素迷彩：椭圆范围内按 8 px 网格铺色块，边缘呈阶梯状
+    const shades = ["#a9b3be", "#8d99a6", "#6f7b89"];
+    for (let i = 0; i < 24; i += 1) {
+      const cx = rnd() * S;
+      const cy = rnd() * S;
+      const rx = 48 + rnd() * 98;
+      const ry = 42 + rnd() * 86;
+      g.fillStyle = shades[Math.floor(rnd() * shades.length)];
+      const step = 8;
+      for (let px = -rx; px <= rx; px += step) {
+        for (let py = -ry; py <= ry; py += step) {
+          const d = (px * px) / (rx * rx) + (py * py) / (ry * ry);
+          if (d > 1.0) continue;
+          if (rnd() > 0.94 - d * 0.62) continue;
+          const w = step * (rnd() < 0.22 ? 2 : 1);
+          wrapDraw(g, cx, cy, (x, y) => {
+            g.fillRect(x + px, y + py, w, step);
+          });
+        }
+      }
+    }
+    // 散落的单像素块，让边缘更像真实数码迷彩
+    for (let i = 0; i < 500; i += 1) {
+      g.fillStyle = shades[Math.floor(rnd() * shades.length)];
+      g.globalAlpha = 0.35 + rnd() * 0.5;
+      const s = 4 + Math.floor(rnd() * 3) * 4;
+      g.fillRect(Math.floor(rnd() * S), Math.floor(rnd() * S), s, s);
+    }
+    g.globalAlpha = 1;
+    return cv;
+  }
+
+  const CAMO_SPECS = {
+    "F-16V": { draw: f16CamoTexture, tile: 7.4, len: 15.06, seed: 3,
+      nose: [64, 70, 78], noseAmt: 1.0, tint: 0.12 },
+    "SU-57": { draw: su57CamoTexture, tile: 9.2, len: 20.1, seed: 17,
+      nose: [148, 156, 165], noseAmt: 0.85, tint: 0.12 },
+  };
+  const camoTextures = {};
+  const camoMaterials = {};
+
+  function camoTexture(name) {
+    if (!camoTextures[name]) {
+      const spec = CAMO_SPECS[name];
+      const tex = new THREE.CanvasTexture(spec.draw(CAMO_SEED + spec.seed));
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.anisotropy = 4;
+      tex.needsUpdate = true;
+      camoTextures[name] = tex;
+    }
+    return camoTextures[name];
+  }
+
+  function camoMaterial(team, name) {
+    const key = `${team}|${name}`;
+    const cached = camoMaterials[key];
+    if (cached) return cached;
+    const part = CAMO_SPECS[name] || CAMO_SPECS["SU-57"];
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(rgbHex(mix([255, 255, 255], RGB.TEAM[team], part.tint))),
+      roughness: 0.66,
+      metalness: 0.08,
+      side: THREE.DoubleSide,
+    });
+    const noseVec = new THREE.Vector3(
+      part.nose[0] / 255, part.nose[1] / 255, part.nose[2] / 255
+    );
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uCamoTex = { value: camoTexture(name) };
+      shader.uniforms.uCamoScale = { value: 1.0 / part.tile };
+      shader.uniforms.uCamoLen = { value: part.len };
+      shader.uniforms.uNoseColor = { value: noseVec };
+      shader.uniforms.uNoseAmt = { value: part.noseAmt };
+      shader.vertexShader = `varying vec3 vCamoPos;
+varying vec3 vCamoNrm;
+${shader.vertexShader}`;
+      shader.vertexShader = shader.vertexShader.replace(
+        "#include <begin_vertex>",
+        `#include <begin_vertex>
+  vCamoPos = position;
+  vCamoNrm = normal;`
+      );
+      shader.fragmentShader = `varying vec3 vCamoPos;
+varying vec3 vCamoNrm;
+uniform sampler2D uCamoTex;
+uniform float uCamoScale;
+uniform float uCamoLen;
+uniform vec3 uNoseColor;
+uniform float uNoseAmt;
+${shader.fragmentShader}`;
+      shader.fragmentShader = shader.fragmentShader.replace(
+        "#include <map_fragment>",
+        `#include <map_fragment>
+  vec3 camoN = abs(normalize(vCamoNrm));
+  vec3 camoN6 = camoN * camoN;
+  camoN6 = camoN6 * camoN6 * camoN6;
+  vec3 camoW = camoN6 / (camoN6.x + camoN6.y + camoN6.z + 1e-4);
+  vec3 camoP = vCamoPos * uCamoScale;
+  vec3 camoCol = texture2D(uCamoTex, camoP.zy).rgb * camoW.x
+    + texture2D(uCamoTex, camoP.xz).rgb * camoW.y
+    + texture2D(uCamoTex, camoP.xy).rgb * camoW.z;
+  diffuseColor.rgb *= camoCol;
+  float camoFz = vCamoPos.z / uCamoLen;
+  float camoNose = (1.0 - smoothstep(-0.42, -0.35, camoFz)) * uNoseAmt;
+  diffuseColor.rgb = mix(diffuseColor.rgb, uNoseColor, camoNose);`
+      );
+    };
+    camoMaterials[key] = mat;
+    return mat;
+  }
+
   const canopyMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(rgbHex(RGB.CANOPY)),
     roughness: 0.25,
@@ -220,6 +527,99 @@
     metalness: 0.05,
     side: THREE.DoubleSide,
   });
+
+  // ---------- 导弹涂装 ----------
+  // 实弹涂装惯例：整弹浅灰/白色，导引头罩（雷达罩/红外罩）压成深灰；
+  // 战斗部与发动机段用黄褐色识别环，另加黑色编号条，尾喷口为金属深灰。
+  const MISSILE_LIVERY = {
+    "R-73": { base: "#d3d5d7", nose: "#3d4248", band: "#b59a5c",
+      bandAt: [0.34, 0.375], stripeAt: [0.62, 0.645] },
+    "AIM-9X": { base: "#d8dbde", nose: "#33383e", band: "#c9a24e",
+      bandAt: [0.28, 0.32], stripeAt: [0.55, 0.57] },
+    "R-77-1": { base: "#cfd2d5", nose: "#3a3f45", band: "#b89a55",
+      bandAt: [0.19, 0.23], stripeAt: [0.50, 0.52] },
+    "AIM-120C": { base: "#cdd1d4", nose: "#343940", band: "#c7a04d",
+      bandAt: [0.17, 0.21], stripeAt: [0.46, 0.48] },
+  };
+  const MISSILE_TEX_W = 128;
+  const MISSILE_TEX_H = 512;
+  const missileTextures = {};
+
+  function missileTexture(name) {
+    if (missileTextures[name]) return missileTextures[name];
+    const spec = MISSILE_LIVERY[name] || MISSILE_LIVERY["R-73"];
+    const cv = document.createElement("canvas");
+    cv.width = MISSILE_TEX_W;
+    cv.height = MISSILE_TEX_H;
+    const g = cv.getContext("2d");
+    const W = MISSILE_TEX_W;
+    const H = MISSILE_TEX_H;
+    g.fillStyle = spec.base;
+    g.fillRect(0, 0, W, H);
+    // 纵向漆面磨损（贴图 x 为周向、y 为轴向，竖线即纵向条痕）
+    const rnd = camoRng(CAMO_SEED + 977 + name.length * 131);
+    for (let i = 0; i < 80; i += 1) {
+      const light = rnd() < 0.5;
+      g.fillStyle = light
+        ? `rgba(255,255,255,${0.03 + rnd() * 0.05})`
+        : `rgba(36,40,46,${0.03 + rnd() * 0.06})`;
+      g.fillRect(rnd() * W, rnd() * H, 1 + rnd() * 2, 40 + rnd() * 220);
+    }
+    for (let i = 0; i < 1600; i += 1) {
+      const v = 150 + Math.floor(rnd() * 90);
+      g.fillStyle = `rgba(${v},${v + 2},${v + 4},${0.05 + rnd() * 0.08})`;
+      g.fillRect(rnd() * W, rnd() * H, 1, 1 + rnd() * 3);
+    }
+    // 导引头罩
+    g.fillStyle = spec.nose;
+    g.fillRect(0, 0, W, H * 0.11);
+    g.fillStyle = "rgba(30,34,39,0.9)";
+    g.fillRect(0, H * 0.11, W, H * 0.012);
+    // 识别环与黑色编号条
+    g.fillStyle = spec.band;
+    g.fillRect(0, H * spec.bandAt[0], W, H * (spec.bandAt[1] - spec.bandAt[0]));
+    g.fillStyle = "#2c3035";
+    g.fillRect(0, H * spec.stripeAt[0], W, H * (spec.stripeAt[1] - spec.stripeAt[0]));
+    // 尾喷口金属段
+    g.fillStyle = "#585c61";
+    g.fillRect(0, H * 0.905, W, H * 0.095);
+    g.fillStyle = "rgba(28,31,36,0.85)";
+    g.fillRect(0, H * 0.895, W, H * 0.008);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.flipY = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = 4;
+    tex.needsUpdate = true;
+    missileTextures[name] = tex;
+    return tex;
+  }
+
+  // 导弹几何与材质跨帧共享，不能随每帧重建的场景节点一起 dispose。
+  const missileMats = {};
+  const missileDeadMat = new THREE.MeshStandardMaterial({
+    color: 0x9a9ea4,
+    roughness: 0.62,
+    metalness: 0.22,
+    side: THREE.DoubleSide,
+  });
+  const missileShared = new Set([missileDeadMat]);
+
+  function missileMaterial(team, name) {
+    const key = `${team}|${name}`;
+    let mat = missileMats[key];
+    if (mat) return mat;
+    mat = new THREE.MeshStandardMaterial({
+      map: missileTexture(name),
+      color: new THREE.Color(rgbHex(mix([255, 255, 255], RGB.TEAM[team], 0.10))),
+      roughness: 0.46,
+      metalness: 0.32,
+      side: THREE.DoubleSide,
+    });
+    missileMats[key] = mat;
+    missileShared.add(mat);
+    return mat;
+  }
 
   // 尾焰：屏幕朝向的带状面片 + 程序化着色（与 flame_demo 同一套羽流）。
   // 面片两端对齐喷口与羽流末端，宽度在视空间内展开，任何视角下都是柔和
@@ -438,6 +838,38 @@
     g.light.intensity = (0.55 + 1.05 * level) * (1.0 + 0.30 * ab);
   }
 
+  // 导弹尾焰：单层小羽流 + 喷口辉光，只在点火且仍有推进剂时显示。
+  function makeMissilePlume(seed) {
+    const group = new THREE.Group();
+    const core = plumeMesh(seed, 1.0, 1.0, 1.9);
+    group.add(core);
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex,
+      color: PLUME_HOT_WARM,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      opacity: 0.55,
+    }));
+    group.add(glow);
+    group.userData = { core: core.material.uniforms, glow };
+    return group;
+  }
+
+  function setMissilePlumeState(plume, len, level, time, scale) {
+    const u = plume.userData.core;
+    u.uTime.value = time;
+    u.uLevel.value = level;
+    u.uAb.value = 0.0;
+    u.uLen.value = len;
+    u.uW0.value = 0.10;
+    u.uW1.value = 0.30;
+    u.uScale.value = scale;
+    u.uGain.value = 1.9;
+    plume.userData.glow.material.opacity = 0.30 + 0.40 * level;
+    plume.userData.glow.scale.setScalar(0.75 + 0.45 * level);
+  }
+
   function bodyQuat(psi, theta, phi) {
     const sp = Math.sin(psi), cp = Math.cos(psi);
     const st = Math.sin(theta), ct = Math.cos(theta);
@@ -453,6 +885,71 @@
     return new THREE.Quaternion().setFromRotationMatrix(m);
   }
 
+  // 高过载时翼尖拉出的白色蒸汽/涡流。复用尾焰的屏幕朝向带状顶点着色器，
+  // 只是把长度、宽度和颜色换成淡淡的冷凝雾。
+  const vaporFrag = `
+    precision highp float;
+    varying vec2 vUv;
+    uniform float uAlpha;
+    uniform float uTime;
+    uniform float uSeed;
+    uniform vec3 uColor;
+    void main() {
+      float v = vUv.y;
+      float u = (vUv.x - 0.5) * 2.0;
+      float core = exp(-pow(abs(u) * 1.8, 2.0));
+      float edge = 1.0 - smoothstep(0.55, 1.0, abs(u));
+      float head = smoothstep(0.0, 0.16, v);
+      float trail = 1.0 - smoothstep(0.30, 1.0, v);
+      float turb = 0.74
+        + 0.14 * sin(v * 15.0 - uTime * 5.0 + uSeed * 7.0)
+        + 0.12 * sin(u * 9.0 + uTime * 3.2 + uSeed * 3.0);
+      float a = core * edge * (head * 0.85 + trail * 0.75) * turb * uAlpha;
+      vec3 col = mix(uColor, vec3(1.0), 0.35 * core);
+      gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
+    }
+  `;
+
+  function makeVaporMaterial(seed, color) {
+    return new THREE.ShaderMaterial({
+      vertexShader: plumeVert,
+      fragmentShader: vaporFrag,
+      uniforms: {
+        uLen: { value: 1.0 },
+        uW0: { value: 0.04 },
+        uW1: { value: 0.15 },
+        uSpread: { value: 1.0 },
+        uScale: { value: 1.0 },
+        uAlpha: { value: 0.0 },
+        uTime: { value: 0.0 },
+        uSeed: { value: seed },
+        uColor: { value: new THREE.Color(color) },
+      },
+      transparent: true,
+      blending: THREE.NormalBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+  }
+
+  const texBoomCloud = makeSpriteTexture((ctx, s) => {
+    const rnd = camoRng(0x9c41);
+    ctx.clearRect(0, 0, s, s);
+    for (let i = 0; i < 10; i += 1) {
+      const x = s * 0.5 + (rnd() - 0.5) * s * 0.48;
+      const y = s * 0.5 + (rnd() - 0.5) * s * 0.48;
+      const r = s * (0.14 + rnd() * 0.18);
+      const grd = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grd.addColorStop(0, `rgba(255,255,255,${0.22 + rnd() * 0.18})`);
+      grd.addColorStop(0.50, "rgba(236,246,255,0.10)");
+      grd.addColorStop(1.00, "rgba(220,236,255,0)");
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TAU);
+      ctx.fill();
+    }
+  }, 128);
+
   class AircraftView {
     constructor(team) {
       this.team = team;
@@ -466,6 +963,10 @@
       this.flames = [];
       this.engineCount = -1;
       this.modelLen = REF_LENGTH;
+      // 发动机中心相对机体中心的偏移（模型局部 y 向下为负、z 向机尾为正），
+      // 用于把飘带下移到喷口高度并后移到喷口位置；数值在 setModel 时给出。
+      this.engineY = 0.0;
+      this.engineZ = 0.0;
 
       // 高度投影线与地面圈（不随姿态旋转）。
       this.groundGeo = new THREE.BufferGeometry();
@@ -506,6 +1007,19 @@
       this.envOuter.frustumCulled = false;
       this.envInner.frustumCulled = false;
       scene.add(this.envOuter, this.envInner);
+
+      // 高 G 蒸汽与音爆云挂在机体 group 上，跟着姿态和视觉缩放一起走。
+      this.effectGroup = new THREE.Group();
+      this.group.add(this.effectGroup);
+      this.vaporStreaks = [];
+      this.vaporHalos = [];
+      this.highGLevel = 0.0;
+      this.machPrev = null;
+      this.boomStart = -1e9;
+      this.effectLastT = null;
+      this.boomCloud = null;
+      this.boomSmoke = [];
+      this.boomPuffs = [];
     }
 
     setModel(name, engines, modelLen) {
@@ -514,13 +1028,19 @@
       this.name = name;
       this.engineCount = engines.length;
       this.modelLen = ml;
+      this.engineY = engines.length
+        ? engines.reduce((sum, e) => sum + e[1], 0) / engines.length
+        : 0.0;
+      this.engineZ = engines.length
+        ? engines.reduce((sum, e) => sum + e[2], 0) / engines.length
+        : 0.0;
       this.modelGroup.clear();
       this.bodyMesh = null;
       this.canopyMesh = null;
       this.flames = [];
       const geo = MODEL_GEOS[name];
       if (geo) {
-        this.bodyMesh = new THREE.Mesh(geo.body, bodyMats[this.team]);
+        this.bodyMesh = new THREE.Mesh(geo.body, camoMaterial(this.team, name));
         this.canopyMesh = new THREE.Mesh(geo.canopy, canopyMat);
         this.modelGroup.add(this.bodyMesh, this.canopyMesh);
       }
@@ -532,9 +1052,225 @@
         this.modelGroup.add(plume);
         this.flames.push(plume);
       });
+      this.buildFlightEffects(ml);
     }
 
-    update(ac, cameraDepth) {
+    // 翼尖蒸汽与音爆云都放在机体局部坐标系里，随 group 的统一视觉缩放
+    // 一起放大，因此所有长度按 modelLen 的比例给出即可。
+    buildFlightEffects(ml) {
+      for (const obj of [...this.effectGroup.children]) {
+        obj.traverse((n) => {
+          if (n.material && n.material.dispose) n.material.dispose();
+          if (n.isMesh && n.geometry && n.geometry !== plumeGeo) n.geometry.dispose();
+        });
+      }
+      this.effectGroup.clear();
+      this.vaporStreaks = [];
+      this.vaporHalos = [];
+      this.boomCloud = null;
+      this.boomSmoke = [];
+      this.boomPuffs = [];
+
+      const geo = MODEL_GEOS[this.name];
+      let halfSpan = ml * 0.46;
+      let wingY = 0.0;
+      let wingZ = ml * 0.24;
+      if (geo && geo.body) {
+        geo.body.computeBoundingBox();
+        const bb = geo.body.boundingBox;
+        halfSpan = Math.max(halfSpan, Math.abs(bb.min.x), Math.abs(bb.max.x));
+        wingY = bb.min.y * 0.18;
+        // 蒸汽起点取真实翼尖顶点的平均位置：后掠翼的翼尖在弦向靠后，
+        // 按机体中点摆放会出现“蒸汽从机翼前方冒出”的错位。
+        const pos = geo.body.attributes.position;
+        const tipX = halfSpan * 0.95;
+        let sy = 0.0, sz = 0.0, cnt = 0;
+        for (let i = 0; i < pos.count; i += 1) {
+          if (Math.abs(pos.getX(i)) >= tipX) {
+            sy += pos.getY(i);
+            sz += pos.getZ(i);
+            cnt += 1;
+          }
+        }
+        if (cnt > 0) {
+          wingY = sy / cnt;
+          wingZ = sz / cnt;
+        }
+      }
+      const wingX = halfSpan * 0.92;
+
+      for (const sgn of [-1.0, 1.0]) {
+        // 每个翼尖两层：外层宽而淡，内层窄而实，叠出参考图里的白色
+        // 冷凝雾带而不是一条发光线。
+        for (let layer = 0; layer < 2; layer += 1) {
+          const mat = makeVaporMaterial(0.35 + sgn * 0.11 + layer * 0.7, 0xf4f9ff);
+          const streak = new THREE.Mesh(plumeGeo, mat);
+          streak.position.set(
+            sgn * wingX * (1.0 - layer * 0.10),
+            wingY,
+            wingZ + layer * ml * 0.035,
+          );
+          streak.frustumCulled = false;
+          streak.visible = false;
+          streak.userData.widthScale = layer === 0 ? 1.0 : 0.55;
+          streak.userData.lengthScale = layer === 0 ? 1.0 : 0.78;
+          this.effectGroup.add(streak);
+          this.vaporStreaks.push(streak);
+        }
+
+        // 水平尾翼/后机身也拉出较窄的蒸汽，贴近参考图里翼尖与尾段
+        // 同时起雾的样子。
+        const tail = new THREE.Mesh(plumeGeo, makeVaporMaterial(0.9 + sgn * 0.2, 0xf4f9ff));
+        tail.position.set(sgn * ml * 0.17, wingY * 0.35, ml * 0.30);
+        tail.frustumCulled = false;
+        tail.visible = false;
+        tail.userData.widthScale = 0.62;
+        tail.userData.lengthScale = 0.62;
+        this.effectGroup.add(tail);
+        this.vaporStreaks.push(tail);
+
+        const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: glowTex,
+          color: 0xf4faff,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          opacity: 0.0,
+        }));
+        halo.position.set(sgn * wingX, wingY, wingZ + ml * 0.06);
+        halo.scale.setScalar(ml * 0.085);
+        halo.visible = false;
+        this.effectGroup.add(halo);
+        this.vaporHalos.push(halo);
+      }
+
+      // 音爆云：参照真实跨音速照片，白色凝结雾从翼尖、翼根和机尾向后
+      // 喷出，并在机身后段聚成软云团；不再画几何锥壳，避免出现生硬的
+      // 三角轮廓。
+      const cloud = new THREE.Group();
+      cloud.visible = false;
+      this.boomSmoke = [];
+      this.boomPuffs = [];
+      const smokeDefs = [
+        [wingX, wingY, wingZ + ml * 0.02, 1.55, 1.00, 0.15],
+        [-wingX, wingY, wingZ + ml * 0.02, 1.55, 1.00, 0.85],
+        [wingX * 0.52, wingY, wingZ + ml * 0.12, 1.25, 0.84, 0.45],
+        [-wingX * 0.52, wingY, wingZ + ml * 0.12, 1.25, 0.84, 1.10],
+        [ml * 0.12, -ml * 0.03, ml * 0.31, 1.45, 0.95, 0.30],
+        [-ml * 0.12, -ml * 0.03, ml * 0.31, 1.45, 0.95, 1.35],
+      ];
+      for (const [x, y, z, wScale, lScale, seed] of smokeDefs) {
+        const mat = makeVaporMaterial(seed, 0xf6fbff);
+        const streak = new THREE.Mesh(plumeGeo, mat);
+        streak.position.set(x, y, z);
+        streak.frustumCulled = false;
+        streak.visible = false;
+        streak.userData.widthScale = wScale;
+        streak.userData.lengthScale = lScale;
+        cloud.add(streak);
+        this.boomSmoke.push(streak);
+      }
+      for (let k = 0; k < 8; k += 1) {
+        const mat = new THREE.SpriteMaterial({
+          map: texBoomCloud,
+          color: 0xf2f9ff,
+          transparent: true,
+          opacity: 0.0,
+          depthWrite: false,
+          blending: THREE.NormalBlending,
+        });
+        const sp = new THREE.Sprite(mat);
+        const ang = (k / 8.0) * TAU + 0.35;
+        const rad = ml * (0.07 + 0.10 * Math.random());
+        sp.position.set(
+          Math.cos(ang) * rad,
+          Math.sin(ang) * rad - ml * 0.04,
+          -ml * 0.16 + (k / 8.0) * ml * 0.58,
+        );
+        const baseW = ml * (0.30 + 0.12 * Math.random());
+        const baseH = ml * (0.20 + 0.08 * Math.random());
+        sp.scale.set(baseW, baseH, 1.0);
+        sp.userData.baseW = baseW;
+        sp.userData.baseH = baseH;
+        sp.userData.alphaScale = 0.55 + Math.random() * 0.35;
+        cloud.add(sp);
+        this.boomPuffs.push(sp);
+      }
+      this.effectGroup.add(cloud);
+      this.boomCloud = cloud;
+    }
+
+    updateFlightEffects(ac, t, k) {
+      const ml = this.modelLen || REF_LENGTH;
+      // 4.5G 触发后立刻给一个可见的起始强度（约 1/3），再随过载增大
+      // 平滑增强；否则 4.6G 时 target 只有 0.07，几乎看不见。
+      const over = HIGH_G_EFFECT && ac.alive
+        ? clamp((ac.g - HIGH_G_ON) / 1.2, 0.0, 1.0)
+        : 0.0;
+      const target = over > 0.0 ? 0.34 + 0.66 * over : 0.0;
+      this.highGLevel += (target - this.highGLevel) * 0.30;
+      const g = this.highGLevel;
+
+      for (const streak of this.vaporStreaks) {
+        streak.visible = g > 0.01;
+        if (!streak.visible) continue;
+        const u = streak.material.uniforms;
+        const wScale = streak.userData.widthScale || 1.0;
+        const lScale = streak.userData.lengthScale || 1.0;
+        u.uAlpha.value = 0.60 * g;
+        u.uTime.value = t;
+        u.uLen.value = ml * (0.55 + 0.28 * g) * lScale;
+        u.uW0.value = (0.75 + 0.45 * g) * wScale;
+        u.uW1.value = (2.00 + 1.00 * g) * wScale * (ml / REF_LENGTH);
+        u.uScale.value = k;
+      }
+      for (const halo of this.vaporHalos) {
+        halo.visible = g > 0.02;
+        if (!halo.visible) continue;
+        halo.material.opacity = 0.10 * g
+          * (0.82 + 0.18 * Math.sin(t * 9.0 + halo.position.x * 2.0));
+      }
+
+      const mach = ac.alive ? ac.speed / speedOfSound(ac.alt) : 0.0;
+      const crossed = this.machPrev !== null
+        && this.machPrev < 1.0 && mach >= 1.0
+        && (t - this.boomStart) > 1.5;
+      if (crossed) this.boomStart = t;
+      this.machPrev = mach;
+
+      const age = t - this.boomStart;
+      const p = clamp(age / 0.95, 0.0, 1.0);
+      const active = ac.alive && age >= 0.0 && p < 1.0;
+      const rise = clamp(age / 0.08, 0.0, 1.0);
+      const env = rise * Math.pow(1.0 - p, 1.1);
+      if (this.boomCloud) {
+        this.boomCloud.visible = active;
+        if (active) {
+          for (const streak of this.boomSmoke) {
+            const u = streak.material.uniforms;
+            const wScale = streak.userData.widthScale || 1.0;
+            const lScale = streak.userData.lengthScale || 1.0;
+            u.uAlpha.value = 0.80 * env;
+            u.uTime.value = t;
+            u.uLen.value = ml * (0.38 + 0.34 * p) * lScale;
+            u.uW0.value = 0.34 * wScale;
+            u.uW1.value = (1.20 + 0.35 * p) * wScale * (ml / REF_LENGTH);
+            u.uScale.value = k;
+          }
+          for (const sp of this.boomPuffs) {
+            const s = 0.90 + 0.55 * p;
+            sp.scale.set(
+              sp.userData.baseW * s,
+              sp.userData.baseH * s,
+              1.0,
+            );
+            sp.material.opacity = 0.40 * env * sp.userData.alphaScale;
+          }
+        }
+      }
+    }
+
+    update(ac, cameraDepth, simT) {
       this.group.position.copy(w2t(ac.pos));
       this.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
       const focal = (window.innerHeight / 2.0) / Math.tan((50.0 * Math.PI / 180.0) / 2.0);
@@ -542,6 +1278,15 @@
       const k = targetPx * cameraDepth / (focal * REF_LENGTH);
       this.group.scale.setScalar(k);
       this.group.visible = !!ac.alive;
+
+      const t = simT || 0.0;
+      if (this.effectLastT !== null && t < this.effectLastT) {
+        this.highGLevel = 0.0;
+        this.machPrev = null;
+        this.boomStart = -1e9;
+      }
+      this.effectLastT = t;
+      this.updateFlightEffects(ac, t, k);
 
       const level = ac.alive ? clamp(ac.flame, 0, 1) : 0;
       const ab = ac.alive ? clamp(ac.ab, 0, 1) : 0;
@@ -603,15 +1348,34 @@
     varying float vShade;
     void main() {
       float u = abs(vSide);
-      float edge = vSide < 0.0 ? 0.82 : 0.98;
-      float f = 1.14 + (edge - 1.14) * u;
-      f = max(f, 1.28 * exp(-pow(vSide * 2.4, 2.0)));
-      vec3 col = uColor * vFade * vShade * f;
-      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+      // 整条飘带是“带”而不是“线”：中心亮度平缓下降，边缘再柔化成
+      // 羽化边，加色混合下旧段自然变暗而不会压住背景。
+      float core = exp(-pow(u * 1.7, 2.0));
+      float soft = 1.0 - 0.45 * u * u;
+      float a = clamp((0.30 + 0.70 * core) * soft * vFade, 0.0, 1.0);
+      vec3 col = uColor * vShade * (0.80 + 0.40 * core);
+      gl_FragColor = vec4(min(col, vec3(1.0)), a);
     }
   `;
-  const TRAIL_HALF_PX = 5.0;
+  // 屏幕半宽（px）：飘带是发光丝带，目标约 12 px 总宽；边缘不再迅速衰减，
+  // 让转弯、俯冲时都能看出“带”而不是一条细线。
+  const TRAIL_HALF_PX = 6.0;
   const TRAIL_LIGHT = new THREE.Vector3(-0.35, -0.55, 0.76);
+  const TRAIL_SUB = 3;
+
+  // Catmull-Rom 平滑：后端每 60 m 才采一个点，硬转弯会形成生硬的折角。
+  // 飘带中心线按样条细分，转弯处自然变圆，起点仍然精确落在机尾。
+  function trailSpline(p0, p1, p2, p3, u) {
+    const u2 = u * u, u3 = u2 * u;
+    const f = (a, b, c, d) => 0.5 * (
+      2.0 * b + (c - a) * u
+      + (2.0 * a - 5.0 * b + 4.0 * c - d) * u2
+      + (3.0 * b - a - 3.0 * c + d) * u3
+    );
+    return new THREE.Vector3(f(p0.x, p1.x, p2.x, p3.x),
+                              f(p0.y, p1.y, p2.y, p3.y),
+                              f(p0.z, p1.z, p2.z, p3.z));
+  }
 
   const trailViews = [0, 1].map((team) => {
     const geo = new THREE.BufferGeometry();
@@ -621,7 +1385,8 @@
       uniforms: {
         uColor: { value: new THREE.Color(rgbHex(mix([198, 202, 208], RGB.TEAM[team], 0.25))) },
       },
-      transparent: false,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
@@ -662,15 +1427,94 @@
 
       const now = snap.t;
       const axes = src.axes || [];
-      const P = pts.map((p) => w2t(p));
+      const ac = snap.acs ? snap.acs[i] : null;
+      const ml = (ac && ac.alive) ? (ac.model_len || REF_LENGTH) : REF_LENGTH;
       const eye = w2t(snap.camera.eye);
       const center = new THREE.Vector3(snap.camera.cx, snap.camera.cz, -snap.camera.cy);
       const forward = center.clone().sub(eye).normalize();
       const focal = (window.innerHeight / 2.0)
         / Math.tan((snap.fov || 50.0) * Math.PI / 360.0);
-      const depths = P.map((p) => Math.max(1.0, p.clone().sub(eye).dot(forward)));
+      // 后端每 60 m 才记录一个航迹采样点，末点可能在机体后方很远。
+      // 历史点保持真实飞行轨迹，只把末尾追加的“当前点”放到视觉机尾；
+      // 若把所有历史点都按切线后移，转弯时整条飘带会扭成穿过机体的折线。
+      const centerAc = (ac && ac.alive) ? w2t(ac.pos) : new THREE.Vector3();
+      const depthAc = Math.max(1.0, eye.distanceTo(centerAc));
+      const targetPx = 46.0 * clamp(8000.0 / depthAc, 2.0, 3.0);
+      const k = targetPx * depthAc / (focal * REF_LENGTH);
+      const back = ml * 0.5 * k;
+      const P = pts.map((p) => w2t(p));
+      const axisW = axes.map((ax) => w2t(ax));
+      const times = pts.map((p) => (p[3] === undefined ? now : p[3]));
+      // 机体轴向单位向量（xb 指向机头），末点即使飞机已坠毁也用它做平移。
+      const sp = ac ? Math.sin(ac.psi) : 0.0;
+      const cp = ac ? Math.cos(ac.psi) : 1.0;
+      const st = ac ? Math.sin(ac.theta) : 0.0;
+      const ct = ac ? Math.cos(ac.theta) : 1.0;
+      const sf = ac ? Math.sin(ac.phi) : 0.0;
+      const cf = ac ? Math.cos(ac.phi) : 1.0;
+      const xb = [ct * cp, ct * sp, st];
+      const yb = [
+        cf * sp + sf * st * cp,
+        -cf * cp + sf * st * sp,
+        -sf * ct,
+      ];
+      // 当前帧的飘带头部直接挂在当前视觉机尾上，从尾部伸出。
+      if (ac && ac.alive) {
+        P.push(w2t([
+          ac.pos[0] - xb[0] * back,
+          ac.pos[1] - xb[1] * back,
+          ac.pos[2] - xb[2] * back,
+        ]));
+        axisW.push(w2t(yb));
+        times.push(now);
+      }
+      // 整条飘带沿机体向后（机体轴 -xb）平移：距离取机体中心到发动机中心
+      // 在机体轴向上的分量（模型局部 +z），按当前视觉缩放 k 换算成世界坐标，
+      // 机体显示大小随镜头距离变化，所以每帧用当前的 k。
+      const backShift = Math.max(0.0, aircraftViews[i].engineZ || 0.0) * k;
+      if (backShift > 0.0) {
+        for (const p of P) {
+          p.x -= xb[0] * backShift;
+          p.y -= xb[2] * backShift;
+          p.z += xb[1] * backShift;
+        }
+      }
+      // 飘带整体下移到喷口高度：模型局部 y 向下为负，机体中心到发动机
+      // 中心的纵向间距同样按当前 k 换算。
+      const drop = Math.max(0.0, -(aircraftViews[i].engineY || 0.0)) * k;
+      if (drop > 0.0) {
+        for (const p of P) p.y -= drop;
+      }
+      // Catmull-Rom 细分：60 m 一个后端采样点，直接连折线会在转弯处出现
+      // 生硬折角。中心线按 TRAIL_SUB 细分，展向/时间同步插值；端点复制一份
+      // 作切线控制点，首点仍精确落在机尾、末点仍是最后一个真实采样点。
+      const S = [];
+      const SA = [];
+      const ST = [];
+      const nP = P.length;
+      for (let j = 0; j < nP - 1; j += 1) {
+        const p0 = P[Math.max(0, j - 1)];
+        const p1 = P[j];
+        const p2 = P[j + 1];
+        const p3 = P[Math.min(nP - 1, j + 2)];
+        const a0 = axisW[j] || new THREE.Vector3(0, 1, 0);
+        const a1 = axisW[j + 1] || a0;
+        const t0 = times[j];
+        const t1 = times[j + 1];
+        for (let s = 0; s < TRAIL_SUB; s += 1) {
+          const uu = s / TRAIL_SUB;
+          S.push(trailSpline(p0, p1, p2, p3, uu));
+          SA.push(a0.clone().lerp(a1, uu).normalize());
+          ST.push(t0 + (t1 - t0) * uu);
+        }
+      }
+      S.push(P[nP - 1].clone());
+      SA.push(axisW[nP - 1] || new THREE.Vector3(0, 1, 0));
+      ST.push(times[nP - 1]);
 
-      const segs = pts.length - 1;
+      const depths = S.map((p) => Math.max(1.0, p.clone().sub(eye).dot(forward)));
+
+      const segs = S.length - 1;
       if (view.segCount !== segs) {
         const nv = segs * 4;
         const pos = new Float32Array(nv * 3);
@@ -694,12 +1538,12 @@
       const fadeA = view.geo.attributes.aFade.array;
       const shadeA = view.geo.attributes.aShade.array;
 
-      for (let j = 1; j < pts.length; j += 1) {
-        const A = P[j - 1];
-        const B = P[j];
+      for (let j = 1; j < S.length; j += 1) {
+        const A = S[j - 1];
+        const B = S[j];
         const b = (j - 1) * 4;
         const T = B.clone().sub(A);
-        const axis = axes[j] ? w2t(axes[j]) : new THREE.Vector3(0, 1, 0);
+        const axis = SA[j] || new THREE.Vector3(0, 1, 0);
         let span = null;
         if (T.lengthSq() > 1e-9) {
           T.normalize();
@@ -724,7 +1568,7 @@
         const lit = normal.dot(TRAIL_LIGHT);
         const shade = 0.80 + 0.20 * Math.max(0.0, lit);
 
-        const age = now - (pts[j][3] || now);
+        const age = now - ST[j];
         const life = Math.max(0.0, 1.0 - age / TRAIL_FADE);
         const fade = 0.62 + 0.38 * life;
         const half = TRAIL_HALF_PX * 0.5
@@ -757,8 +1601,8 @@
       const arrowPos = [];
       const arrowCol = [];
       for (let j = ARROW_EVERY; j < pts.length; j += ARROW_EVERY) {
-        const A = w2t(pts[j - 1]);
-        const B = w2t(pts[j]);
+        const A = P[j - 1];
+        const B = P[j];
         const d = B.clone().sub(A);
         if (d.lengthSq() < 1e-9) continue;
         d.normalize();
@@ -801,7 +1645,10 @@
   // ---------- 导弹 / 预测线 / 炮线 / 事件标记 / 干扰物 ----------
   const missileGroup = new THREE.Group();
   scene.add(missileGroup);
-  const missileDotGeo = new THREE.SphereGeometry(1, 6, 6);
+  // 尾焰羽流池单独挂一个组，避免每帧清空导弹节点时把着色器材质一起释放。
+  const missileFlameGroup = new THREE.Group();
+  scene.add(missileFlameGroup);
+  const missileFlames = [];
 
   const predictionGroup = new THREE.Group();
   scene.add(predictionGroup);
@@ -904,31 +1751,374 @@
     points.visible = arr.length > 0;
   }
 
+  // ---------- 干扰物动效：箔条云 / 热诱弹 ----------
+  // 快照只给存活干扰物的位置和类型；前端按位置做帧间匹配，自行维护
+  // 每个诱饵的出生时间、膨胀和拖尾。干扰物显示时锚定在机体的“视觉
+  // 机尾”上（机体被放大渲染，机尾离机位中心约半个屏幕机长），
+  // 否则诱饵会从模型内部出现，看起来像贴在图中央。
+  const cmGroup = new THREE.Group();
+  scene.add(cmGroup);
+
+  const texChaffCloud = makeSpriteTexture((ctx, s) => {
+    const rnd = camoRng(0x51a7);
+    ctx.clearRect(0, 0, s, s);
+    for (let i = 0; i < 16; i += 1) {
+      const x = s * 0.5 + (rnd() - 0.5) * s * 0.46;
+      const y = s * 0.5 + (rnd() - 0.5) * s * 0.46;
+      const r = s * (0.12 + rnd() * 0.20);
+      const grd = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grd.addColorStop(0, `rgba(255,255,255,${0.14 + rnd() * 0.12})`);
+      grd.addColorStop(0.55, `rgba(232,238,246,${0.06 + rnd() * 0.06})`);
+      grd.addColorStop(1, "rgba(210,220,232,0)");
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, TAU);
+      ctx.fill();
+    }
+  }, 128);
+
+  const texFlareCore = makeSpriteTexture((ctx, s) => {
+    const grd = ctx.createRadialGradient(s * 0.5, s * 0.5, 0, s * 0.5, s * 0.5, s * 0.5);
+    grd.addColorStop(0.00, "rgba(255,255,250,1.00)");
+    grd.addColorStop(0.14, "rgba(255,246,196,0.95)");
+    grd.addColorStop(0.36, "rgba(255,176,64,0.62)");
+    grd.addColorStop(0.66, "rgba(255,92,18,0.22)");
+    grd.addColorStop(1.00, "rgba(255,50,0,0)");
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, s, s);
+  }, 128);
+
+  const CM_TRAIL_MAX = 48;
+  const CM_MATCH_R2 = 60.0 * 60.0;
+  const cmEffects = [];
+  let cmLastT = -1.0;
+
+  // 把真实干扰物位置映射到机体的视觉机尾坐标系。
+  function cmDisplayPos(eff, snap, eye, focal) {
+    const ac = snap.acs ? snap.acs[eff.owner] : null;
+    if (!ac || !ac.alive) return eff.raw.clone();
+    const center = w2t(ac.pos);
+    const depth = Math.max(1.0, eye.distanceTo(center));
+    const targetPx = 46.0 * clamp(8000.0 / depth, 2.0, 3.0);
+    const k = targetPx * depth / (focal * REF_LENGTH);
+    const ml = ac.model_len || REF_LENGTH;
+    const sp = Math.sin(ac.psi), cp = Math.cos(ac.psi);
+    const st = Math.sin(ac.theta), ct = Math.cos(ac.theta);
+    const xb = [ct * cp, ct * sp, st];
+    const back = ml * 0.5 * k;
+    const tail = new THREE.Vector3(
+      center.x - xb[0] * back,
+      center.y - xb[2] * back,
+      center.z + xb[1] * back,
+    );
+    return tail.add(eff.raw.clone().sub(center));
+  }
+
+  function baseCounterEffect(kind, live, born) {
+    return {
+      kind,
+      owner: live.owner,
+      raw: live.pos.clone(),
+      born,
+      last: born,
+      seed: Math.random() * 1000.0,
+      objects: [],
+      materials: [],
+      puffMat: null,
+      glintMat: null,
+      coreMat: null,
+      haloMat: null,
+      smokeMat: null,
+      lineGeo: null,
+      linePos: null,
+      lineCol: null,
+      history: [],
+    };
+  }
+
+  function attachCounterObject(eff, obj) {
+    cmGroup.add(obj);
+    eff.objects.push(obj);
+    if (obj.material && !eff.materials.includes(obj.material)) {
+      eff.materials.push(obj.material);
+    }
+  }
+
+  function spawnChaffEffect(live, born) {
+    const eff = baseCounterEffect("chaff", live, born);
+    const mat = new THREE.SpriteMaterial({
+      map: texChaffCloud, color: 0xd2d8e0, transparent: true,
+      opacity: 0, depthWrite: false, blending: THREE.NormalBlending,
+    });
+    eff.puffMat = mat;
+    eff.materials.push(mat);
+    eff.puffs = [];
+    for (let k = 0; k < 4; k += 1) {
+      const sp = new THREE.Sprite(mat);
+      const ang = Math.random() * TAU;
+      const y = (Math.random() - 0.5) * 0.55;
+      const radial = Math.sqrt(Math.max(0.0, 1.0 - y * y));
+      sp.visible = false;
+      attachCounterObject(eff, sp);
+      eff.puffs.push({
+        sprite: sp,
+        dir: new THREE.Vector3(Math.cos(ang) * radial, y, Math.sin(ang) * radial),
+        off: 0.12 + Math.random() * 0.50,
+        size: 0.42 + Math.random() * 0.34,
+      });
+    }
+    const gmat = new THREE.SpriteMaterial({
+      map: texStar, color: 0xeef4fb, transparent: true,
+      opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    eff.glintMat = gmat;
+    eff.materials.push(gmat);
+    eff.glints = [];
+    for (let k = 0; k < 3; k += 1) {
+      const sp = new THREE.Sprite(gmat);
+      const ang = Math.random() * TAU;
+      const y = (Math.random() - 0.5) * 0.6;
+      const radial = Math.sqrt(Math.max(0.0, 1.0 - y * y));
+      sp.visible = false;
+      attachCounterObject(eff, sp);
+      eff.glints.push({
+        sprite: sp,
+        dir: new THREE.Vector3(Math.cos(ang) * radial, y, Math.sin(ang) * radial),
+        phase: Math.random() * TAU,
+      });
+    }
+    return eff;
+  }
+
+  function spawnFlareEffect(live, born) {
+    const eff = baseCounterEffect("flare", live, born);
+    const coreMat = new THREE.SpriteMaterial({
+      map: texFlareCore, color: 0xffffff, transparent: true,
+      opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    const haloMat = new THREE.SpriteMaterial({
+      map: texFlareCore, color: 0xff8c30, transparent: true,
+      opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending,
+    });
+    const smokeMat = new THREE.SpriteMaterial({
+      map: texChaffCloud, color: 0x8e8a84, transparent: true,
+      opacity: 0, depthWrite: false, blending: THREE.NormalBlending,
+    });
+    eff.coreMat = coreMat;
+    eff.haloMat = haloMat;
+    eff.smokeMat = smokeMat;
+    eff.materials.push(coreMat, haloMat, smokeMat);
+    eff.core = new THREE.Sprite(coreMat);
+    eff.halo = new THREE.Sprite(haloMat);
+    eff.smoke = new THREE.Sprite(smokeMat);
+    for (const sp of [eff.smoke, eff.halo, eff.core]) {
+      sp.visible = false;
+      attachCounterObject(eff, sp);
+    }
+
+    // 燃烧拖尾：位置来自快照历史，颜色从新到旧变暗。
+    eff.linePos = new Float32Array(CM_TRAIL_MAX * 3);
+    eff.lineCol = new Float32Array(CM_TRAIL_MAX * 3);
+    eff.lineGeo = new THREE.BufferGeometry();
+    eff.lineGeo.setAttribute("position", new THREE.BufferAttribute(eff.linePos, 3));
+    eff.lineGeo.setAttribute("color", new THREE.BufferAttribute(eff.lineCol, 3));
+    eff.lineGeo.setDrawRange(0, 0);
+    const line = new THREE.Line(eff.lineGeo, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0.85,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    line.frustumCulled = false;
+    cmGroup.add(line);
+    eff.objects.push(line);
+    eff.materials.push(line.material);
+    return eff;
+  }
+
+  function disposeCounterEffect(eff) {
+    for (const o of eff.objects) cmGroup.remove(o);
+    for (const m of eff.materials) m.dispose();
+    if (eff.lineGeo) eff.lineGeo.dispose();
+  }
+
+  function clearCounterEffects() {
+    for (const eff of cmEffects) disposeCounterEffect(eff);
+    cmEffects.length = 0;
+    cmLastT = -1.0;
+  }
+
+  function updateChaffEffect(eff, age, snap, eye, focal) {
+    const center = cmDisplayPos(eff, snap, eye, focal);
+    const pxWorld = Math.max(1.0, eye.distanceTo(center)) / focal;
+    const p = clamp(age / CHAFF_LIFE, 0, 1);
+    const fadeIn = clamp(age / 0.16, 0, 1);
+    const fadeOut = clamp((1.0 - p) / 0.30, 0, 1);
+    eff.puffMat.opacity = 0.38 * fadeIn * fadeOut;
+    const cloudPx = 16.0 + 68.0 * (1.0 - Math.exp(-age * 1.5));
+    for (const puff of eff.puffs) {
+      puff.sprite.visible = true;
+      puff.sprite.position.copy(center).addScaledVector(puff.dir, cloudPx * 0.45 * pxWorld * puff.off);
+      puff.sprite.scale.setScalar(cloudPx * puff.size * pxWorld);
+    }
+    eff.glintMat.opacity = 0.62 * fadeIn * fadeOut;
+    for (let k = 0; k < eff.glints.length; k += 1) {
+      const gl = eff.glints[k];
+      gl.sprite.visible = true;
+      gl.sprite.position.copy(center).addScaledVector(gl.dir, cloudPx * 0.35 * pxWorld);
+      const glint = 3.0 + 2.0 * Math.abs(Math.sin(age * 11.0 + gl.phase));
+      gl.sprite.scale.setScalar(glint * pxWorld * 2.0);
+    }
+  }
+
+  function updateFlareEffect(eff, age, snap, eye, focal) {
+    const center = cmDisplayPos(eff, snap, eye, focal);
+    const pxWorld = Math.max(1.0, eye.distanceTo(center)) / focal;
+    const p = clamp(age / FLARE_LIFE, 0, 1);
+    const fadeOut = clamp((1.0 - p) / 0.32, 0, 1);
+    const flash = Math.min(1.0, age / 0.10);
+    const flicker = 0.86 + 0.14 * Math.sin(age * 26.0 + eff.seed);
+
+    eff.core.visible = true;
+    eff.core.position.copy(center);
+    eff.core.scale.setScalar((10.0 + 8.0 * flash) * flicker * pxWorld);
+    eff.coreMat.opacity = 0.95 * fadeOut;
+
+    eff.halo.visible = true;
+    eff.halo.position.copy(center);
+    eff.halo.scale.setScalar((30.0 + 34.0 * Math.min(1.0, age / 0.5)) * flicker * pxWorld);
+    eff.haloMat.opacity = 0.40 * fadeOut;
+
+    eff.smoke.visible = true;
+    eff.smoke.position.copy(center);
+    eff.smoke.scale.setScalar((26.0 + 36.0 * Math.min(1.0, age / 1.2)) * pxWorld);
+    eff.smokeMat.opacity = 0.16 * fadeOut * (1.0 - 0.4 * p);
+
+    // 记录拖尾点；只在移动足够远或时间超过 60 ms 时采样，最多 48 点。
+    const hist = eff.history;
+    const last = hist.length ? hist[hist.length - 1] : null;
+    if (!last || last.p.distanceTo(center) > 6.0 * pxWorld || snap.t - last.t > 0.06) {
+      hist.push({ p: center.clone(), t: snap.t });
+    }
+    while (hist.length && snap.t - hist[0].t > 1.5) hist.shift();
+    if (hist.length > CM_TRAIL_MAX) hist.splice(0, hist.length - CM_TRAIL_MAX);
+
+    const n = hist.length;
+    for (let k = 0; k < n; k += 1) {
+      const hp = hist[k];
+      eff.linePos[k * 3] = hp.p.x;
+      eff.linePos[k * 3 + 1] = hp.p.y;
+      eff.linePos[k * 3 + 2] = hp.p.z;
+      const f = Math.max(0.16, 1.0 - (snap.t - hp.t) / 1.5);
+      eff.lineCol[k * 3] = 1.00 * f;
+      eff.lineCol[k * 3 + 1] = 0.60 * f;
+      eff.lineCol[k * 3 + 2] = 0.18 * f;
+    }
+    eff.lineGeo.setDrawRange(0, n);
+    eff.lineGeo.attributes.position.needsUpdate = true;
+    eff.lineGeo.attributes.color.needsUpdate = true;
+  }
+
+  function syncCounterEffects(snap) {
+    if (cmLastT >= 0.0 && snap.t < cmLastT) clearCounterEffects();
+    cmLastT = snap.t;
+
+    const live = (snap.counters || []).map((cm) => ({
+      kind: cm.kind,
+      owner: cm.owner,
+      pos: w2t(cm.pos),
+    }));
+    const used = new Array(live.length).fill(false);
+    let write = 0;
+    for (const eff of cmEffects) {
+      let best = -1;
+      let bestD = CM_MATCH_R2;
+      for (let k = 0; k < live.length; k += 1) {
+        if (used[k] || live[k].kind !== eff.kind) continue;
+        const d = eff.raw.distanceToSquared(live[k].pos);
+        if (d < bestD) { bestD = d; best = k; }
+      }
+      if (best >= 0) {
+        used[best] = true;
+        eff.raw.copy(live[best].pos);
+        eff.owner = live[best].owner;
+        eff.last = snap.t;
+        cmEffects[write] = eff;
+        write += 1;
+      } else if (snap.t - eff.last <= 0.30) {
+        cmEffects[write] = eff;
+        write += 1;
+      } else {
+        disposeCounterEffect(eff);
+      }
+    }
+    cmEffects.length = write;
+    for (let k = 0; k < live.length; k += 1) {
+      if (used[k]) continue;
+      const eff = live[k].kind === "chaff"
+        ? spawnChaffEffect(live[k], snap.t)
+        : spawnFlareEffect(live[k], snap.t);
+      cmEffects.push(eff);
+    }
+
+    const eye = w2t(snap.camera.eye);
+    const focal = (window.innerHeight / 2.0)
+      / Math.tan((snap.fov || 50.0) * Math.PI / 360.0);
+    for (const eff of cmEffects) {
+      const age = Math.max(0.0, snap.t - eff.born);
+      if (eff.kind === "chaff") updateChaffEffect(eff, age, snap, eye, focal);
+      else updateFlareEffect(eff, age, snap, eye, focal);
+    }
+  }
+
+  function missileDir(m) {
+    const d = new THREE.Vector3(m.dir[0], m.dir[2], -m.dir[1]);
+    if (d.lengthSq() < 1e-8) d.set(0, 0, 1);
+    return d.normalize();
+  }
+
   function updateMissiles(snap) {
     while (missileGroup.children.length) {
       const o = missileGroup.children.pop();
-      if (o.geometry && o.geometry !== missileDotGeo) o.geometry.dispose();
-      if (o.material) o.material.dispose();
+      if (o.geometry && !missileShared.has(o.geometry)) o.geometry.dispose();
+      if (o.material && !missileShared.has(o.material)) o.material.dispose();
     }
-    for (const m of snap.missiles || []) {
+    const ms = snap.missiles || [];
+    for (const f of missileFlames) f.visible = false;
+    const focal = (window.innerHeight / 2.0)
+      / Math.tan(camera.fov * Math.PI / 360.0);
+
+    ms.forEach((m, idx) => {
       const p = w2t(m.pos);
-      const d = new THREE.Vector3(m.dir[0], m.dir[2], -m.dir[1]);
-      if (d.lengthSq() < 1e-8) d.set(0, 0, 1);
-      d.normalize();
-      const color = new THREE.Color(rgbHex(mix(RGB.CLAY_LIT, RGB.TEAM[m.owner], 0.25)));
-      if (!m.guided) color.set(0x969696);
-      const len = clamp(m.length * 1.4, 2.0, 8.0);
-      const mesh = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.10, 0.10, len, 5),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
-      );
-      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d);
-      mesh.position.copy(p).addScaledVector(d, -len * 0.5);
-      missileGroup.add(mesh);
-      const dot = new THREE.Mesh(missileDotGeo, new THREE.MeshBasicMaterial({ color: 0xfafafc }));
-      dot.scale.setScalar(0.18);
-      dot.position.copy(p);
-      missileGroup.add(dot);
+      const d = missileDir(m);
+      const geo = MISSILE_GEOS[m.name];
+      // 导弹尺寸直接复用载机的可视化缩放系数 k：机体为看得清会被放大到
+      // 92–138 px，导弹用同一个 k 放大，弹长/机长就严格等于真实比例。
+      // k 的算法与 AircraftView.update 完全一致（同一视深基准）。
+      const eye = (snap.camera && snap.camera.eye) ? w2t(snap.camera.eye) : camera.position;
+      const ac = snap.acs ? snap.acs[m.owner] : null;
+      const refPos = ac ? w2t(ac.pos) : p;
+      const depth = Math.max(1.0, eye.distanceTo(refPos));
+      const targetPx = 46.0 * clamp(8000.0 / depth, 2.0, 3.0);
+      const s = targetPx * depth / (focal * REF_LENGTH);
+      if (geo) {
+        // 模型按真实弹长导出：弹头在局部原点、弹尾朝 +Z，直接把弹头放在
+        // 快照位置，弹体沿 -d 向后延伸。
+        const mat = m.guided ? missileMaterial(m.owner & 1, m.name) : missileDeadMat;
+        const mesh = new THREE.Mesh(geo.body, mat);
+        mesh.position.copy(p);
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), d);
+        mesh.scale.setScalar(s);
+        missileGroup.add(mesh);
+      } else {
+        // 模型未就绪时退化为一段短柱，保证弹道仍然可见。
+        const mesh = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.10, 0.10, m.length, 5),
+          new THREE.MeshBasicMaterial({ color: 0xd8dade })
+        );
+        mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d);
+        mesh.position.copy(p).addScaledVector(d, -m.length * 0.5);
+        mesh.scale.setScalar(s);
+        missileGroup.add(mesh);
+      }
       if (m.trail && m.trail.length > 1) {
         const g = new THREE.BufferGeometry();
         const arr = [];
@@ -941,14 +2131,23 @@
           color: 0x84888e, transparent: true, opacity: 0.58,
         })));
       }
+      // 点火阶段：弹尾挂一支小羽流，燃料烧完即熄灭。
       if (m.ignited && m.fuel > 0.0) {
-        const tip = p.clone().addScaledVector(d, -len * 1.6);
-        const g = new THREE.BufferGeometry().setFromPoints([p.clone().addScaledVector(d, -len), tip]);
-        missileGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({
-          color: 0xeceef2, transparent: true, opacity: 0.75,
-        })));
+        let flame = missileFlames[idx];
+        if (!flame) {
+          flame = makeMissilePlume(2.1 + idx * 0.9);
+          missileFlameGroup.add(flame);
+          missileFlames[idx] = flame;
+        }
+        flame.visible = true;
+        flame.position.copy(p).addScaledVector(d, -m.length * s);
+        flame.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), d);
+        flame.scale.setScalar(s);
+        const phase = (performance.now() / 1000.0 + idx * 0.7) % 8.0;
+        // 羽流长度按真实弹长给，scale 再按屏幕尺度放大。
+        setMissilePlumeState(flame, m.length * 0.75, 1.0, (phase / 8.0) * TAU, s);
       }
-    }
+    });
   }
 
   function updatePredictions(snap) {
@@ -1041,6 +2240,7 @@
     }
     setPointsPositions(chaffPoints, chaff);
     setPointsPositions(flarePoints, flare);
+    syncCounterEffects(snap);
   }
 
   // ---------- 姿态框、座舱 HUD 布局 ----------
@@ -1272,7 +2472,11 @@
       this.wpnFootL.textContent = `GUN ${wp.gun}`;
       this.wpnFootR.textContent = `CH ${wp.chaff}  FL ${wp.flares}`;
       const rw = this.rects.weapon;
-      drawSilhouette(this.silCanvas, ac.name, ac.team, rw.w - 172, rw.h - 38);
+      const sw = rw.w - 172;
+      const sh = rw.h - 38;
+      const padBottom = Math.max(14, sh * 0.30);
+      drawSilhouette(this.silCanvas, ac.name, ac.team, sw, sh, padBottom);
+      drawWeaponMissiles(this.silCanvas, sw, sh, padBottom);
     }
   }
 
@@ -1798,16 +3002,18 @@
     SIL_IMAGES[key] = img;
   }
 
-  function drawSilhouette(cv, name, team, w, h) {
+  function drawSilhouette(cv, name, team, w, h, padBottom = 0) {
     if (w <= 2 || h <= 2) return;
     const ctx = fitCanvas(cv, w, h);
+    // padBottom 给机尾下方的两枚小弹留位置，机体按剩余高度居中。
+    const bh = Math.max(2, h - padBottom);
     const img = SIL_IMAGES[name];
     if (img && img.complete && img.naturalWidth) {
-      const s = Math.min((w - 8) / img.naturalWidth, (h - 8) / img.naturalHeight);
+      const s = Math.min((w - 8) / img.naturalWidth, (bh - 8) / img.naturalHeight);
       const dw = img.naturalWidth * s;
       const dh = img.naturalHeight * s;
       const dx = (w - dw) / 2.0;
-      const dy = (h - dh) / 2.0;
+      const dy = (bh - dh) / 2.0;
       ctx.globalAlpha = 0.92;
       ctx.drawImage(img, dx, dy, dw, dh);
       // 透明度只作用于轮廓像素：用队伍色轻轻染色，与 2D 版观感一致。
@@ -1826,10 +3032,10 @@
       minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
     }
     const sx = (w - 12) / Math.max(1e-6, maxY - minY);
-    const sy = (h - 8) / Math.max(1e-6, maxX - minX);
+    const sy = (bh - 8) / Math.max(1e-6, maxX - minX);
     const scale = Math.min(sx, sy);
     const cx = w / 2;
-    const cy = h / 2;
+    const cy = bh / 2;
     ctx.beginPath();
     pts.forEach((p, k) => {
       const x = cx + p[1] * scale;
@@ -1844,13 +3050,63 @@
     ctx.stroke();
   }
 
+  // 武器面板的导弹轮廓（参考图 2）：左右两枚大弹、机尾下方两枚小弹，
+  // 绿色霓虹描边；与机体轮廓一起构成“挂载示意”，不抢文字读数。
+  function missileOutlinePath(ctx, cx, cy, len, wid) {
+    const nose = cy - len * 0.5;
+    const tail = cy + len * 0.5;
+    const hw = wid * 0.5;
+    const shoulder = nose + len * 0.24;
+    ctx.beginPath();
+    ctx.moveTo(cx, nose);
+    ctx.quadraticCurveTo(cx - hw, shoulder - len * 0.12, cx - hw, shoulder);
+    ctx.lineTo(cx - hw, tail - len * 0.16);
+    ctx.lineTo(cx - hw * 1.9, tail - len * 0.05);
+    ctx.lineTo(cx - hw, tail - len * 0.02);
+    ctx.lineTo(cx - hw * 0.6, tail);
+    ctx.lineTo(cx + hw * 0.6, tail);
+    ctx.lineTo(cx + hw, tail - len * 0.02);
+    ctx.lineTo(cx + hw * 1.9, tail - len * 0.05);
+    ctx.lineTo(cx + hw, tail - len * 0.16);
+    ctx.lineTo(cx + hw, shoulder);
+    ctx.quadraticCurveTo(cx + hw, shoulder - len * 0.12, cx, nose);
+    ctx.closePath();
+  }
+
+  function drawWeaponMissiles(cv, w, h, padBottom) {
+    if (w <= 8 || h <= 8) return;
+    const ctx = cv.getContext("2d");
+    const bh = Math.max(2, h - padBottom);
+    ctx.save();
+    ctx.lineWidth = 1.1;
+    ctx.strokeStyle = "rgba(152,246,184,0.92)";
+    ctx.fillStyle = "rgba(118,232,162,0.08)";
+    ctx.shadowColor = "rgba(110,240,160,0.85)";
+    ctx.shadowBlur = 5;
+    // 两侧大弹：长度约占机体高度的 0.9，位于机体轮廓外侧。
+    const bigLen = bh * 0.86;
+    const bigWid = Math.max(2.8, bigLen * 0.11);
+    for (const x of [w * 0.12, w * 0.88]) {
+      missileOutlinePath(ctx, x, bh * 0.46, bigLen, bigWid);
+      ctx.fill();
+      ctx.stroke();
+    }
+    // 机尾下方两枚小弹：靠近中轴，弹头朝上。
+    const smallLen = bh * 0.34;
+    const smallWid = Math.max(1.8, smallLen * 0.15);
+    for (const x of [w * 0.44, w * 0.56]) {
+      missileOutlinePath(ctx, x, bh + padBottom * 0.5, smallLen, smallWid);
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // ---------- 顶部姿态框 ----------
   const ATT_VIEW = [0.85, -0.98, 0.55];
-  const ATT_RIGHT = [
-    ATT_VIEW[1] * 1 - ATT_VIEW[2] * 0, // cross((0,0,1), view)
-    ATT_VIEW[2] * 0 - ATT_VIEW[0] * 1,
-    ATT_VIEW[0] * 0 - ATT_VIEW[1] * 0,
-  ];
+  // 与 render.py 的 _attitude_basis 完全一致：right = cross((0,0,1), view)。
+  // 这里若写成 cross(view, z) 会让 up 反向，姿态框里的飞机整体上下颠倒。
+  const ATT_RIGHT = [-ATT_VIEW[1], ATT_VIEW[0], 0];
   function norm3(v) {
     const n = Math.hypot(v[0], v[1], v[2]) || 1;
     return [v[0] / n, v[1] / n, v[2] / n];
@@ -1901,7 +3157,7 @@
     const geo = MODEL_GEOS[ac.name];
     const ml = ac.model_len || REF_LENGTH;
     if (geo) {
-      gl.body = new THREE.Mesh(geo.body, ac.alive ? bodyMats[ac.team] : deadBodyMat);
+      gl.body = new THREE.Mesh(geo.body, ac.alive ? camoMaterial(ac.team, ac.name) : deadBodyMat);
       gl.canopy = new THREE.Mesh(geo.canopy, canopyMat);
       gl.canopy.visible = !!ac.alive;
       gl.group.add(gl.body, gl.canopy);
@@ -1937,7 +3193,7 @@
     if (gl.name !== ac.name || gl.modelLen !== ml || gl.engineCount !== engines.length) {
       buildAttitudeModel(gl, ac);
     }
-    if (gl.body) gl.body.material = ac.alive ? bodyMats[ac.team] : deadBodyMat;
+    if (gl.body) gl.body.material = ac.alive ? camoMaterial(ac.team, ac.name) : deadBodyMat;
     if (gl.canopy) gl.canopy.visible = !!ac.alive;
     gl.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
 
@@ -1992,6 +3248,66 @@
     }
   }
 
+  // ---------- 屏幕空间标签：导弹名称 / 机体旁的战术与机动 ----------
+  const labelsCanvas = document.getElementById("labels");
+  const labelsCtx = labelsCanvas.getContext("2d");
+  let labelsW = 0;
+  let labelsH = 0;
+  let labelsDpr = 1;
+
+  function resizeLabels() {
+    labelsDpr = Math.min(2, window.devicePixelRatio || 1);
+    labelsW = window.innerWidth;
+    labelsH = window.innerHeight;
+    labelsCanvas.width = Math.round(labelsW * labelsDpr);
+    labelsCanvas.height = Math.round(labelsH * labelsDpr);
+  }
+  resizeLabels();
+
+  function projectScreen(p) {
+    const v = p.clone().project(camera);
+    if (v.z < -1.0 || v.z > 1.0) return null;
+    if (v.x < -1.05 || v.x > 1.05 || v.y < -1.05 || v.y > 1.05) return null;
+    return { x: (v.x + 1.0) * 0.5 * labelsW, y: (1.0 - v.y) * 0.5 * labelsH };
+  }
+
+  function drawTag(str, sx, sy, color, size, flip) {
+    const ctx = labelsCtx;
+    ctx.font = `${size}px ${FONT}`;
+    const w = ctx.measureText(str).width;
+    const x = flip ? sx - w : sx;
+    // 先画一层深色底影，任何背景亮度下都读得清。
+    ctx.fillStyle = "rgba(6,10,14,0.88)";
+    ctx.fillText(str, x + 1, sy + 1);
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, sy);
+  }
+
+  function drawLabels() {
+    labelsCtx.setTransform(labelsDpr, 0, 0, labelsDpr, 0, 0);
+    labelsCtx.clearRect(0, 0, labelsW, labelsH);
+    if (!snapshot) return;
+
+    for (let i = 0; i < 2; i += 1) {
+      const ac = snapshot.acs ? snapshot.acs[i] : null;
+      if (!ac || !ac.alive) continue;
+      const s = projectScreen(w2t(ac.pos));
+      if (!s) continue;
+      const hud = ac.hud || {};
+      const parts = [hud.tactic, hud.primitive].filter((v) => v);
+      if (!parts.length) continue;
+      // 标签贴在机体右侧；靠右边缘时自动翻到左侧，避免被窗口裁掉。
+      const flip = s.x > labelsW - 230;
+      drawTag(parts.join(" · "), s.x + (flip ? -30 : 30), s.y - 24, C.team[i], 13, flip);
+    }
+
+    for (const m of snapshot.missiles || []) {
+      const s = projectScreen(w2t(m.pos));
+      if (!s) continue;
+      drawTag(m.name, s.x + 9, s.y - 6, m.guided ? C.text : C.sub, 12, false);
+    }
+  }
+
   // ---------- 布局 ----------
   let stationsVisible = false;
 
@@ -2031,7 +3347,7 @@
       const view = aircraftViews[i];
       view.setModel(ac.model, ac.engines || [], ac.model_len);
       const depth = Math.max(1.0, cameraPos.distanceTo(w2t(ac.pos)));
-      view.update(ac, depth);
+      view.update(ac, depth, snap.t);
     }
     updateTrails(snap);
     updateMissiles(snap);
@@ -2192,9 +3508,11 @@
     }
   });
   window.addEventListener("resize", () => {
+    if (CAPTURE) return;  // 固定分辨率采集时不受面板缩放影响
     renderer.setSize(window.innerWidth, window.innerHeight, false);
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
+    resizeLabels();
     layoutAll();
     if (snapshot) updateHud(snapshot);
   });
@@ -2204,6 +3522,7 @@
   stream.onmessage = (ev) => {
     try {
       snapshot = JSON.parse(ev.data);
+      capReady = true;
       MODELS_READY.then(() => {
         updateScene(snapshot);
         updateHud(snapshot);
@@ -2217,11 +3536,63 @@
     console.warn("SSE 连接断开，正在重连…");
   };
 
+  // ---------- 1080p 采集 ----------
+  // 每帧渲染完成后按目标帧率把 WebGL 画面拷贝到离屏 2D 画布，
+  // 以 PNG 二进制 POST 给服务端；帧序列由服务端 ffmpeg 统一编码成 MP4。
+  // 采集只包含 3D 场景（HUD 是 DOM，不参与离屏合成）。
+  let capReady = false;
+  const capState = { t0: 0, next: 0, i: 0, done: false };
+
+  function captureTick() {
+    if (!capReady || capState.done) return;
+    const now = performance.now();
+    if (capState.t0 === 0) {
+      capState.t0 = now + CAPTURE.delay * 1000;
+      capState.next = capState.t0;
+      if (CAPTURE.delay > 0) return;
+    }
+    if (now < capState.next) return;
+    capState.next += 1000.0 / CAPTURE.fps;
+    if (capState.next < now - 500) capState.next = now;  // 掉帧时不无限追赶
+
+    const off = document.createElement("canvas");
+    off.width = renderer.domElement.width;
+    off.height = renderer.domElement.height;
+    off.getContext("2d").drawImage(renderer.domElement, 0, 0);
+    const idx = String(capState.i).padStart(4, "0");
+    off.toBlob((blob) => {
+      if (!blob) return;
+      fetch(`/api/capture?name=${encodeURIComponent(CAPTURE.name)}&i=${idx}`, {
+        method: "POST",
+        body: blob,
+      }).catch((err) => console.error("帧上传失败", err));
+    }, "image/png");
+
+    capState.i += 1;
+    if (capState.i >= CAPTURE.frames) {
+      capState.done = true;
+      if (CAPTURE.frames > 1 && CAPTURE.encode) {
+        // 等最后几帧传完再请求编码
+        setTimeout(() => {
+          fetch("/api/capture/encode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: CAPTURE.name, fps: CAPTURE.fps }),
+          }).then((r) => r.json())
+            .then((d) => console.log("采集完成", d))
+            .catch((err) => console.error("编码请求失败", err));
+        }, 1600);
+      }
+    }
+  }
+
   // ---------- 渲染循环 ----------
   function animate() {
     requestAnimationFrame(animate);
     updateCameraFrame();
     renderer.render(scene, camera);
+    drawLabels();
+    if (CAPTURE) captureTick();
   }
 
   layoutAll();

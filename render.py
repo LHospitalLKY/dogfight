@@ -526,7 +526,9 @@ SU57_MODEL = _load_obj_model(
     SU57_OBJ_PATH, 20.1, 0.03, gear_y=_GEAR_Y, mini_voxel=0.06,
 )
 # 双发尾喷口位置（机体系，x 向后、y 右、z 下），用于画尾焰。
-SU57_MODEL["engines"] = [(-9.4, 0.7, 0.0), (-9.4, -0.7, 0.0)]
+# 按 OBJ 的三视图实测：两台喷口的出口环位于 x≈-8.65，环心
+# y≈±1.51、z≈0.68，环半径约 0.4 m（x=-10.03 处只是中间尾撑）。
+SU57_MODEL["engines"] = [(-8.65, 1.51, 0.68), (-8.65, -1.51, 0.68)]
 
 F16_MODEL = _load_obj_model(
     F16_OBJ_PATH, 15.06, 0.28,
@@ -535,7 +537,9 @@ F16_MODEL = _load_obj_model(
     gear_y=F16_GEAR_Y,
     mini_voxel=0.40,
 )
-F16_MODEL["engines"] = [(-7.30, 0.0, 0.0)]
+# F-16 单发喷口：出口环在 x≈-6.95，环心 y≈0、z≈1.21，环半径约 0.52 m
+# （x=-7.51 处是垂尾/平尾尖，不是喷口）。
+F16_MODEL["engines"] = [(-6.95, 0.0, 1.21)]
 
 MODEL_BY_NAME = {"SU-57": SU57_MODEL, "F-16V": F16_MODEL}
 GENERIC_MODEL = SU57_MODEL

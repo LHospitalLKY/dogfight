@@ -13,9 +13,13 @@ import argparse
 import json
 import math
 import os
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,6 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = Path(__file__).resolve().parent
 STATIC = WEB / "static"
 MODEL_DIR = STATIC / "models"
+# 前端固定分辨率采集（/?capture=1920x1080）上传的 PNG 帧与编码后的 MP4。
+CAPTURE_DIR = WEB / "captures"
 sys.path.insert(0, str(ROOT))
 
 # 导入 render 会读取 OBJ、做体素简化（启动花几秒属正常）；这里只取模型
@@ -42,8 +48,27 @@ MISSILE_RCS = render.MISSILE_RCS
 
 
 # ---------------------------------------------------------------------------
-# 模型导出：render 的机体系 (x 前 / y 右 / z 下) → three.js (Y 上 / 机头 -Z)
+# Web 模型导出：直接读取 assets 下的原始 OBJ，转到 three.js 机体系
+# （机头 -Z、上 +Y），只服务 Web 观战端；pygame 继续用 render.py 的模型。
 # ---------------------------------------------------------------------------
+
+ASSET_ROOT = ROOT / "assets"
+# 导出版本号：改动坐标换算/抽稀参数时递增，旧的 web/static/models 会自动重建。
+MODEL_TAG = "web-obj-v3"
+
+AIRCRAFT_EXPORTS = (
+    # (机体名, 源文件, 真实机长 m)
+    ("SU-57", ASSET_ROOT / "flighter" / "SU57.obj", 20.1),
+    ("F-16V", ASSET_ROOT / "flighter" / "F16.obj", 15.06),
+)
+MISSILE_EXPORTS = (
+    # (导弹名, 源文件, 真实弹长 m, 导出文件名)
+    ("R-73", ASSET_ROOT / "missle" / "R73.obj", 2.90, "r73.obj"),
+    ("AIM-9X", ASSET_ROOT / "missle" / "AIM9.obj", 3.02, "aim9.obj"),
+    ("R-77-1", ASSET_ROOT / "missle" / "R77.obj", 3.60, "r77.obj"),
+    ("AIM-120C", ASSET_ROOT / "missle" / "AIM120.obj", 3.66, "aim120.obj"),
+)
+
 
 def _three_vertex(p):
     """机体系点 → three.js 坐标：X = y, Y = -z, Z = -x。"""
@@ -51,6 +76,7 @@ def _three_vertex(p):
 
 
 def _export_model(model: dict, path: Path, name: str) -> None:
+    """旧版兜底：render 的体素模型 → web OBJ（原始资产缺失时才会用到）。"""
     lines = [f"# dogfight web export: {name}", f"o {name}"]
     vcount = 0
     for poly, kind, _ao in model["faces"]:
@@ -66,29 +92,261 @@ def _export_model(model: dict, path: Path, name: str) -> None:
     os.replace(tmp, path)
 
 
+def _read_obj(path: Path):
+    """读取 OBJ 的顶点与面（面记录为 (索引元组, 材质名)）。"""
+    verts = []
+    faces = []
+    material = "body"
+    with open(path, "r", errors="ignore") as fh:
+        for line in fh:
+            if line.startswith("v "):
+                _, x, y, z = line.split()[:4]
+                verts.append((float(x), float(y), float(z)))
+            elif line.startswith("usemtl "):
+                material = line.split(None, 1)[1].strip()
+            elif line.startswith("f "):
+                idx = tuple(int(tok.split("/")[0]) - 1 for tok in line.split()[1:])
+                if len(idx) >= 3:
+                    faces.append((idx, material))
+    return verts, faces
+
+
+def _cluster(verts, voxel, faces):
+    """体素聚类抽稀：同格顶点合并到平均值，退化/重复面直接丢弃。"""
+    cells = {}
+    for x, y, z in verts:
+        key = (round(x / voxel), round(y / voxel), round(z / voxel))
+        slot = cells.get(key)
+        if slot is None:
+            cells[key] = [x, y, z, 1]
+        else:
+            slot[0] += x
+            slot[1] += y
+            slot[2] += z
+            slot[3] += 1
+    index = {key: i for i, key in enumerate(cells)}
+    pts = [(slot[0] / slot[3], slot[1] / slot[3], slot[2] / slot[3])
+           for slot in cells.values()]
+    remap = [index[(round(x / voxel), round(y / voxel), round(z / voxel))]
+             for x, y, z in verts]
+    out = []
+    seen = set()
+    for idx, material in faces:
+        polys = []
+        for i in idx:
+            c = remap[i]
+            if c not in polys:
+                polys.append(c)
+        if len(polys) < 3:
+            continue
+        sig = tuple(sorted(polys))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append((tuple(polys), material))
+    return pts, out
+
+
+def _write_obj(path: Path, pts, faces, name: str, canopy_faces=None) -> None:
+    """写 three.js 用 OBJ；canopy_faces 是 faces 中要归入 canopy 的面序号。"""
+    body = []
+    canopy = []
+    for n, (idx, _material) in enumerate(faces):
+        if canopy_faces and n in canopy_faces:
+            canopy.append(idx)
+        else:
+            body.append(idx)
+    lines = [f"# dogfight web {MODEL_TAG}", f"o {name}"]
+    for x, y, z in pts:
+        lines.append(f"v {x:.3f} {y:.3f} {z:.3f}")
+    for kind, group in (("body", body), ("canopy", canopy)):
+        if not group:
+            continue
+        lines.append(f"usemtl {kind}")
+        for idx in group:
+            lines.append("f " + " ".join(str(i + 1) for i in idx))
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _bbox(verts):
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    return (min(xs), max(xs)), (min(ys), max(ys)), (min(zs), max(zs))
+
+
+def _export_su57(path: Path):
+    """SU-57：OBJ 纵轴 X、机头 -X；换算后机头朝 three 的 -Z。"""
+    verts, faces = _read_obj(path)
+    (x0, x1), (y0, y1), (z0, z1) = _bbox(verts)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    s = 20.1 / (x1 - x0)
+
+    def conv(v):
+        return (-v[2] * s, (v[1] - cy) * s, (v[0] - cx) * s)
+
+    pts = [conv(v) for v in verts]
+    engines = []
+    # 双发喷口：尾部 x≈1.7–1.8、|z|≈0.18 的两个出口环。
+    for sign in (1.0, -1.0):
+        ring = [v for v in verts
+                if 1.45 <= v[0] <= 1.90 and 0.10 <= sign * v[2] <= 0.30
+                and -0.02 <= v[1] <= 0.15]
+        if not ring:
+            continue
+        x_exit = max(v[0] for v in ring)
+        tip = [v for v in ring if v[0] >= x_exit - 0.02]
+        ey = sum(v[1] for v in tip) / len(tip)
+        ez = sum(v[2] for v in tip) / len(tip)
+        engines.append(list(conv((x_exit, ey, ez))))
+    # 座舱盖只有 glass.001；screen / Glowing_green 是仪表面片，仍归 body。
+    canopy = {n for n, (_idx, material) in enumerate(faces) if material == "glass.001"}
+    return pts, faces, engines, canopy
+
+
+def _export_f16(path: Path):
+    """F-16：OBJ 纵轴 Z、机头 +Z；换算后机头朝 three 的 -Z。"""
+    verts, faces = _read_obj(path)
+    (x0, x1), (y0, y1), (z0, z1) = _bbox(verts)
+    cx, cy, cz = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0
+    s = 15.06 / (z1 - z0)
+
+    def conv(v):
+        return (-(v[0] - cx) * s, (v[1] - cy) * s, -(v[2] - cz) * s)
+
+    pts = [conv(v) for v in verts]
+    exhaust = set()
+    for idx, material in faces:
+        if material == "EXHAUST":
+            exhaust.update(idx)
+    engines = []
+    if exhaust:
+        ep = [verts[i] for i in exhaust]
+        z_exit = min(p[2] for p in ep)
+        ring = [p for p in ep if p[2] <= z_exit + 0.01]
+        ex = sum(p[0] for p in ring) / len(ring)
+        ey = sum(p[1] for p in ring) / len(ring)
+        engines.append(list(conv((ex, ey, z_exit))))
+    # F-16 的玻璃材质混了整颗翼下导弹：GLASS2 全部、glass.002 的 ±1.9 侧块。
+    # 只有靠近机体中线（|x|<0.8）的座舱盖归 canopy，其余玻璃面片留在 body，
+    # 否则前端会把导弹当成透明座舱盖渲染成玻璃。
+    canopy = set()
+    for n, (idx, material) in enumerate(faces):
+        if "glass" not in material.lower():
+            continue
+        if max(abs(verts[i][0] - cx) for i in idx) < 0.8:
+            canopy.add(n)
+    return pts, faces, engines, canopy
+
+
+def _export_missile(path: Path, length: float):
+    """导弹：长轴弹头落到局部原点、弹尾朝 +Z，按真实弹长缩放并抽稀。
+
+    平面网格太密（AIM-120 有 76 万面），按弹长 1/300 的体素聚类，保留
+    弹头锥度、翼面与尾喷口的轮廓即可。
+    """
+    verts, faces = _read_obj(path)
+    bb = _bbox(verts)
+    axis = max(range(3), key=lambda k: bb[k][1] - bb[k][0])
+    lo, hi = bb[axis]
+    others = [k for k in range(3) if k != axis]
+    centers = [(bb[k][0] + bb[k][1]) / 2.0 for k in others]
+
+    def radial(p):
+        return sum((p[k] - centers[j]) ** 2 for j, k in enumerate(others)) ** 0.5
+
+    # 两端各取 3% 的薄片：最大径向半径更小的一端是弹头（尖锥），
+    # 半径大的另一端是尾喷口/尾翼。
+    slab = (hi - lo) * 0.03
+    r_lo = max(radial(v) for v in verts if v[axis] <= lo + slab)
+    r_hi = max(radial(v) for v in verts if v[axis] >= hi - slab)
+    nose_hi = r_hi < r_lo
+    scale = length / (hi - lo)
+
+    def conv(v):
+        along = (hi - v[axis]) if nose_hi else (v[axis] - lo)
+        z = along * scale
+        return tuple((v[k] - centers[j]) * scale for j, k in enumerate(others)) + (z,)
+
+    pts = [conv(v) for v in verts]
+    pts, faces = _cluster(pts, max(0.004, length / 300.0), faces)
+    return pts, faces
+
+
+def _exported_ok(path: Path) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            return fh.readline().strip() == f"# dogfight web {MODEL_TAG}"
+    except OSError:
+        return False
+
+
 def export_models() -> dict:
+    """导出/复用 assets 原始模型，返回前端所需元数据。"""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    targets = (
+    meta_path = MODEL_DIR / "meta.json"
+    required = [MODEL_DIR / "su57.obj", MODEL_DIR / "f16.obj"] + [
+        MODEL_DIR / spec[3] for spec in MISSILE_EXPORTS
+    ]
+    sources = [spec[1] for spec in AIRCRAFT_EXPORTS] + [spec[1] for spec in MISSILE_EXPORTS]
+    if all(spec.exists() for spec in sources):
+        if meta_path.exists() and all(_exported_ok(p) for p in required):
+            try:
+                return json.loads(meta_path.read_text(encoding="utf-8"))["models"]
+            except (OSError, ValueError, KeyError):
+                pass
+        aircraft = {}
+        for name, source, length in AIRCRAFT_EXPORTS:
+            if name == "SU-57":
+                pts, faces, engines, canopy = _export_su57(source)
+            else:
+                pts, faces, engines, canopy = _export_f16(source)
+            _write_obj(MODEL_DIR / ("su57.obj" if name == "SU-57" else "f16.obj"),
+                       pts, faces, name.lower().replace("-", ""), canopy)
+            aircraft[name] = {
+                "url": f"/api/models/{'su57' if name == 'SU-57' else 'f16'}.obj",
+                "length": length,
+                "engines": engines,
+            }
+        missiles = {}
+        for name, source, length, filename in MISSILE_EXPORTS:
+            pts, faces = _export_missile(source, length)
+            _write_obj(MODEL_DIR / filename, pts, faces, filename[:-4])
+            missiles[name] = {
+                "url": f"/api/models/{filename}",
+                "length": length,
+            }
+        meta = {"version": MODEL_TAG, "models": {"aircraft": aircraft,
+                                                 "missiles": missiles}}
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        return meta["models"]
+
+    # 原始资产缺失时退回 render 的体素模型，保证服务仍能启动。
+    for filename, model, name in (
         ("su57.obj", render.SU57_MODEL, "su57"),
         ("f16.obj", render.F16_MODEL, "f16"),
-    )
-    for filename, model, name in targets:
+    ):
         _export_model(model, MODEL_DIR / filename, name)
 
     def engines(model):
         return [list(_three_vertex(p)) for p in model.get("engines", [])]
 
     return {
-        "SU-57": {
-            "url": "/api/models/su57.obj",
-            "length": render.SU57_MODEL["length"],
-            "engines": engines(render.SU57_MODEL),
+        "aircraft": {
+            "SU-57": {
+                "url": "/api/models/su57.obj",
+                "length": render.SU57_MODEL["length"],
+                "engines": engines(render.SU57_MODEL),
+            },
+            "F-16V": {
+                "url": "/api/models/f16.obj",
+                "length": render.F16_MODEL["length"],
+                "engines": engines(render.F16_MODEL),
+            },
         },
-        "F-16V": {
-            "url": "/api/models/f16.obj",
-            "length": render.F16_MODEL["length"],
-            "engines": engines(render.F16_MODEL),
-        },
+        "missiles": {},
     }
 
 
@@ -589,9 +847,16 @@ def _ac_snapshot(world, i, agent, engines, recorder) -> dict:
 class SimEngine:
     """独立线程推进内核，维护最近一帧快照与版本号。"""
 
-    def __init__(self, seconds: float, seed: int | None) -> None:
+    def __init__(self, seconds: float, seed: int | None, baseline: bool = False,
+                 dof: int = 6, f16_radar: str = "always",
+                 su57_radar: str = "always", awacs: bool = True) -> None:
         self.seconds = seconds
         self.seed = seed
+        self.baseline = baseline
+        self.dof = dof
+        self.f16_radar = f16_radar
+        self.su57_radar = su57_radar
+        self.awacs = awacs
         self.lock = threading.Condition()
         self.version = 0
         self.snapshot = {}
@@ -609,8 +874,11 @@ class SimEngine:
             self.thread.start()
 
     def _new_world(self) -> None:
-        self.world = main.build_world(self.seconds, 6, awacs=True)
-        self.agents = main.build_agents(False, seed=self.seed)
+        self.world = main.build_world(self.seconds, self.dof, awacs=self.awacs)
+        self.agents = main.build_agents(
+            self.baseline, seed=self.seed,
+            f16_radar=self.f16_radar, su57_radar=self.su57_radar,
+        )
         self.actions = [Action(), Action()]
         self.accumulator = 0.0
         self.steps = 0
@@ -637,7 +905,7 @@ class SimEngine:
         d_e = a.energy - b.energy
         dist_s = self._smooth("dist", dist, dt)
         dalt_s = self._smooth("dalt", d_alt, dt)
-        models = export_meta
+        models = export_meta["aircraft"]
         acs = [
             _ac_snapshot(world, i, self.agents[i],
                          models.get(world.acs[i].spec.name,
@@ -837,6 +1105,24 @@ class SimEngine:
 
 
 # ---------------------------------------------------------------------------
+# 1080p 帧采集 / 编码
+# ---------------------------------------------------------------------------
+
+def _safe_name(raw) -> str:
+    name = re.sub(r"[^\w.-]+", "_", str(raw or ""))[:64].strip("._")
+    return name or "shot"
+
+
+def _ffmpeg_bin():
+    """优先用 imageio-ffmpeg 自带的二进制，其次找系统 ffmpeg。"""
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+# ---------------------------------------------------------------------------
 # HTTP / SSE
 # ---------------------------------------------------------------------------
 
@@ -851,7 +1137,7 @@ class Handler(BaseHTTPRequestHandler):
         # 默认每个请求一行日志在 24 Hz SSE 下也只在连接/断开时打印，保留但简化。
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
-    def _send_file(self, path: Path, content_type: str) -> None:
+    def _send_file(self, path: Path, content_type: str, cache: str = "no-cache") -> None:
         try:
             data = path.read_bytes()
         except OSError:
@@ -860,7 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(data)
 
@@ -895,7 +1181,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/models/"):
             name = os.path.basename(path)
-            self._send_file(MODEL_DIR / name, "text/plain; charset=utf-8")
+            # 模型是重新导出的生成物，禁止浏览器缓存，避免继续用旧模型。
+            self._send_file(MODEL_DIR / name, "text/plain; charset=utf-8", "no-store")
+            return
+        if path.startswith("/captures/"):
+            name = os.path.basename(path)
+            ctype = "video/mp4" if name.endswith(".mp4") else "image/png"
+            self._send_file(CAPTURE_DIR / name, ctype, "no-cache")
             return
         if path.startswith("/static/"):
             rel = path[len("/static/"):]
@@ -907,7 +1199,8 @@ class Handler(BaseHTTPRequestHandler):
                     ".html": "text/html; charset=utf-8",
                     ".obj": "text/plain; charset=utf-8",
                 }.get(target.suffix, "application/octet-stream")
-                self._send_file(target, ctype)
+                # 开发期前端资源同样不缓存，改完刷新即生效。
+                self._send_file(target, ctype, "no-store")
                 return
         self.send_error(404)
 
@@ -942,8 +1235,76 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
+    def _capture_frame(self) -> None:
+        """接收一帧 PNG（binary body）并按 name_0000.png 落盘。"""
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict((k, v[0]) for k, v in urllib.parse.parse_qs(query).items())
+        name = _safe_name(params.get("name", "shot"))
+        try:
+            idx = max(0, int(params.get("i", "0")))
+        except ValueError:
+            self._json({"ok": False, "error": "bad index"}, 400)
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0 or length > 40_000_000:
+            self._json({"ok": False, "error": "bad length"}, 400)
+            return
+        data = self.rfile.read(length)
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        target = CAPTURE_DIR / f"{name}_{idx:04d}.png"
+        target.write_bytes(data)
+        self._json({"ok": True, "path": f"/captures/{target.name}", "bytes": len(data)})
+
+    def _capture_encode(self) -> None:
+        """把 name_*.png 帧序列编码成 MP4（服务端 ffmpeg，恒定帧率）。"""
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._json({"ok": False, "error": "invalid json"}, 400)
+            return
+        name = _safe_name(body.get("name", "shot"))
+        try:
+            fps = max(1.0, float(body.get("fps", 30.0)))
+        except (TypeError, ValueError):
+            fps = 30.0
+        frames = sorted(CAPTURE_DIR.glob(f"{name}_*.png"))
+        if not frames:
+            self._json({"ok": False, "error": "no frames"}, 400)
+            return
+        ffmpeg = _ffmpeg_bin()
+        if not ffmpeg:
+            self._json({"ok": False, "error": "ffmpeg not found"}, 500)
+            return
+        out = CAPTURE_DIR / f"{name}.mp4"
+        cmd = [
+            ffmpeg, "-y", "-framerate", f"{fps:.3f}",
+            "-start_number", "0",
+            "-i", str(CAPTURE_DIR / f"{name}_%04d.png"),
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p", str(out),
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=300,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._json({"ok": False, "error": str(exc)}, 500)
+            return
+        self._json({
+            "ok": True,
+            "path": f"/captures/{out.name}",
+            "frames": len(frames),
+            "fps": fps,
+        })
+
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/api/capture":
+            self._capture_frame()
+            return
+        if path == "/api/capture/encode":
+            self._capture_encode()
+            return
         if path != "/api/control":
             self.send_error(404)
             return
@@ -981,11 +1342,36 @@ def main_entry() -> None:
     parser = argparse.ArgumentParser(description="Dogfight Web 观战前端")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--seconds", type=float, default=300.0)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seconds", type=float, default=300.0,
+                        help="对局时长上限（默认 300 s）")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="固定开局随机占位的随机种子（默认每次启动随机）")
+    parser.add_argument("--baseline", action="store_true",
+                        help="双方使用纯追踪基线")
+    parser.add_argument(
+        "--dof", type=int, choices=(2, 3, 6), default=6,
+        help="内核自由度：默认 6（刚体）；2/3 仅用于 A/B 对照实验",
+    )
+    radar_choices = ("always", "silent", "auto")
+    parser.add_argument(
+        "--f16-radar", choices=radar_choices, default="always",
+        help="F-16V 雷达策略：常开 / 全程静默 / 静默+短时开机（默认 always）",
+    )
+    parser.add_argument(
+        "--su57-radar", choices=radar_choices, default="always",
+        help="Su-57 雷达策略（默认 always）",
+    )
+    parser.add_argument(
+        "--awacs", action=argparse.BooleanOptionalAction, default=True,
+        help="是否启用预警机（默认开启；--no-awacs 关闭）",
+    )
     args = parser.parse_args()
 
-    ENGINE = SimEngine(args.seconds, args.seed)
+    ENGINE = SimEngine(
+        args.seconds, args.seed, baseline=args.baseline, dof=args.dof,
+        f16_radar=args.f16_radar, su57_radar=args.su57_radar,
+        awacs=args.awacs,
+    )
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     print(f"Dogfight web observer: http://{args.host}:{args.port}/")

@@ -17,12 +17,17 @@ out/
 f_16c_model/
 I154-SU-57战机/
 Sukhoi_PAKFA.gif
+assets/flighter/
+assets/missle/
 
 # 视觉金标截图（本地验收基线，体积大，不入库）
 docs/images/golden/
 
 # Web 前端启动时由 render 模型导出的简化 OBJ（生成物，不入库）
 web/static/models/
+
+# 前端 1080p 采集上传的帧与编码视频（生成物，不入库）
+web/captures/
 
 # IDE / 系统文件
 .idea/

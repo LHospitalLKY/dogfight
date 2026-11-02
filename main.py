@@ -989,8 +989,8 @@ def main() -> None:
     parser.add_argument("--track-interval", type=float, default=10.0, help="轨迹采样间隔（秒）")
     parser.add_argument("--fps", type=int, default=20, help="录制帧率")
     parser.add_argument(
-        "--record-size", default="1280x800", metavar="WxH",
-        help="录制分辨率（默认 1280x800，例如 1920x1080）",
+        "--record-size", default="1920x1080", metavar="WxH",
+        help="录制分辨率（默认 1920x1080，例如 1280x800）",
     )
     parser.add_argument(
         "--start", type=float, default=0.0,
