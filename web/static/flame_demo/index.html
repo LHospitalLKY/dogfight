@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Su-57 Afterburner Test</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #06070a; }
+  body { font-family: "Fira Code", "SFMono-Regular", Consolas, monospace; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(circle at 50% 55%, rgba(0,0,0,0) 42%, rgba(0,0,0,0.55) 100%);
+  }
+  .tag {
+    position: fixed; pointer-events: none; letter-spacing: 1px;
+    color: #9eaaba; font-size: 15px;
+  }
+  #tag-title { left: 28px; top: 24px; color: #cfe3ff; }
+  #tag-sub { left: 28px; top: 48px; font-size: 13px; color: #66738a; }
+  #tag-bottom { left: 50%; transform: translateX(-50%); bottom: 26px; font-size: 14px; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="vignette"></div>
+<div id="tag-title">SU-57 · AFTERBURNER PLUME</div>
+<div id="tag-sub">双发加力燃烧 · 独立特效测试</div>
+<div id="tag-bottom">afterburner plume test · 1920 × 1080</div>
+
+<script src="../vendor/three.min.js"></script>
+<script src="su57_model.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("scene");
+  const renderer = new THREE.WebGLRenderer({
+    canvas, antialias: true, alpha: false,
+    powerPreference: "high-performance",
+    preserveDrawingBuffer: true,
+  });
+  renderer.setPixelRatio(1);
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x06070a);
+
+  const camera = new THREE.PerspectiveCamera(
+    40, window.innerWidth / window.innerHeight, 0.1, 400
+  );
+
+  // ---------- 灯光：暗夜环境，主光很弱，靠尾焰照亮机体 ----------
+  scene.add(new THREE.AmbientLight(0x9fb4d0, 0.10));
+  const key = new THREE.DirectionalLight(0xbfd0e8, 0.26);
+  key.position.set(-9, 14, 16);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0xffd8c0, 0.10);
+  rim.position.set(10, 6, -14);
+  scene.add(rim);
+  const fill = new THREE.DirectionalLight(0x7ea4ff, 0.10);
+  fill.position.set(12, -4, 6);
+  scene.add(fill);
+
+  // ---------- OBJ 解析（v / f / usemtl） ----------
+  function parseOBJ(text) {
+    const verts = [];
+    const groups = { body: [], canopy: [] };
+    let material = "body";
+    for (const raw of text.split(/\r?\n/)) {
+      if (raw.length < 2) continue;
+      if (raw.startsWith("v ")) {
+        const p = raw.trim().split(/\s+/);
+        verts.push([+p[1], +p[2], +p[3]]);
+      } else if (raw.startsWith("usemtl ")) {
+        material = raw.slice(7).trim() === "canopy" ? "canopy" : "body";
+      } else if (raw.startsWith("f ")) {
+        const idx = raw.trim().split(/\s+/).slice(1)
+          .map((tok) => parseInt(tok.split("/")[0], 10) - 1);
+        const g = groups[material];
+        for (let t = 1; t < idx.length - 1; t += 1) {
+          for (const i of [idx[0], idx[t], idx[t + 1]]) {
+            const p = verts[i];
+            if (p) g.push(p[0], p[1], p[2]);
+          }
+        }
+      }
+    }
+    const geo = (arr) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(arr, 3));
+      g.computeVertexNormals();
+      return g;
+    };
+    return { body: geo(groups.body), canopy: geo(groups.canopy) };
+  }
+
+  const model = parseOBJ(window.SU57_OBJ);
+  const bodyMat = new THREE.MeshStandardMaterial({
+    color: 0x565c66, roughness: 0.68, metalness: 0.34,
+    side: THREE.DoubleSide,
+  });
+  const canopyMat = new THREE.MeshStandardMaterial({
+    color: 0x6fb6e0, roughness: 0.22, metalness: 0.20,
+    transparent: true, opacity: 0.42, depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const jet = new THREE.Group();
+  jet.add(new THREE.Mesh(model.body, bodyMat));
+  jet.add(new THREE.Mesh(model.canopy, canopyMat));
+  scene.add(jet);
+
+  // ---------- 喷口位置（OBJ 坐标：机头 -Z，机尾 +Z） ----------
+  const ENGINES = [
+    [0.70, 0.0, 9.40],
+    [-0.70, 0.0, 9.40],
+  ];
+
+  // ---------- 加力羽流：屏幕朝向的带状面片 + 程序化着色 ----------
+  // 面片两端始终对齐喷口与羽流末端在屏幕上的投影，宽度在视空间内展开，
+  // 因此不存在交叉面片的硬边，任何视角下都是柔和的光带。
+  const plumeVert = `
+    attribute float aSide;
+    attribute float aV;
+    uniform float uLen;
+    uniform float uW0;
+    uniform float uW1;
+    uniform float uSpread;
+    varying vec2 vUv;
+    void main() {
+      vUv = vec2((aSide + 1.0) * 0.5, aV);
+      vec4 p0 = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+      vec4 p1 = modelViewMatrix * vec4(0.0, 0.0, uLen, 1.0);
+      vec2 d = p1.xy - p0.xy;
+      float dl = length(d);
+      vec2 dir = dl > 1e-5 ? d / dl : vec2(0.0, 1.0);
+      vec2 perp = vec2(-dir.y, dir.x);
+      vec4 mv = mix(p0, p1, aV);
+      mv.xy += perp * (aSide * 0.5 * mix(uW0, uW1, aV) * uSpread);
+      gl_Position = projectionMatrix * mv;
+    }
+  `;
+
+  const plumeFrag = `
+    precision highp float;
+    varying vec2 vUv;
+    uniform float uTime;      // 相位（2π 周期 → 循环无跳变）
+    uniform float uLevel;     // 0..1 加力等级
+    uniform float uSeed;
+    uniform float uGain;
+    uniform float uCoreMix;   // 1 核心光带 / 0 外围光晕
+
+    vec3 ramp(float v) {
+      vec3 white  = vec3(0.92, 0.99, 1.00);
+      vec3 cyan   = vec3(0.20, 0.82, 1.00);
+      vec3 blue   = vec3(0.16, 0.40, 1.00);
+      vec3 violet = vec3(0.62, 0.20, 1.00);
+      vec3 purple = vec3(0.38, 0.10, 0.72);
+      if (v < 0.18) return mix(white, cyan, v / 0.18);
+      if (v < 0.62) return mix(cyan, blue, (v - 0.18) / 0.44);
+      if (v < 0.80) return mix(blue, violet, (v - 0.62) / 0.18);
+      return mix(violet, vec3(0.82, 0.97, 0.56), clamp((v - 0.80) / 0.20, 0.0, 1.0));
+    }
+
+    void main() {
+      float v = vUv.y;                 // 0 喷口 → 1 尾端
+      float u = (vUv.x - 0.5) * 2.0;   // -1..1（已按该处羽流宽度归一化）
+
+      float core = exp(-pow(abs(u) * 2.80, 2.0));
+      float halo = exp(-pow(abs(u) * 1.00, 2.0));
+      float edge = 1.0 - smoothstep(0.52, 1.0, abs(u));
+
+      float alongCore = 1.0 - smoothstep(0.42, 1.0, v);
+      float alongHalo = 1.0 - smoothstep(0.26, 1.0, v);
+      float head = smoothstep(0.0, 0.045, v);
+      float tailCut = 1.0;
+      float hot = smoothstep(0.42, 0.0, v);
+
+      // 激波节：喷口附近更明显
+      float diamond = 0.62 + 0.38 * cos(v * 27.0 - uTime * 2.0 + uSeed * 4.0);
+      diamond = mix(1.0, diamond, smoothstep(0.62, 0.06, v));
+
+      // 湍流抖动
+      float turb = 0.84
+        + 0.10 * sin(u * 7.0 + uTime * 4.0 + uSeed * 9.0)
+        + 0.06 * sin(v * 16.0 - uTime * 6.0 + uSeed * 5.0);
+
+      float a = (core * uCoreMix * alongCore + halo * 0.34 * alongHalo)
+        * head * tailCut * diamond * turb * edge;
+      a *= uLevel * uGain * (1.0 + 0.25 * hot);
+      a = clamp(a, 0.0, 1.0);
+
+      vec3 colCore = ramp(v);
+      vec3 colHalo = vec3(1.00, 0.28, 0.82);
+      vec3 col = colCore * core * uCoreMix * 1.15 + colHalo * halo * 0.30;
+      col = mix(col, vec3(0.84, 0.97, 1.00), 0.55 * hot);
+      float tip = smoothstep(0.56, 0.98, v);
+      col = mix(col, vec3(0.88, 0.98, 0.58), tip * (0.45 + 0.40 * halo));
+
+      gl_FragColor = vec4(col, a);
+    }
+  `;
+
+  const ribbonGeo = new THREE.BufferGeometry();
+  ribbonGeo.setAttribute("position", new THREE.Float32BufferAttribute(
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3));
+  ribbonGeo.setAttribute("aSide", new THREE.Float32BufferAttribute([-1, 1, -1, 1], 1));
+  ribbonGeo.setAttribute("aV", new THREE.Float32BufferAttribute([0, 0, 1, 1], 1));
+  ribbonGeo.setIndex([0, 1, 2, 2, 1, 3]);
+
+  function plumeMesh(seed, spread, coreMix, gain, w0, w1) {
+    const uniforms = {
+      uTime: { value: 0 },
+      uLevel: { value: 1.0 },
+      uSeed: { value: seed },
+      uGain: { value: gain },
+      uCoreMix: { value: coreMix },
+      uSpread: { value: spread },
+      uLen: { value: 6.6 },
+      uW0: { value: w0 },
+      uW1: { value: w1 },
+    };
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: plumeVert,
+      fragmentShader: plumeFrag,
+      uniforms,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const m = new THREE.Mesh(ribbonGeo, mat);
+    m.frustumCulled = false;
+    return m;
+  }
+
+  // 每台发动机两层：窄的蓝白核心光带 + 更宽更淡的品红光晕带。
+  function makePlume(seed) {
+    const group = new THREE.Group();
+    const core = plumeMesh(seed, 1.0, 1.0, 1.70, 0.62, 1.60);
+    const halo = plumeMesh(seed + 0.4, 3.2, 0.0, 0.50, 0.62, 1.60);
+    group.add(core);
+    group.add(halo);
+    group.userData.core = core.material.uniforms;
+    group.userData.halo = halo.material.uniforms;
+    return group;
+  }
+
+  // 喷口辉光贴图（程序化径向渐变）
+  function makeGlowTexture() {
+    const s = 256;
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = s;
+    const ctx = cv.getContext("2d");
+    const grd = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    grd.addColorStop(0.00, "rgba(235,250,255,1.00)");
+    grd.addColorStop(0.12, "rgba(150,225,255,0.85)");
+    grd.addColorStop(0.28, "rgba(110,140,255,0.55)");
+    grd.addColorStop(0.48, "rgba(230,90,220,0.28)");
+    grd.addColorStop(0.72, "rgba(150,40,140,0.10)");
+    grd.addColorStop(1.00, "rgba(0,0,0,0)");
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, s, s);
+    return new THREE.CanvasTexture(cv);
+  }
+  const glowTex = makeGlowTexture();
+
+  const engines = ENGINES.map((pos, i) => {
+    const plume = makePlume(i === 0 ? 0.35 : 1.75);
+    plume.position.set(pos[0], pos[1], pos[2]);
+    plume.rotation.y = pos[0] > 0 ? 0.05 : -0.05;   // 双发轻微外张
+    scene.add(plume);
+
+    // 喷口处的白青色高热核心
+    const glowHot = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: 0xbfe4ff, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      opacity: 0.55,
+    }));
+    glowHot.position.set(pos[0], pos[1], pos[2] + 0.30);
+    glowHot.scale.setScalar(3.4);
+    scene.add(glowHot);
+
+    // 羽流中段的品红/紫外大光晕
+    const glowHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: 0xc257ff, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      opacity: 0.26,
+    }));
+    glowHalo.position.set(pos[0], pos[1], pos[2] + 4.2);
+    glowHalo.scale.setScalar(10.5);
+    scene.add(glowHalo);
+
+    const light = new THREE.PointLight(0x74c8ff, 3.2, 34, 1.8);
+    light.position.set(pos[0], pos[1], pos[2] + 0.9);
+    scene.add(light);
+
+    return { plume, uniCore: plume.userData.core, uniHalo: plume.userData.halo,
+             glowHot, glowHalo, light };
+  });
+
+  // ---------- 相机：尾后四分之三视角 ----------
+  const TARGET = new THREE.Vector3(-1.6, 0.20, 5.6);
+  const AZ0 = 1.15;
+  const ELEV = 0.30;
+
+  function placeCamera(phase) {
+    const az = AZ0 + 0.14 * Math.sin(phase);
+    const el = ELEV + 0.015 * Math.sin(phase * 2.0);
+    const dist = 19.5;
+    camera.position.set(
+      Math.sin(az) * Math.cos(el) * dist,
+      Math.sin(el) * dist,
+      TARGET.z + Math.cos(az) * Math.cos(el) * dist
+    );
+    camera.lookAt(TARGET);
+  }
+
+  const TAU = Math.PI * 2;
+  // ---------- 动画状态 ----------
+  const LOOP = 8.0;              // 秒，所有振荡按 2π 相位循环
+  let phase = 0.0;
+
+  function applyState(ph) {
+    phase = ph;
+    const level = 0.78 + 0.22 * Math.sin(ph * 2.0 - Math.PI / 2.0);
+    const flick = 0.90 + 0.10 * Math.sin(ph * 9.0);
+
+    for (const e of engines) {
+      const len = 5.6 + 1.3 * level;
+      for (const u of [e.uniCore, e.uniHalo]) {
+        u.uTime.value = ph;
+        u.uLevel.value = level;
+        u.uLen.value = len;
+        u.uW1.value = 1.15 + 0.50 * level;
+      }
+      e.glowHot.material.opacity = 0.18 + 0.10 * level;
+      e.glowHot.scale.setScalar(1.9 + 0.4 * level);
+      e.glowHalo.material.opacity = 0.10 + 0.10 * level;
+      e.glowHalo.position.z = e.plume.position.z + 0.42 * len;
+      e.glowHalo.scale.setScalar(6.4 + 1.8 * level);
+      e.light.intensity = 0.8 + 1.3 * level * flick;
+    }
+    placeCamera(ph);
+    renderer.render(scene, camera);
+  }
+
+  function resize() {
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener("resize", resize);
+
+  // 离线逐帧渲染接口（供录制脚本调用）
+  window.__snap = (t) => {
+    applyState((TAU * t) / LOOP);
+    return canvas.toDataURL("image/jpeg", 0.95);
+  };
+
+  let raf = 0;
+  function animate(now) {
+    const t = (now || 0) / 1000.0;
+    applyState(TAU * (t % LOOP) / LOOP);
+    raf = requestAnimationFrame(animate);
+  }
+
+  // ---------- 模型就绪 → 预热 → 启动 ----------
+  // SwiftShader 首次绘制时着色器编译/纹理上传有明显延迟，若立刻开始逐帧
+  // 采集会拿到若干全黑帧，因此先编译并反复渲染若干帧再标记就绪。
+  resize();
+  if (renderer.compile) renderer.compile(scene, camera);
+  for (let k = 0; k < 10; k += 1) applyState((TAU * k) / (LOOP * 20.0));
+  window.__ready = true;
+  if (!window.__capture) raf = requestAnimationFrame(animate);
+  window.addEventListener("keydown", (ev) => {
+    if (ev.code === "Space") {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(animate);
+    }
+  });
+})();
+</script>
+</body>
+</html>
