@@ -677,15 +677,15 @@ class _CachedFont:
         self._font.antialiased = True
         self.tabular = tabular
         self._cell = 0
+        # 逐字形合成（定宽数字与加字距标题）都按基线落笔，所有字体统一打开
+        # origin：只给 tabular 打开时，font_small 的标题走 _render_spaced 会
+        # 把字形画到行盒之外，栅格结果只剩 9 px 高，“SU-57 RDR ON”“WPN”
+        # 在成片里直接被削掉上半截。
+        self._font.origin = True
         self._ascent = self._font.get_sized_ascender()
         if tabular:
             adv = [self._font.get_metrics(str(d))[0][4] for d in range(10)]
             self._cell = int(round(sum(adv) / len(adv)))
-            # 逐字形栅格化时以基线为原点：默认 render_to 会把每个字形墨迹的
-            # 顶边都贴到 (0,0)，"." ":" "-" 这类矮字形会浮到字顶（例如
-            # "0.9" 的小数点看起来像撇号）。置 origin=True 后统一按基线落笔，
-            # 所有字形的行高自然对齐。
-            self._font.origin = True
         self._cache: dict[tuple, pygame.Surface] = {}
         # 单字形缓存：定宽数字每帧都在变（速度/高度/航向），字符串缓存命中率低，
         # 真正贵的是逐字符栅格化；按 (字符, 颜色) 缓存栅格结果后，合成就只剩 blit。
@@ -2215,28 +2215,43 @@ class Renderer:
             self.screen.blit(ps, (self.w / 2 - ps.get_width() / 2, 18))
 
     def _draw_missile_status(self, world: World) -> None:
-        """在飞导弹状态：只留目标与当前速度，窄条居中，不挤占主视区。"""
+        """在飞导弹状态：弹型 → 目标、当前速度，窄条居中，不挤占主视区。
+
+        原来只写目标名和速度，两枚弹追同一目标时会读成同一个目标同时在
+        以 311 和 423 m/s 飞行；现在给出弹型与目标，一眼能分清是哪两枚弹。
+        """
         live = [m for m in world.missiles if m.alive]
         if not live:
             return
-        width, row_h = 216, 16
-        height = 10 + row_h * len(live)
+        # 面板宽度按最长一行实测（“AIM-120C → SU-57  586 m/s”约 270 px），
+        # 不再写死：换成更长的弹型/目标名时会从右边溢出。
+        rows = []
+        for m in live:
+            target = world.acs[m.target] if 0 <= m.target < len(world.acs) else None
+            target_name = target.spec.name if target is not None else "-"
+            rows.append((
+                TEAM_COLORS[m.owner],
+                self.font_num_small.render(
+                    f"{m.spec.name} → {target_name}   {m.speed:4.0f} m/s",
+                    True, TEXT,
+                ),
+            ))
+        row_h = 16
+        width = max(s.get_width() for _c, s in rows) + 34
+        height = 10 + row_h * len(rows)
         x = self.w // 2 - width // 2
-        y = 236
+        # 姿态框底边在 y=238（py=20 + 高 218），这条状态条原来从 236 起笔，
+        # 正好压在姿态框的下边框上。留 8 px 间隙放到下面。
+        y = 246
         self._panel_bg(
             pygame.Rect(x, y, width, height), PANEL_FILL, edge=PANEL_EDGE
         )
 
-        for k, m in enumerate(live):
-            target = world.acs[m.target] if 0 <= m.target < len(world.acs) else None
-            target_name = target.spec.name if target is not None else "-"
-            color = TEAM_COLORS[m.owner]
-            # 队伍色圆点表示是谁发射的；文字只给目标与当前速度。
-            text = f"{target_name}   {m.speed:4.0f} m/s"
+        for k, (color, surf) in enumerate(rows):
+            # 队伍色圆点表示是谁发射的。
             pygame.draw.circle(
                 self.screen, color, (x + 10, y + 7 + k * row_h + 6), 3
             )
-            surf = self.font_num_small.render(text, True, TEXT)
             self.screen.blit(surf, (x + 20, y + 3 + k * row_h))
 
     def _draw_counters(self, world: World) -> None:
@@ -2263,12 +2278,12 @@ class Renderer:
         机体表面沿“威胁来向”做队伍色 → 告警红的渐变，越靠近来袭一侧越红。
         油门以滑动条 + 百分比给出，尾焰长度与当前推力（油门/加速度）同步。
         """
-        width, height = 440, 205
+        width, height = 440, 218
         px = (self.w - width) // 2
         py = 20
         self._attitude_rects = []
-        self._panel_bg(
-            pygame.Rect(px, py, width, height), PANEL_FILL, edge=BORDER
+        self._glass_panel(
+            pygame.Rect(px, py, width, height), edge=BORDER
         )
         pygame.draw.line(
             self.screen, BORDER, (px + width // 2, py + 6),
@@ -2283,7 +2298,7 @@ class Renderer:
             self.screen.blit(name, (hx + 10, py + 5))
             # 血量不在这里重复：它在本机 HUD 的顶部状态带里（见 _draw_hud_status）。
 
-            rect = pygame.Rect(hx + 8, py + 22, half - 16, 140)
+            rect = pygame.Rect(hx + 8, py + 22, half - 16, 134)
             self._attitude_rects.append(rect)
             # GPU 模式下机体由 GL 补画，这里只留地面线、Z 轴和尾焰。
             self._draw_attitude_model(
@@ -2293,7 +2308,7 @@ class Renderer:
             # 油门滑动条：填充比例即当前功率指令；加力时整条变成白蓝色。
             # 条长留出右侧读数位：读数右对齐到本半幅边缘，加力（“AB”）出现时
             # 也不会挤到相邻半幅的标签上。
-            bx, by, bw, bh = hx + 62, py + 173, 64, 9
+            bx, by, bw, bh = hx + 62, py + 174, 64, 9
             thr = clamp(ac.throttle, 0.0, 1.0) if ac.alive else 0.0
             ab = clamp(getattr(ac, "ab", 0.0), 0.0, 1.0) if ac.alive else 0.0
             pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
@@ -2312,7 +2327,7 @@ class Renderer:
             # 燃油条：加力油耗远高于军推，条长直接给出剩余油量。
             cap = ac.spec.fuel_capacity
             frac = clamp(ac.fuel / cap, 0.0, 1.0) if cap > 0.0 and ac.alive else 1.0
-            fy = py + 192
+            fy = py + 194
             pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, fy, bw, bh))
             pygame.draw.rect(
                 self.screen, (118, 196, 148), pygame.Rect(bx, fy, int(bw * frac), bh)
@@ -2508,23 +2523,30 @@ class Renderer:
     def _station_metrics(self) -> tuple[int, int, int, int, int, int, bool]:
         """三块仪表的尺寸：(簇宽, 雷达宽, 雷达高, HUD 宽, HUD 高, 武器高, 是否竖排)。"""
         margin = self.STATION_MARGIN
-        avail = max(320, (self.w - self.ATT_W) // 2 - margin - 8)
+        # 中间要给三维姿态框留出宽度和他的两侧间隙：按 (w - ATT_W) // 2 直接
+        # 算可用宽会让左右两簇各压住姿态框 12 px，成片里姿态框的圆角边线
+        # 正好切在本机 HUD 的外沿上。
+        avail = max(320, (self.w - self.ATT_W - 2 * margin - 16) // 2)
         weapon_h = self.WEAPON_H
         status_h = self.HUD_STATUS_H
         if avail >= 520:
-            # 并排：雷达至少 220 px、HUD 至少 300 px，簇宽封顶 640。
-            cluster_w = min(avail, 640)
-            hud_w = min(352, cluster_w - 228)
+            # 并排：簇宽按可用宽度给足（1080p 约 712 px），HUD 占不到六成。
+            cluster_w = min(avail, 760)
+            hud_w = min(456, int(cluster_w * 0.58))
             radar_w = cluster_w - hud_w - 8
-            # HUD 主体高度跟雷达高度走（三块面板右列总高 = 雷达高），
-            # 再加回顶部状态带的高度，保证航向/俯仰区不会被状态带挤扁。
-            hud_h = int(clamp(radar_w - 8 - weapon_h, 132, 202)) + status_h
+            # HUD 高度按自身宽度定（约 0.60），不再由雷达宽度反推：否则
+            # 雷达一窄，HUD 就被压成 188 px 高的横条，俯仰梯只够显示 ±20°，
+            # ±10° 的角度标注还会互相压住，速度/高度刻度也跟着挤成一团。
+            hud_h = int(clamp(hud_w * 0.60, 168, 280)) + status_h
             radar_h = max(radar_w, hud_h + 8 + weapon_h)
             return cluster_w, radar_w, radar_h, hud_w, hud_h, weapon_h, False
         # 竖排：雷达占满簇宽，压成 190–240 px 高的横屏也比细长条好读。
         radar_w = avail
         radar_h = int(clamp(min(avail * 0.58, self.h * 0.30), 190, 240))
-        return avail, radar_w, radar_h, avail, 168 + status_h, weapon_h, True
+        # HUD 高度同样按宽度给（宽高比约 1.56），1280×800 下也能容下
+        # 航向带、俯仰梯与两侧刻度带，不再压成 192 px 高的横条。
+        hud_h = int(clamp(avail * 0.58, 200, 300)) + status_h
+        return avail, radar_w, radar_h, avail, hud_h, weapon_h, True
 
     def _station_panels(self, i: int) -> tuple[pygame.Rect, pygame.Rect, pygame.Rect]:
         """第 i 架的三块仪表矩形（红方贴左上、蓝方贴右上，雷达始终靠外）。"""
@@ -2635,17 +2657,6 @@ class Renderer:
             return
         self.screen.blit(surf, r.topleft, r)
         self._overlay_dirty[key] = r
-
-    def _alpha_poly(
-        self, rect: pygame.Rect, color: tuple[int, int, int],
-        points, alpha: int,
-    ) -> None:
-        surf = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.polygon(
-            surf, (color[0], color[1], color[2], alpha),
-            [(x - rect.x, y - rect.y) for x, y in points],
-        )
-        self.screen.blit(surf, rect.topleft)
 
     def _panel_bg(
         self, rect: pygame.Rect, fill=None, *, alpha: int | None = None,
@@ -2758,16 +2769,32 @@ class Renderer:
         clip = rect.clip(self.screen.get_rect())
         if clip.w < 8 or clip.h < 8:
             return
-        region = self.screen.subsurface(clip).copy()
+        region = self.screen.subsurface(clip)
         div = GLASS_BLUR_DIV
         small = pygame.transform.smoothscale(
             region, (max(2, clip.w // div), max(2, clip.h // div))
         )
+        # 亮部软压缩：面板背后常有导弹尾焰、机体高光经过，直接模糊会在玻璃
+        # 上糊出一块灰白污渍（实测 t≈245 s 的 HUD 底部就被擦过面板的机体
+        # 盖住）。指数映射保留暗部（空域网格仍然透得出来），同时把接近纯白
+        # 的亮部压到 46 左右，亮物只剩一层很淡的雾。在小图上算，成本可忽略。
+        arr = pygame.surfarray.pixels3d(small)
+        arr[:] = (
+            46.0 * (1.0 - np.exp(-arr.astype(np.float32) / 40.0))
+        ).astype(np.uint8)
+        del arr
         blur = pygame.Surface(clip.size, pygame.SRCALPHA)
-        blur.blit(pygame.transform.smoothscale(small, clip.size), (0, 0))
-        blur.blit(self._glass_tint(clip.w, clip.h, alpha), (0, 0))
-        blur.blit(self._glass_sheen(clip.w, clip.h), (0, 0))
-        blur.blit(self._glass_noise(clip.w, clip.h), (0, 0))
+        # 先平滑放大到一半尺寸，再用最近邻放大到原尺寸：1/14 小图直接最近邻
+        # 放大后每格 14 px，会看出马赛克；平滑一次到半分辨率把格子缩到 2 px，
+        # 模糊底本来就低频，再最近邻翻倍已经看不出块状，成本又只有全尺寸
+        # 平滑的一半。
+        mid = (max(2, clip.w // 2), max(2, clip.h // 2))
+        blur.blit(
+            pygame.transform.scale(
+                pygame.transform.smoothscale(small, mid), clip.size
+            ), (0, 0),
+        )
+        blur.blit(self._glass_overlay(clip.w, clip.h, alpha), (0, 0))
         blur.blit(
             self._glass_mask(clip.w, clip.h, radius), (0, 0),
             special_flags=pygame.BLEND_RGBA_MULT,
@@ -2775,6 +2802,17 @@ class Renderer:
         self.screen.blit(blur, clip.topleft)
         # 投影、描边、上沿高光与队伍色强调条仍走静态 chrome。
         self._panel_bg(rect, None, edge=edge, radius=radius, bar=bar)
+
+    def _glass_overlay(self, w: int, h: int, alpha: int) -> pygame.Surface:
+        """把 tint、反光与颗粒预合成一张，逐帧只做一次 blit。"""
+        key = ("overlay", w, h, alpha)
+        surf = self._glass_cache.get(key)
+        if surf is None:
+            surf = self._glass_tint(w, h, alpha).copy()
+            surf.blit(self._glass_sheen(w, h), (0, 0))
+            surf.blit(self._glass_noise(w, h), (0, 0))
+            self._glass_cache[key] = surf
+        return surf
 
     def _glass_tint(self, w: int, h: int, alpha: int) -> pygame.Surface:
         """玻璃的压暗渐变：顶部略浅、底部略深，模拟玻璃厚度与受光。"""
@@ -2802,7 +2840,7 @@ class Renderer:
             band = max(6, int(h * 0.42))
             for row in range(band):
                 t = row / max(1, band - 1)
-                a = int(26 * (1.0 - t))
+                a = int(34 * (1.0 - t))
                 pygame.draw.line(
                     surf, (255, 255, 255, a), (0, row), (w, row)
                 )
@@ -2821,7 +2859,7 @@ class Renderer:
         if surf is None:
             rng = np.random.default_rng(7)
             gray = rng.integers(128, 192, (h, w, 1), dtype=np.uint8)
-            alpha = rng.integers(4, 10, (h, w, 1), dtype=np.uint8)
+            alpha = rng.integers(5, 12, (h, w, 1), dtype=np.uint8)
             rgba = np.concatenate((gray, gray, gray, alpha), axis=2)
             surf = pygame.image.frombuffer(
                 np.ascontiguousarray(rgba).tobytes(), (w, h), "RGBA"
@@ -2883,27 +2921,27 @@ class Renderer:
             f"{ac.spec.name} {'RDR ON' if ac.radar_on else 'RDR SIL'}",
             True, team, tracking=1,
         )
-        self.screen.blit(title, (radar.x + 10, radar.y + 6))
+        self.screen.blit(title, (radar.x + 12, radar.y + 6))
         # 标题下的 1 px 分隔线：把页头与下方的雷达画面明确分层。
         pygame.draw.line(
             self.screen, _mix(PANEL_EDGE, STATION_FILL, 0.4),
-            (radar.x + 10, radar.y + 24), (radar.right - 10, radar.y + 24), 1,
+            (radar.x + 12, radar.y + 24), (radar.right - 12, radar.y + 24), 1,
         )
         # 火控状态用 FS_TINY：窄屏雷达只有 220 px 宽，18 px 会直接撞上标题。
         st = self.font_tiny.render(lock_text, True, lock_color)
-        self.screen.blit(st, (radar.right - 10 - st.get_width(), radar.y + 8))
+        self.screen.blit(st, (radar.right - 12 - st.get_width(), radar.y + 8))
         if ac.radar_lock_timer > 0.0 and not ac.radar_locked:
             rspec = ac.spec.radar_missile
             frac = (
                 clamp(ac.radar_lock_timer / max(rspec.lock_time, 1e-6), 0.0, 1.0)
                 if rspec is not None else 0.0
             )
-            bx, by, bw, bh = radar.x + 10, radar.y + 27, radar.w - 20, 3
+            bx, by, bw, bh = radar.x + 12, radar.y + 27, radar.w - 24, 3
             pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
             pygame.draw.rect(
                 self.screen, lock_color, pygame.Rect(bx, by, int(bw * frac), bh)
             )
-        scope = pygame.Rect(radar.x + 5, radar.y + 32, radar.w - 10, radar.h - 37)
+        scope = pygame.Rect(radar.x + 8, radar.y + 34, radar.w - 16, radar.h - 42)
         self._draw_scope(world, i, scope, agent)
 
         # ---- 抬头显示仪 ----
@@ -2914,8 +2952,8 @@ class Renderer:
         )
         self._draw_fwd_hud(
             world, i,
-            pygame.Rect(hud.x + 1, hud.y + self.HUD_STATUS_H,
-                        hud.w - 2, hud.h - self.HUD_STATUS_H - 1),
+            pygame.Rect(hud.x + 5, hud.y + self.HUD_STATUS_H,
+                        hud.w - 10, hud.h - self.HUD_STATUS_H - 6),
         )
 
         # ---- 武器栏 ----
@@ -2933,8 +2971,8 @@ class Renderer:
         col = HUD_WARN if frac < 0.25 else HUD_GREEN
         y = rect.y + 3
         lab = self.font_num_small.render(f"HP {hp:3.0f}", True, col)
-        self.screen.blit(lab, (rect.x + 8, y))
-        bar = pygame.Rect(rect.x + 8 + lab.get_width() + 8, y + 6, 52, 5)
+        self.screen.blit(lab, (rect.x + 12, y))
+        bar = pygame.Rect(rect.x + 12 + lab.get_width() + 8, y + 6, 52, 5)
         pygame.draw.rect(self.screen, (26, 40, 34), bar)
         if frac > 0.0:
             pygame.draw.rect(
@@ -2942,10 +2980,10 @@ class Renderer:
                 pygame.Rect(bar.x, bar.y, max(1, int(bar.w * frac)), bar.h),
             )
         g = self.font_num_small.render(f"G {ac.n:3.1f}", True, HUD_GREEN)
-        self.screen.blit(g, (rect.right - 8 - g.get_width(), y))
+        self.screen.blit(g, (rect.right - 12 - g.get_width(), y))
         pygame.draw.line(
-            self.screen, PANEL_EDGE, (rect.x + 8, rect.bottom),
-            (rect.right - 8, rect.bottom), 1,
+            self.screen, PANEL_EDGE, (rect.x + 12, rect.bottom),
+            (rect.right - 12, rect.bottom), 1,
         )
 
     def _draw_scope(self, world: World, i: int, rect: pygame.Rect,
@@ -3135,6 +3173,12 @@ class Renderer:
         # 上部留给航向带（含方位尖标），底部留给速度/高度单位标注。
         ladder_top = rect.top + 54
         ladder_bottom = rect.bottom - 24
+        # 地平线、天空/地面色块与俯仰梯只落在中间的“梯窗”里：两侧的速度/
+        # 高度刻度带与上下单位标注不能被地平线斜着切过。大坡度时原来那条
+        # 贯穿全幅的地平线正好从 “SPD m/s”“150”“ALT m” 上划过去，
+        # 俯仰梯短线也会压到航向带的刻度数字上。
+        ladder_left = rect.left + 104
+        ladder_right = rect.right - 104
 
         def hud_pt(az: float, below: float) -> tuple[float, float]:
             """HUD 坐标 → 屏幕像素：az 沿横线方向，below 是相对机头基准向下的度数。"""
@@ -3152,22 +3196,22 @@ class Renderer:
 
         self.screen.set_clip(rect)
         try:
-            self._alpha_rect(rect, (14, 30, 44), 110)
-            # 地面：地平线以下的半边，随滚转倾斜
+            self._alpha_rect(rect, (14, 30, 44), 96)
+            ladder_win = pygame.Rect(
+                ladder_left, ladder_top,
+                max(1, ladder_right - ladder_left),
+                max(1, ladder_bottom - ladder_top),
+            )
+            self.screen.set_clip(ladder_win)
+            # 地平线本体：只画在梯窗内，不横切两侧刻度带。
             hx, hy = hud_pt(0.0, pitch)
             big = max(rect.w, rect.h) * 3.0
             hl = (hx - big * d_x, hy - big * d_y)
             hr = (hx + big * d_x, hy + big * d_y)
-            self._alpha_poly(
-                rect, (46, 54, 34),
-                [
-                    hl, hr,
-                    (hr[0] + big * n_x, hr[1] + big * n_y),
-                    (hl[0] + big * n_x, hl[1] + big * n_y),
-                ], 70,
-            )
-            # 地平线本体：整条贯穿视野，读起来更像抬头显示器
             pygame.draw.line(self.screen, HUD_GREEN, hl, hr, 1)
+            # 原来的天地色块已经去掉：它按地平线分成两种色，裁剪到梯窗后会在
+            # 窗口左右/下沿留下直角接缝；不裁又会斜着切过速度高度读数。暗场里
+            # 这条地平线本身已经够读，不需要再加一层低透明度色块。
             # 俯仰梯：5° 一短线、10° 一长线并标角度，0° 与地平线重合
             for p in range(-40, 45, 5):
                 mx, my = hud_pt(0.0, pitch - p)
@@ -3182,13 +3226,33 @@ class Renderer:
                     (mx + ln * d_x, my + ln * d_y), 1,
                 )
                 if major and p != 0:
-                    lab = self.font_num_small.render(f"{p:+d}", True, (92, 168, 126))
+                    # 坡度接近 90° 时，相邻 10° 俯仰格在屏幕上只隔几像素，
+                    # 角度标注会叠成一团（80° 坡度下 +20/+30/+40 已经连在一起）；
+                    # 这时只保留梯线，不画数字。
+                    if abs(n_y) * px_per_deg * 10.0 < 12.0:
+                        continue
+                    lab = self.font_tiny.render(f"{p:+d}", True, (92, 168, 126))
                     # 角度标注贴在线段左端：右端要留给高度带的五位数字，
-                    # 否则 +10/+20 会直接压到 9500/10000 上。
+                    # 否则 +10/+20 会直接压到 9500/10000 上。字号取 FS_TINY：
+                    # 大坡度时相邻 10° 标注的竖向间距会被压到 14 px 左右，
+                    # 18 px 字高会互相咬住。
                     lw, lh = lab.get_size()
-                    self.screen.blit(
-                        lab, (int(mx - ln * d_x) - 4 - lw, int(my - ln * d_y) - lh / 2)
-                    )
+                    lab_x = int(mx - ln * d_x) - 4 - lw
+                    lab_y = int(my - ln * d_y) - lh / 2
+                    # 梯窗上下/左右沿都会裁掉半个字：贴边的标注直接不画，
+                    # 否则航向带下沿会留一道被切断的 “+40”，大坡度时梯子
+                    # 左端还会露出只剩尾数的 “0”（完整标注是 “-10”）。
+                    if (lab_y < ladder_top or lab_y + lh > ladder_bottom
+                            or lab_x < ladder_left + 2
+                            or lab_x + lw > ladder_right - 2):
+                        continue
+                    # 固定水平标志画在最后且不随滚转，梯子转过一定角度后
+                    # 标注会正好落在它那对短线上被横穿；让标注避开中央区域。
+                    if pygame.Rect(lab_x, lab_y, lw, lh).colliderect(
+                        pygame.Rect(cx - 48, cy - 12, 96, 24)
+                    ):
+                        continue
+                    self.screen.blit(lab, (lab_x, lab_y))
 
             # 水平标志：固定不随横滚转动，它与俯仰梯的夹角就是当前坡度。
             # 中间留空，避免和机炮准星/目标框挤在一起，只留两端的长线加端标。
@@ -3197,9 +3261,17 @@ class Renderer:
             pygame.draw.line(self.screen, HUD_MARK, (cx - 44, cy - 4), (cx - 44, cy + 4), 2)
             pygame.draw.line(self.screen, HUD_MARK, (cx + 44, cy - 4), (cx + 44, cy + 4), 2)
 
-            # 速度/高度刻度带（当前值方框 + 滚动刻度），顶部航向带
+            # 速度/高度刻度带只允许出现在梯窗的纵向范围内：滚动刻度越过
+            # 上下边界时原来会画进顶部航向带，速度数字与 “HDG” 标签叠在
+            # 一起，高度带上端的 “13000” 也会挤到航向刻度下方。读数方框
+            # 在梯窗内，裁剪不影响它。
+            self.screen.set_clip(
+                pygame.Rect(rect.left + 2, ladder_top, rect.w - 4,
+                            ladder_bottom - ladder_top)
+            )
             self._speed_tape(rect.left + 2, ladder_top, ladder_bottom, ac.v, cy)
             self._altitude_tape(rect.right - 2, ladder_top, ladder_bottom, ac.z, cy)
+            self.screen.set_clip(rect)
             self._heading_tape(rect, math.degrees(ac.psi) % 360.0)
 
             # 目标框：视场内按真实方位/仰角投影，菱形框；出视场退化为头瞄指引。
@@ -3236,16 +3308,27 @@ class Renderer:
                         self._alpha_rect(chip, (10, 22, 18), 205)
                         self.screen.blit(lab, (chip.x + 3, chip.y + 2))
                     else:
-                        side = rect.right - 10 if rel > 0.0 else rect.left + 10
+                        # 出视场时的头瞄指引贴在梯窗两侧，不能落在速度/高度
+                        # 刻度带上：原来贴着面板边画，箭头正好压在速度读数
+                        # “150”上，HMD 标签也会盖住高度数字。右侧按五位高度
+                        # 读数框的实际宽度退让（读数框会从 44 px 往左扩到约
+                        # 73 px，“10467”），否则箭头会直接压在最低位上。
+                        # 箭头朝外（目标在哪一侧就指哪一侧），不要朝面板中心。
+                        side = (
+                            rect.right - 138 if rel > 0.0 else ladder_left + 4
+                        )
                         tri = (
                             [(side, cy - 7), (side, cy + 7),
-                             (side - 10 if rel > 0.0 else side + 10, cy)]
+                             (side + 10 if rel > 0.0 else side - 10, cy)]
                         )
                         self._aa_poly(lock_color, tri)
                         lab = self.font_small.render("HMD", True, lock_color)
+                        # 标签贴着箭头放：原来固定在面板顶部（rect.top+58），
+                        # 箭头却在面板中线，成片里 “HMD” 孤零零浮在航向带
+                        # 下面，看不出和箭头是一组。
                         self.screen.blit(
                             lab, (side - lab.get_width() if rel > 0.0 else side,
-                                  rect.top + 56)
+                                  cy + 10)
                         )
                 elif ac.contact == CONTACT_DETECT or ac.rwr:
                     brg = (math.degrees(ac.psi) + math.degrees(rel)) % 360.0
@@ -3389,6 +3472,11 @@ class Renderer:
         """顶部航向带：0° = 世界 +x 轴，顺时针增大（相对地球坐标系）。"""
         y = rect.top + 26
         cx = rect.centerx
+        hdg_cap = self.font_small.render("HDG", True, HUD_DIM)
+        # 左端要留出 “HDG” 标签的宽度：origin 修复后标签比旧版宽约 4 px，
+        # 原来固定 36 px 的门限会让第一个航向数字（如 210）贴着标签起笔，
+        # 成片里读成 “HDG210”。按实际字宽算，再多留 6 px 间隔。
+        label_left = rect.left + 6 + hdg_cap.get_width() + 6
         # 面板上沿多留一条窄带，给“仅方位”目标的尖标用（见 _bearing_marker）。
         self._alpha_rect(
             pygame.Rect(rect.left + 2, rect.top + 2, rect.w - 4, 42), (8, 22, 30), 120
@@ -3411,7 +3499,7 @@ class Renderer:
             if major:
                 lab = self.font_num_small.render(f"{t:03.0f}", True, (100, 176, 136))
                 # 左右两端留出“HDG”标签的位置，避免第一个航向数字压在上面
-                if x - lab.get_width() * 0.5 < rect.left + 36:
+                if x - lab.get_width() * 0.5 < label_left:
                     continue
                 if x + lab.get_width() * 0.5 > rect.right - 10:
                     continue
@@ -3420,10 +3508,10 @@ class Renderer:
                 if abs(x - cx) < 26.0 + lab.get_width() * 0.5 + 4.0:
                     continue
                 self.screen.blit(lab, (x - lab.get_width() / 2, y + 2))
-        self._value_box(pygame.Rect(cx - 26, y - 11, 52, 22), f"{hdg:3.0f}", ticks=True)
-        self.screen.blit(
-            self.font_small.render("HDG", True, HUD_DIM), (rect.left + 6, y + 2)
-        )
+        # 航向是三位读数：小于 100° 时必须补零（092、017），否则读数框
+        # 只有两位，和旁边的刻度标签（030/060）格式对不上。
+        self._value_box(pygame.Rect(cx - 26, y - 11, 52, 22), f"{hdg:03.0f}", ticks=True)
+        self.screen.blit(hdg_cap, (rect.left + 6, y + 2))
 
     def _speed_tape(self, x: int, top: int, bottom: int, v: float, cy: int) -> None:
         """左侧速度带：刻度随速度连续滚动，当前值锁在方框里（滚条式读数）。"""
@@ -3438,7 +3526,10 @@ class Renderer:
             major = int(k) % 50 == 0
             ln = 7 if major else 4
             pygame.draw.line(self.screen, HUD_DIM, (line_x - ln, y), (line_x, y), 1)
-            if major:
+            # 当前值方框附近不标数字：v 正好是 50 的整数倍时（300 m/s），
+            # 刻度标签会紧挨着读数框画出同样的数，成片里读成 “300 300”。
+            if (major and abs(y - cy) > 24
+                    and y - 9 >= top and y + 4 <= bottom):
                 lab = self.font_num_small.render(f"{k:3.0f}", True, (100, 176, 136))
                 self.screen.blit(lab, (x + 2, y - 9))
             k += 10.0
@@ -3466,7 +3557,8 @@ class Renderer:
                 # 当前值方框压住的那几行不再标数字（方框里已经是精确读数）。
                 # 门限要含字形高度：只排除 |y-cy|≤16 时，紧邻方框的读数
                 # 仍会露出半个字，看起来像方框里多了一位。
-                if abs(y - cy) > 24 and int(k) % int(lab_step) == 0:
+                if (abs(y - cy) > 24 and int(k) % int(lab_step) == 0
+                        and y - 9 >= top and y + 4 <= bottom):
                     lab = self.font_num_small.render(f"{k:5.0f}", True, (100, 176, 136))
                     # 标在刻度线左侧：右侧只剩 34 px 到面板边，五位数字摆不下
                     self.screen.blit(lab, (line_x - 9 - lab.get_width(), y - 9))
@@ -3631,7 +3723,7 @@ class Renderer:
         )
         self.screen.blit(
             self.font_small.render("WPN", True, (104, 202, 150), tracking=1),
-            (rect.x + 8, rect.y + 4),
+            (rect.x + 12, rect.y + 4),
         )
         inflight = sum(1 for m in world.missiles if m.alive and m.owner == i)
         threat = self._missile_threat(world, i)
@@ -3642,7 +3734,7 @@ class Renderer:
         else:
             tag, tcol = "CLEAR", (104, 202, 150)
         t = self.font_small.render(tag, True, tcol)
-        self.screen.blit(t, (rect.right - 8 - t.get_width(), rect.y + 4))
+        self.screen.blit(t, (rect.right - 12 - t.get_width(), rect.y + 4))
 
         # 格斗弹导引头状态（原来在信息卡的 MSL 行）：持续留在视场内读满时间
         # 才转 LOCK。放在页头中段，和右侧的导弹/CLEAR 状态错开。
@@ -3681,7 +3773,7 @@ class Renderer:
             if spec is None:
                 continue
             y = rect.y + 22 + k * row_gap
-            x = rect.x + 8 if left else rect.right - 8
+            x = rect.x + 12 if left else rect.right - 12
             head = self.font_small.render(title, True, dim)
             self.screen.blit(head, (x if left else x - head.get_width(), y))
             # 弹体 logo：一排小弹体剪影，已挂载的亮、已打掉的压暗，
@@ -3700,7 +3792,7 @@ class Renderer:
                                          name_col if have else empty)
             self.screen.blit(tag, (x if left else x - tag.get_width(), y + 14))
 
-        by = rect.bottom - 19
+        by = rect.bottom - 22
         gun = self.font_small.render(f"GUN {int(ac.ammo)}", True, dim)
         self.screen.blit(gun, (rect.x + 8, by))
         cm = self.font_small.render(
