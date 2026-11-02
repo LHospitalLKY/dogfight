@@ -1412,6 +1412,41 @@ ${shader.fragmentShader}`;
   });
   const ARROW_EVERY = 25;
 
+  // 视觉机尾偏移：飘带整体沿机体轴后移到喷口、再下移到喷口高度。
+  // 开火点/发射点/高 G 点这些挂在航迹上的标记复用同一偏移，
+  // 否则会留在真实机体位置，和画出来的飘带错开。
+  function visualEngineOffset(i, snap) {
+    const view = aircraftViews[i];
+    const ac = snap.acs ? snap.acs[i] : null;
+    if (!view || !ac) return null;
+    const eye = w2t(snap.camera.eye);
+    const center = new THREE.Vector3(snap.camera.cx, snap.camera.cz, -snap.camera.cy);
+    const focal = (window.innerHeight / 2.0)
+      / Math.tan((snap.fov || 50.0) * Math.PI / 360.0);
+    const centerAc = ac.alive ? w2t(ac.pos) : new THREE.Vector3();
+    const depthAc = Math.max(1.0, eye.distanceTo(centerAc));
+    const targetPx = 46.0 * clamp(8000.0 / depthAc, 2.0, 3.0);
+    const k = targetPx * depthAc / (focal * REF_LENGTH);
+    const sp = Math.sin(ac.psi);
+    const cp = Math.cos(ac.psi);
+    const st = Math.sin(ac.theta);
+    const ct = Math.cos(ac.theta);
+    const xb = [ct * cp, ct * sp, st];
+    return {
+      xb,
+      back: Math.max(0.0, view.engineZ || 0.0) * k,
+      drop: Math.max(0.0, -(view.engineY || 0.0)) * k,
+    };
+  }
+
+  function applyEngineOffset(v, off) {
+    if (!off) return v;
+    v.x -= off.xb[0] * off.back;
+    v.y -= off.xb[2] * off.back + off.drop;
+    v.z += off.xb[1] * off.back;
+    return v;
+  }
+
   function updateTrails(snap) {
     for (let i = 0; i < 2; i += 1) {
       const src = snap.trails[i] || { points: [] };
@@ -1468,22 +1503,13 @@ ${shader.fragmentShader}`;
         axisW.push(w2t(yb));
         times.push(now);
       }
-      // 整条飘带沿机体向后（机体轴 -xb）平移：距离取机体中心到发动机中心
-      // 在机体轴向上的分量（模型局部 +z），按当前视觉缩放 k 换算成世界坐标，
-      // 机体显示大小随镜头距离变化，所以每帧用当前的 k。
-      const backShift = Math.max(0.0, aircraftViews[i].engineZ || 0.0) * k;
-      if (backShift > 0.0) {
-        for (const p of P) {
-          p.x -= xb[0] * backShift;
-          p.y -= xb[2] * backShift;
-          p.z += xb[1] * backShift;
-        }
-      }
-      // 飘带整体下移到喷口高度：模型局部 y 向下为负，机体中心到发动机
-      // 中心的纵向间距同样按当前 k 换算。
-      const drop = Math.max(0.0, -(aircraftViews[i].engineY || 0.0)) * k;
-      if (drop > 0.0) {
-        for (const p of P) p.y -= drop;
+      // 整条飘带沿机体向后（机体轴 -xb）平移、再下移到喷口高度：
+      // 距离取发动机中心相对机体中心的模型偏移，按当前视觉缩放 k 换算成
+      // 世界坐标；机体显示大小随镜头距离变化，所以每帧都用当前的 k。
+      // 开火点、发射点与高 G 点复用同一偏移，保证标记贴在飘带上。
+      const off = visualEngineOffset(i, snap);
+      if (off) {
+        for (const p of P) applyEngineOffset(p, off);
       }
       // Catmull-Rom 细分：60 m 一个后端采样点，直接连折线会在转弯处出现
       // 生硬折角。中心线按 TRAIL_SUB 细分，展向/时间同步插值；端点复制一份
@@ -2210,23 +2236,26 @@ ${shader.fragmentShader}`;
 
   function updateMarks(snap) {
     const marks = snap.marks || {};
+    // 航迹标记跟随飘带的视觉偏移：开火点按所属队伍、发射点与高 G 点
+    // 按 owner 取同一机体的机尾偏移，否则会停在真实机体坐标上。
+    const offsets = [visualEngineOffset(0, snap), visualEngineOffset(1, snap)];
     for (let i = 0; i < 2; i += 1) {
       const arr = [];
       for (const p of marks.fire?.[i] || []) {
-        const v = w2t(p);
+        const v = applyEngineOffset(w2t(p), offsets[i]);
         arr.push(v.x, v.y, v.z);
       }
       setPointsPositions(firePoints[i], arr);
     }
     const launch = [];
     for (const m of marks.launch || []) {
-      const v = w2t(m.pos);
+      const v = applyEngineOffset(w2t(m.pos), offsets[m.owner] || null);
       launch.push(v.x, v.y, v.z);
     }
     setPointsPositions(launchPoints, launch);
     const highg = [];
     for (const m of marks.highg || []) {
-      const v = w2t(m.pos);
+      const v = applyEngineOffset(w2t(m.pos), offsets[m.owner] || null);
       highg.push(v.x, v.y, v.z);
     }
     setPointsPositions(highgPoints, highg);
