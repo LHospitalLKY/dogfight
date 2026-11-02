@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from array import array
 
 import numpy as np
@@ -30,26 +31,72 @@ from sim import (
     wrap_pi,
 )
 
-# 主界面配色：底色压深压冷，文字、机体和航迹统一提高明度，这样叠上半透明
-# 面板、地形图之后仍然读得清；红方偏橙红、蓝方偏亮青蓝，与 HUD 绿、告警黄
-# 和地形图的青灰都不会混色。
-BG = (11, 15, 21)
-GRID = (34, 44, 58)
-BORDER = (82, 96, 114)
-TEXT = (238, 243, 250)
-SUB = (158, 170, 186)
-TEAM_COLORS = ((255, 116, 96), (92, 178, 255))
-# 抬头显示仪的通用色板：主绿 = 地平线/刻度/读数，暗绿 = 细刻度，
-# 琥珀 = 当前值方框、水平标志与机炮落点，红 = 来袭告警。
-HUD_GREEN = (132, 236, 178)
-HUD_DIM = (74, 140, 106)
-HUD_MARK = (255, 214, 120)
-HUD_WARN = (255, 96, 84)
+# 配色全部收敛到 theme.py：背景压深压冷，文字、机体和航迹统一提高明度，
+# 红方偏橙红、蓝方偏亮青蓝，与 HUD 绿、告警黄和地形图的青灰都不会混色。
+from theme import (  # noqa: E402
+    ACCENT_RED,
+    AIR_EDGE,
+    AIR_GRID,
+    AMB,
+    BG,
+    BORDER,
+    CANOPY_COLOR,
+    CLAY_AO,
+    CLAY_CANOPY,
+    CLAY_EDGE,
+    CLAY_INTAKE,
+    CLAY_LIT,
+    CLAY_NOZZLE,
+    FONT_NUM,
+    FONT_UI,
+    FS_BODY,
+    FS_H1,
+    FS_SMALL,
+    FS_TINY,
+    GLASS_TINT,
+    GRID,
+    HUD_DIM,
+    HUD_GREEN,
+    HUD_MARK,
+    HUD_WARN,
+    ICON_STROKE,
+    INTAKE_COLOR,
+    KEY,
+    NOZZLE_COLOR,
+    NUM_TAU,
+    PANEL_EDGE,
+    PANEL_EDGE_HI,
+    PANEL_FILL,
+    RADIUS_CHIP,
+    RADIUS_PANEL,
+    RIM,
+    SCENE_BG,
+    SCENE_STRIPE,
+    STATIC_SCALE,
+    STATION_ALPHA,
+    STATION_FILL,
+    STRIPE_ALPHA,
+    STRIPE_STEP,
+    SUB,
+    TEAM_COLORS,
+    TEAM_TINT,
+    TEXT,
+    VIGNETTE_ALPHA,
+    VIGNETTE_INNER,
+)
+
 # 轨迹采样间距：整场都保留，但按距离抽点，避免几千段线拖慢每帧。
 TRAIL_SPACING = 60.0
 # 航迹飘带半宽（屏幕像素）：按相机深度换算成世界尺度，保证镜头拉近拉远时
 # 飘带都有稳定的可见厚度，而不是一条 1–2 px 的细线。
 TRAIL_HALF_PX = 5.0
+# 横截面明暗：中心最亮、向两侧连续变暗，两侧再分一点受光差异（+y 侧比
+# -y 侧略亮），飞机滚转时展向翻转，明暗方向随之交换。按 TRAIL_BANDS 拆窄带
+# 插值，条数越多台阶越不明显，取 8 条在 720p～2K 下都看不出色阶。
+TRAIL_CENTER_LIT = 1.14
+TRAIL_EDGE_LIT = 0.98
+TRAIL_EDGE_DARK = 0.82
+TRAIL_BANDS = 8
 # 航迹飘带的“天光”方向（右上前方）：飘带法向与它越接近越亮，
 # 飞机滚转、倒扣时法向随之转动，飘带就出现明暗起伏。
 TRAIL_LIGHT = (-0.35, -0.55, 0.76)
@@ -62,9 +109,10 @@ SHOT_SPACING = 120.0
 ARROW_EVERY = 25
 
 # ---- 轨迹上的事件标记（实时画在 3D 航迹线上，不是事后出图） ----
-# 金色星标 = 导弹发射点；橙色菱形 = 高 G 机动点。
-LAUNCH_MARK = (255, 209, 102)
-HIGH_G_MARK_COLOR = (255, 122, 69)
+# 展示风格里红色只留给人眼需要立刻反应的告警：发射点用米白星标、
+# 高 G 点用浅灰菱形，都不抢红色的语义。
+LAUNCH_MARK = (243, 239, 230)
+HIGH_G_MARK_COLOR = (185, 190, 197)
 # 过载超过人体可持续耐受（6 g）即标注；高空升力受限时（9–12 km、300 m/s
 # 量级）可用过载本身只有 4–5 g，因此执行高 G 原语且拉到当地可用过载的
 # 75% 也标注，否则航迹上几乎看不到高 G 点（与 main.py 一致）。
@@ -202,6 +250,69 @@ F16_CANOPY_MATERIALS = {
 F16_GEAR_Y = -0.95
 
 
+def _bake_ao(faces: list, radius: float) -> tuple[list, list]:
+    """给每个面烘焙环境光遮蔽（0.35–1.0），返回 (面表, 法线表)。
+
+    面表元素是 (poly, kind, ao)；法线表是与之等长的 (nx, ny, nz)，已在
+    机体系下算好，逐帧渲染时直接把光照方向转回机体系点乘，省掉每帧对
+    每个面重新做叉积和归一化。
+
+    一次性开销：用点云式半球遮挡代替逐面射线——对每个面把邻近面片按
+    “朝向它的程度 × 距离衰减”累加，再按全体均值做相对归一化，因此结果与
+    模型尺度无关。机腹、翼根、进气道这些凹处会自然压暗，翼尖与机背保持亮。
+    """
+    if not faces:
+        return faces, []
+    n = len(faces)
+    cents = np.empty((n, 3), dtype=np.float32)
+    nrms = np.empty((n, 3), dtype=np.float32)
+    flips: list[bool] = []
+    for i, (poly, _kind) in enumerate(faces):
+        m = len(poly)
+        cx = sum(p[0] for p in poly) / m
+        cy = sum(p[1] for p in poly) / m
+        cz = sum(p[2] for p in poly) / m
+        ex1, ey1, ez1 = (
+            poly[1][0] - poly[0][0], poly[1][1] - poly[0][1], poly[1][2] - poly[0][2]
+        )
+        ex2, ey2, ez2 = (
+            poly[2][0] - poly[0][0], poly[2][1] - poly[0][1], poly[2][2] - poly[0][2]
+        )
+        nx = ey1 * ez2 - ez1 * ey2
+        ny = ez1 * ex2 - ex1 * ez2
+        nz = ex1 * ey2 - ey1 * ex2
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+        nx, ny, nz = nx / ln, ny / ln, nz / ln
+        # OBJ 的绕序不统一：法线统一翻到背离模型中心的一侧，并同步反转顶点
+        # 顺序，让所有面的绕序都与外法线一致，渲染时才能做背面剔除。
+        flip = nx * cx + ny * cy + nz * cz < 0.0
+        if flip:
+            nx, ny, nz = -nx, -ny, -nz
+        flips.append(flip)
+        cents[i] = (cx, cy, cz)
+        nrms[i] = (nx, ny, nz)
+
+    occ = np.zeros(n, dtype=np.float32)
+    # 分块算，避免 n×n×3 的中间数组在大模型上吃掉几百 MB 内存。
+    for lo in range(0, n, 256):
+        hi = min(lo + 256, n)
+        diff = cents[None, :, :] - cents[lo:hi, None, :]
+        dist = np.sqrt((diff ** 2).sum(axis=2)) + 1e-6
+        cosw = -(diff * nrms[lo:hi, None, :]).sum(axis=2) / dist
+        w = np.clip(cosw, 0.0, None) * np.clip(1.0 - dist / radius, 0.0, None)
+        occ[lo:hi] = w.sum(axis=1)
+    mean = float(occ.mean()) or 1.0
+    ao = np.clip(1.0 / (1.0 + 0.45 * occ / mean), 0.35, 1.0)
+    normals = [
+        (float(nrms[i, 0]), float(nrms[i, 1]), float(nrms[i, 2]))
+        for i in range(n)
+    ]
+    return [
+        (list(reversed(poly)) if flips[i] else poly, kind, float(ao[i]))
+        for i, (poly, kind) in enumerate(faces)
+    ], normals
+
+
 def _load_obj_model(
     path: str,
     length: float,
@@ -209,6 +320,7 @@ def _load_obj_model(
     keep_materials: set | None = None,
     canopy_materials: set | None = None,
     gear_y: float | None = None,
+    mini_voxel: float | None = None,
 ) -> dict:
     """读取 OBJ 并做体素聚类简化，返回机体坐标系下的面列表。
 
@@ -246,63 +358,88 @@ def _load_obj_model(
     scale = length / (max(xs) - min(xs))
 
     # 体素聚类：同一格内的顶点合并到平均位置，面数从 4 万降到几千。
-    buckets = {}
-    for i in used:
-        x, y, z = verts[i]
-        key = (round(x / voxel), round(y / voxel), round(z / voxel))
-        slot = buckets.get(key)
-        if slot is None:
-            buckets[key] = [x, y, z, 1]
-        else:
-            slot[0] += x
-            slot[1] += y
-            slot[2] += z
-            slot[3] += 1
-
-    remap = {}
-    pts = []
-    for k, (key, slot) in enumerate(buckets.items()):
-        remap[key] = k
-        pts.append((slot[0] / slot[3], slot[1] / slot[3], slot[2] / slot[3]))
-
-    out = []
-    seen = set()
-    for idx, material in faces:
-        cluster = []
-        for i in idx:
+    # 同一个 OBJ 只解析一次，姿态框用的粗模型按更大的体素重新聚类。
+    def cluster(vox: float) -> list:
+        buckets = {}
+        for i in used:
             x, y, z = verts[i]
-            c = remap[(round(x / voxel), round(y / voxel), round(z / voxel))]
-            if c not in cluster:
-                cluster.append(c)
-        if len(cluster) < 3:
-            continue
-        sig = tuple(sorted(cluster))
-        if sig in seen:
-            continue
-        seen.add(sig)
-        poly = [
-            ((pts[c][0] - cx) * scale,
-             (pts[c][2] - cz) * scale,
-             -(pts[c][1] - cy) * scale)
-            for c in cluster
-        ]
-        kind = "canopy" if material in canopy_set else "body"
-        out.append((poly, kind))
-    return {"length": length, "faces": out, "cull": False, "outline": False}
+            key = (round(x / vox), round(y / vox), round(z / vox))
+            slot = buckets.get(key)
+            if slot is None:
+                buckets[key] = [x, y, z, 1]
+            else:
+                slot[0] += x
+                slot[1] += y
+                slot[2] += z
+                slot[3] += 1
+
+        remap = {}
+        pts = []
+        for k, (key, slot) in enumerate(buckets.items()):
+            remap[key] = k
+            pts.append((slot[0] / slot[3], slot[1] / slot[3], slot[2] / slot[3]))
+
+        out = []
+        seen = set()
+        for idx, material in faces:
+            cells = []
+            for i in idx:
+                x, y, z = verts[i]
+                c = remap[(round(x / vox), round(y / vox), round(z / vox))]
+                if c not in cells:
+                    cells.append(c)
+            if len(cells) < 3:
+                continue
+            sig = tuple(sorted(cells))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            poly = [
+                ((pts[c][0] - cx) * scale,
+                 (pts[c][2] - cz) * scale,
+                 -(pts[c][1] - cy) * scale)
+                for c in cells
+            ]
+            kind = "canopy" if material in canopy_set else "body"
+            out.append((poly, kind))
+        return out
+
+    out, normals = _bake_ao(cluster(voxel), radius=max(1.0, length * 0.25))
+    # OBJ 的绕序不统一（约 4 成面的绕序朝内），按面心相对模型中心的启发式
+    # 翻转并不能可靠地判断“外表面”，做背面剔除会在翼面/机身内侧留下灰斑。
+    # 因此仍按双面绘制、远面先画近面覆盖，只把烘焙出的法线留下给着色用。
+    model = {
+        "length": length, "faces": out, "normals": normals,
+        "cull": False, "outline": False,
+    }
+    if mini_voxel is not None:
+        # 姿态框只有约 108 px 长，用稍粗的一档聚类；比主模型省面，但仍保留
+        # 机身、翼面与尾翼的完整轮廓（远高于旧版约 120 面的粗模）。
+        mini, mini_normals = _bake_ao(
+            cluster(mini_voxel), radius=max(1.0, length * 0.25)
+        )
+        model["mini_faces"] = mini
+        model["mini_normals"] = mini_normals
+    return model
 
 
-# Su-57 直接用 SU-57 文件夹里的 OBJ，体素 0.05（约 0.5 m）：约 1500 面，
-# 游戏里机体最多约 100 px，这个精度足够，还能保住 60 fps 以上。
+# 面数按“主视图最多约 140 px”反推：0.03 m / 0.28 m 一格保留约 2900 / 3700 面，
+# 140 px 下单个面接近 1 px，翼身与进气道轮廓比 0.06 / 0.35 m 明显更完整。
+# 姿态框另有 0.06 / 0.40 m 的 mini 面表，约 1100 / 1900 面：108 px 下已看不到
+# 体素台阶，观感与主视图同级。
 # 长度取公开数据 20.1 m；F-16 取 15.06 m，两者屏幕上保持真实尺寸比例。
-SU57_MODEL = _load_obj_model(SU57_OBJ_PATH, 20.1, 0.05, gear_y=_GEAR_Y)
+SU57_MODEL = _load_obj_model(
+    SU57_OBJ_PATH, 20.1, 0.03, gear_y=_GEAR_Y, mini_voxel=0.06,
+)
 # 双发尾喷口位置（机体系，x 向后、y 右、z 下），用于画尾焰。
 SU57_MODEL["engines"] = [(-9.4, 0.7, 0.0), (-9.4, -0.7, 0.0)]
 
 F16_MODEL = _load_obj_model(
-    F16_OBJ_PATH, 15.06, 0.40,
+    F16_OBJ_PATH, 15.06, 0.28,
     keep_materials=F16_KEEP_MATERIALS,
     canopy_materials=F16_CANOPY_MATERIALS,
     gear_y=F16_GEAR_Y,
+    mini_voxel=0.40,
 )
 F16_MODEL["engines"] = [(-7.30, 0.0, 0.0)]
 
@@ -314,8 +451,9 @@ _ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 # 城市地图（CityMapStudio 风格，覆盖 200 km × 200 km，与 main.py 的 arena 对齐）。
 TERRAIN_ORTHO_PATH = os.path.join(_ASSET_DIR, "terrain", "city_ortho.png")
 TERRAIN_SIZE_M = 200000.0
-# 地面透视贴图的降采样步长（像素）：6 像素一格，放大后再做平滑。
-GROUND_STEP = 6
+# 地面透视贴图的降采样步长（像素）：8 像素一格，放大后再做平滑。步长越大
+# 逐像素射线越少（1600×1000 下从 4.4 万降到 2.5 万），贴图放大后仍是平滑的。
+GROUND_STEP = 8
 # 武器页的机体俯视轮廓（由 OBJ 正交投影生成，机头朝上、透明底）。
 SILHOUETTE_PATH = {
     "SU-57": os.path.join(_ASSET_DIR, "silhouette", "su57_top.png"),
@@ -331,9 +469,6 @@ PART_SHADE = {
     "intake": None,
     "nozzle": None,
 }
-CANOPY_COLOR = (126, 196, 238)
-INTAKE_COLOR = (52, 56, 62)
-NOZZLE_COLOR = (92, 88, 84)
 
 # 武器页中央的本机俯视轮廓：只给右半侧（x 向前、y 向右，单位 = 机长），
 # 左半侧在 aircraft_silhouette() 里镜像拼接。y 的最大值 = 翼展 / 机长 / 2，
@@ -393,14 +528,151 @@ def _norm(a) -> tuple[float, float, float]:
     return (a[0] / n, a[1] / n, a[2] / n)
 
 
+# 白模配色缓存：明暗量按 1/16 分档，颜色算一次复用，逐面只剩查表。
+_CLAY_CACHE: dict[tuple, tuple] = {}
+
+
+def _clay(kind: str, shade: float, team: int) -> tuple:
+    """白模材质取色：暗部是 AO 灰，亮部是接近纯白的基色。
+
+    shade = AMB·ao + KEY·|n·l| + RIM·(1-|n·v|)²，已在调用处算好；
+    这里把 shade 分档后做“AO 灰 → 基色”的插值，再按队伍色轻染色。
+    """
+    bucket = int(clamp(shade, 0.0, 1.0) * 16.0) / 16.0
+    key = (kind, bucket, team)
+    color = _CLAY_CACHE.get(key)
+    if color is None:
+        if kind == "canopy":
+            base = CLAY_CANOPY
+        elif kind == "intake":
+            base = CLAY_INTAKE
+        elif kind == "nozzle":
+            base = CLAY_NOZZLE
+        else:
+            base = _mix(CLAY_LIT, TEAM_COLORS[team], TEAM_TINT)
+        color = tuple(
+            int(clamp(CLAY_AO[i] + (base[i] - CLAY_AO[i]) * bucket, 0, 255))
+            for i in range(3)
+        )
+        _CLAY_CACHE[key] = color
+    return color
+
+
+class _CachedFont:
+    """pygame.freetype 字体包装，保持 Font.render(text, antialias, color) 接口。
+
+    freetype 带 hinting，文字比内置位图字体锐利；按 (文字, 颜色) 缓存字形
+    Surface，避免每帧重复栅格化——这也是把 HUD 压进 4 ms 预算的关键。
+
+    tabular=True 时数字按“定宽槽位”渲染：把 0–9 各自居中放进同一宽度（全字形
+    平均步进）的槽里，等价于排版里的 tabular figures，读数逐帧变化时整行宽度
+    不抖动；Fira Code 本身已是等宽字体，槽宽恰好等于自然步进，因此换字体的
+    情况下这条约束依然成立，其余字符仍走自然宽度。
+    """
+
+    MAX_CACHE = 4096
+
+    def __init__(self, name: str, size: int, tabular: bool = False) -> None:
+        pygame.freetype.init()
+        path = name if os.path.isfile(name) else pygame.font.match_font(name)
+        self._font = (
+            pygame.freetype.Font(path, size) if path
+            else pygame.freetype.SysFont(name, size)
+        )
+        self._font.antialiased = True
+        self.tabular = tabular
+        self._cell = 0
+        if tabular:
+            adv = [self._font.get_metrics(str(d))[0][4] for d in range(10)]
+            self._cell = int(round(sum(adv) / len(adv)))
+            # 逐字形栅格化时以基线为原点：默认 render_to 会把每个字形墨迹的
+            # 顶边都贴到 (0,0)，"." ":" "-" 这类矮字形会浮到字顶（例如
+            # "0.9" 的小数点看起来像撇号）。置 origin=True 后统一按基线落笔，
+            # 所有字形的行高自然对齐。
+            self._font.origin = True
+            self._ascent = self._font.get_sized_ascender()
+        self._cache: dict[tuple, pygame.Surface] = {}
+        # 单字形缓存：定宽数字每帧都在变（速度/高度/航向），字符串缓存命中率低，
+        # 真正贵的是逐字符栅格化；按 (字符, 颜色) 缓存栅格结果后，合成就只剩 blit。
+        self._glyphs: dict[tuple, tuple] = {}
+
+    def advance(self, ch: str) -> int:
+        """单字符的水平步进：数字取定宽槽位，其余字符取字体自然步进。"""
+        if self.tabular and ch.isdigit():
+            return self._cell
+        m = self._font.get_metrics(ch)
+        return int(round(m[0][4])) if m and m[0] else 0
+
+    def _glyph(self, ch: str, color) -> tuple:
+        """栅格化单个字符，返回 (墨迹面, 墨迹相对行盒左上角的 x/y, 自然步进)。"""
+        key = (ch, tuple(color))
+        glyph = self._glyphs.get(key)
+        if glyph is not None:
+            return glyph
+        natural = int(round(self._font.get_metrics(ch)[0][4]))
+        tmp = pygame.Surface(
+            (max(1, natural), self._font.get_sized_height() + 8), pygame.SRCALPHA
+        )
+        self._font.render_to(tmp, (0, self._ascent), ch, fgcolor=color)
+        ink = tmp.get_bounding_rect()
+        if ink.width > 0 and ink.height > 0:
+            glyph = (tmp.subsurface(ink).copy(), ink.x, ink.y, natural)
+        else:
+            glyph = (None, 0, 0, natural)
+        if len(self._glyphs) > 2048:
+            self._glyphs.clear()
+        self._glyphs[key] = glyph
+        return glyph
+
+    def _render_tabular(self, text: str, color) -> pygame.Surface:
+        width = sum(self.advance(ch) for ch in text)
+        height = self._font.get_sized_height() + 4
+        canvas = pygame.Surface((max(1, width), height), pygame.SRCALPHA)
+        pen = 0
+        for ch in text:
+            step = self.advance(ch)
+            if not ch.isspace():
+                surf, gx, gy, natural = self._glyph(ch, color)
+                if surf is not None:
+                    # 槽内居中，窄字形（如 1）不会偏在槽的左侧；所有字形都按
+                    # “行盒左上角”对齐，基线自然一致。
+                    canvas.blit(surf, (pen + (step - natural) // 2 + gx, gy))
+            pen += step
+        ink = canvas.get_bounding_rect()
+        if ink.width > 0 and ink.height > 0:
+            canvas = canvas.subsurface(ink).copy()
+        return canvas
+
+    def render(self, text: str, antialias: bool = True,
+               color=(255, 255, 255)) -> pygame.Surface:
+        key = (text, tuple(color))
+        surf = self._cache.get(key)
+        if surf is None:
+            if not text:
+                surf = pygame.Surface((1, 1), pygame.SRCALPHA)
+            elif self.tabular:
+                if len(self._cache) >= self.MAX_CACHE:
+                    self._cache.clear()
+                surf = self._render_tabular(text, color)
+            else:
+                if len(self._cache) >= self.MAX_CACHE:
+                    self._cache.clear()
+                surf, _rect = self._font.render(text, fgcolor=color)
+                if surf.get_bitsize() < 32:
+                    surf = surf.convert_alpha()
+            self._cache[key] = surf
+        return surf
+
+
 class Renderer:
     def __init__(
         self,
-        size: tuple[int, int] = (1600, 1000),
+        size: tuple[int, int] = (1920, 1080),
         follow: int | None = None,
         follow_dist: float = 1800.0,
         gpu: bool = True,
         span_factor: float = 1.25,
+        terrain: str = "slab",
     ) -> None:
         pygame.init()
         self.w, self.h = size
@@ -410,11 +682,26 @@ class Renderer:
         self.mgl = None
         self.gpu = gpu and self._init_gpu(size)
         if not self.gpu:
-            self.screen = pygame.display.set_mode(size)
+            self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
         pygame.display.set_caption("Dogfight M2")
-        self.font = pygame.font.Font(None, 22)
-        self.font_small = pygame.font.Font(None, 18)
-        self.font_big = pygame.font.Font(None, 64)
+        # 字体：统一 Fira Code；读数走定宽数字槽位并按固定宽度格式化，
+        # 数字变化时布局不抖动。
+        self.font = _CachedFont(FONT_UI, FS_BODY)
+        self.font_small = _CachedFont(FONT_UI, FS_SMALL)
+        self.font_tiny = _CachedFont(FONT_UI, FS_TINY)
+        self.font_big = _CachedFont(FONT_UI, FS_H1)
+        self.font_num = _CachedFont(FONT_NUM, FS_BODY, tabular=True)
+        self.font_num_small = _CachedFont(FONT_NUM, FS_SMALL, tabular=True)
+
+        # 帧剖析：DOGFIGHT_PROFILE=1 时按阶段计时，默认关闭避免影响帧率。
+        self.profile = bool(os.environ.get("DOGFIGHT_PROFILE"))
+        self.timings: dict[str, float] = {}
+        self.frame_ms = 0.0
+        self._samples: dict[str, list[float]] = {}
+        # 数值显示插值：速度/高度/距离走一阶平滑，告警与锁定保持即时。
+        self._disp: dict[str, float] = {}
+        self._last_draw_t: float | None = None
+        self._frame_dt = 0.0
 
         # 轨道相机：yaw 绕世界 z 轴，pitch 抬高视线，dist 控制取景距离。
         self.cam = [0.0, 0.0, 1000.0]
@@ -447,7 +734,16 @@ class Renderer:
         self.missile_trails: dict[int, list[tuple[float, float, float]]] = {}
         # 尾焰强度跟着真实推力走，0=收油门、1=满加力。
         self._flame = [0.35, 0.35]
+        # 地面风格：slab=暗场 + 极淡网格（默认，已去掉灰色展台），texture=城市地图贴图。
+        self.terrain = terrain
         self.overlay = pygame.Surface(size, pygame.SRCALPHA)
+        # P0 背景面：底色 + 45° 斜纹 + 径向暗角，按窗口尺寸缓存，每帧一次 blit。
+        self._backdrop: pygame.Surface | None = None
+        # 半透明叠加层：每类图元（机炮包线/导弹/开火特效）各用一层，各自只清
+        # 上一次画过的脏矩形、只贴这一块，免掉整屏 fill + 整屏 alpha 混合
+        # （1600×1000 上每次约 0.9 ms，一帧原本要做 3–4 次）。
+        self._overlay_surfs: dict[str, pygame.Surface] = {}
+        self._overlay_dirty: dict[str, pygame.Rect | None] = {}
         # 姿态框的屏幕矩形：GPU 模式下由 GL 在对应区域补画三维模型。
         self._attitude_rects: list[pygame.Rect] = []
         # 地面贴图：图像数组与逐帧投影缓存。
@@ -456,6 +752,10 @@ class Renderer:
         # 武器页轮廓图（按机型和队伍预先着色、缩放后缓存）。
         self._sil_raw: dict[str, pygame.Surface | None] = {}
         self._sil_cache: dict[tuple, pygame.Surface] = {}
+        # 面板底/边框的静态层缓存：键 = 尺寸 + 配色 + 强调条，每帧只 blit。
+        self._chrome_cache: dict[tuple, pygame.Surface] = {}
+        # 纯色半透明底衬缓存（HUD 玻璃底、雷达屏底、武器页底）。
+        self._alpha_cache: dict[tuple, pygame.Surface] = {}
         self._cam_ready = False
         # 跟随模式：相机锁定某架飞机（默认关闭，仍取两机中点）。
         self.follow = follow
@@ -463,6 +763,60 @@ class Renderer:
         # 中点视角的取景倍率：1.25 让两机在 50° 视场内留约 6% 边距；
         # 演示视频可以再调小一点，把两机拍得更近。
         self.span_factor = span_factor
+
+    # ---------- 窗口尺寸与背景 ----------
+
+    def _build_backdrop(self) -> pygame.Surface:
+        """P0 背景面：近黑底色 + 45° 极淡斜纹 + 径向暗角。
+
+        只在窗口尺寸变化时重建：斜纹与暗角都画在这张整屏面上，之后每帧
+        只需一次 blit，代价与原来的 `screen.fill` 同量级。
+        """
+        w, h = max(2, self.w), max(2, self.h)
+        surf = pygame.Surface((w, h))
+        surf.fill(SCENE_BG)
+        # 45° 斜纹：一条从底边到顶边的等距线阵，间距 STRIPE_STEP。
+        stripe = pygame.Surface((w, h), pygame.SRCALPHA)
+        stripe.fill((0, 0, 0, 0))
+        color = (SCENE_STRIPE[0], SCENE_STRIPE[1], SCENE_STRIPE[2], STRIPE_ALPHA)
+        step = max(8, int(STRIPE_STEP))
+        x = -h
+        while x < w:
+            pygame.draw.line(stripe, color, (x, h), (x + h, 0), 1)
+            x += step
+        surf.blit(stripe, (0, 0))
+        # 径向暗角：先在 64×64 的小图上算好 alpha，再平滑放大到全屏。
+        n = 64
+        yy, xx = np.mgrid[0:n, 0:n]
+        nx = (xx + 0.5) / n * 2.0 - 1.0
+        ny = (yy + 0.5) / n * 2.0 - 1.0
+        dist = np.sqrt(nx * nx + ny * ny) / math.sqrt(2.0)
+        falloff = np.clip((dist - VIGNETTE_INNER) / (1.0 - VIGNETTE_INNER), 0.0, 1.0)
+        alpha = (falloff ** 2 * VIGNETTE_ALPHA).astype(np.uint8)
+        rgba = np.zeros((n, n, 4), dtype=np.uint8)
+        rgba[:, :, 3] = alpha
+        vig = pygame.image.frombuffer(rgba.tobytes(), (n, n), "RGBA")
+        surf.blit(pygame.transform.smoothscale(vig, (w, h)), (0, 0))
+        return surf
+
+    def resize(self, size: tuple[int, int]) -> None:
+        """窗口尺寸变化：按新尺寸重建显示面、背景与所有尺寸相关的缓存。"""
+        w, h = max(640, int(size[0])), max(480, int(size[1]))
+        if (w, h) == (self.w, self.h):
+            return
+        self.w, self.h = w, h
+        if not self.gpu:
+            self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+        else:
+            self.screen = self.hud = pygame.Surface((w, h), pygame.SRCALPHA)
+        self.overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        self.focal = (h / 2.0) / math.tan(FOV / 2.0)
+        self._overlay_surfs.clear()
+        self._overlay_dirty.clear()
+        self._alpha_cache.clear()
+        self._chrome_cache.clear()
+        self._sil_cache.clear()
+        self._backdrop = self._build_backdrop()
 
     # ---------- 相机与投影 ----------
 
@@ -617,6 +971,8 @@ class Renderer:
         self.missile_trails = {}
         self._flame = [0.35, 0.35]
         self._attitude_rects = []
+        self._disp.clear()
+        self._last_draw_t = None
 
     def _record_trail(self, world: World, agents=None) -> None:
         """整局航迹都保留；按固定间距抽点，线段数量不会随帧率失控。
@@ -683,8 +1039,28 @@ class Renderer:
     def draw(self, world: World, paused: bool = False, agents=None) -> None:
         self.update_camera(world)
         self.now = world.t
+        # 显示插值的时间步：取两次绘制之间的仿真时间差，暂停时冻结。
+        dt = 0.0
+        if self._last_draw_t is not None:
+            dt = clamp(world.t - self._last_draw_t, 0.0, 0.10)
+        self._last_draw_t = world.t
+        self._frame_dt = 0.0 if paused else dt
         self._record_trail(world, agents)
         self._update_engines(world)
+        prof = self.profile
+        t0 = time.perf_counter() if prof else 0.0
+
+        def mark(name: str) -> None:
+            nonlocal t0
+            dt = (time.perf_counter() - t0) * 1000.0
+            prev = self.timings.get(name)
+            self.timings[name] = dt if prev is None else prev * 0.9 + dt * 0.1
+            samples = self._samples.setdefault(name, [])
+            samples.append(dt)
+            if len(samples) > 600:
+                del samples[0]
+            t0 = time.perf_counter()
+
         if self.gpu:
             # 2D 层先画在透明 HUD 面上，3D 场景由 GPU 渲染后再叠回 HUD。
             self.hud.fill((0, 0, 0, 0))
@@ -695,7 +1071,6 @@ class Renderer:
             self._draw_missiles(world)
             self._draw_counters(world)
             self._draw_gunfire(world)
-            self._draw_altitude_ladder(world)
             self._draw_hud(world, paused, agents)
             if world.result is not None:
                 self._draw_result(world)
@@ -705,22 +1080,43 @@ class Renderer:
             pygame.display.flip()
             return
 
-        self.screen.fill(BG)
-        self._draw_ground(world)
+        if self._backdrop is None:
+            self._backdrop = self._build_backdrop()
+        self.screen.blit(self._backdrop, (0, 0))
+        if prof:
+            mark("clear")
+        if self.terrain == "texture":
+            self._draw_ground(world)
+        if prof:
+            mark("ground")
         self._draw_floor(world.arena, world.z_floor)
         self._draw_trails()
+        if prof:
+            mark("trails")
         self._draw_gun_envelopes(world)
         self._draw_aircraft(world, agents)
+        if prof:
+            mark("aircraft")
         self._draw_predictions(world)
         self._draw_missiles(world)
+        if prof:
+            mark("missiles")
         self._draw_counters(world)
         self._draw_gunfire(world)
-        self._draw_altitude_ladder(world)
+        if prof:
+            mark("effects")
         self._draw_hud(world, paused, agents)
+        if prof:
+            mark("hud")
 
         if world.result is not None:
             self._draw_result(world)
+        if prof:
+            mark("result")
         pygame.display.flip()
+        if prof:
+            mark("flip")
+            self.frame_ms = sum(self.timings.values())
 
     def _ortho_image(self):
         """加载城市地图正交投影贴图，并预生成几级 mip，供远景采样用。
@@ -747,16 +1143,20 @@ class Renderer:
         self._ortho_arr = mips
         return self._ortho_arr
 
-    def _ground_image(self, world: World, step: int = GROUND_STEP):
+    def _ground_image(self, world: World, step: int = GROUND_STEP,
+                      opaque: bool = False):
         """把城市地图按当前相机透视投影到地面（z = z_floor）上。
 
         地面是平面，因此逐像素从屏幕发射线求与地面的交点，再换算成地形图
         UV 即可完成透视贴图。CPU 直接画时用低分辨率算完再放大，避免
         每帧对 160 万像素做 Python 循环。
+
+        返回 (贴图, 地平线行号)。opaque=True 时直接把边缘羽化底色与场景背景
+        预先合成成不透明 RGB，CPU 路径可以走快得多的无 alpha blit。
         """
         mips = self._ortho_image()
         if mips is None:
-            return None
+            return None, 0
         gw = max(2, self.w // step)
         gh = max(2, self.h // step)
         xs = (np.arange(gw, dtype=np.float64) + 0.5) * step
@@ -801,23 +1201,34 @@ class Renderer:
 
         # 地形图边缘做一小段羽化，避免 200 km 图幅边界出现硬切边。
         edge = np.minimum(np.minimum(u, 1.0 - u), np.minimum(v, 1.0 - v))
-        fade = np.clip(edge / 0.02, 0.0, 1.0)
+        fade = np.clip(edge / 0.02, 0.0, 1.0) * np.where(valid, 1.0, 0.0)
+        rows = np.flatnonzero(fade.any(axis=1))
+        top_src = int(rows[0]) if bool(rows.size) else gh
+        if opaque:
+            # 场景底色是纯 BG，先在低分辨率上做一次合成，之后就能走不透明
+            # blit：1600×450 的 RGBA 混合约 7 ms，不透明只剩 1–2 ms。
+            a = fade[:, :, None]
+            bg = np.array(BG, dtype=np.float32)
+            blended = np.clip(rgb, 0, 255) * a + bg * (1.0 - a)
+            return (
+                pygame.image.frombuffer(
+                    blended.astype(np.uint8).tobytes(), (gw, gh), "RGB"
+                ),
+                top_src,
+            )
         rgba = np.zeros((gh, gw, 4), dtype=np.uint8)
         rgba[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
-        rgba[:, :, 3] = np.where(valid, (fade * 255.0), 0.0).astype(np.uint8)
-        return pygame.image.frombuffer(rgba.tobytes(), (gw, gh), "RGBA")
+        rgba[:, :, 3] = (fade * 255.0).astype(np.uint8)
+        return pygame.image.frombuffer(rgba.tobytes(), (gw, gh), "RGBA"), top_src
 
     def _draw_ground(self, world: World) -> None:
         """把城市地图地面层铺到 3D 场景最底层（地面网格仍画在它上面）。"""
-        surf = self._ground_image(world)
+        surf, top_src = self._ground_image(world, opaque=True)
         if surf is None:
             return
         gw, gh = surf.get_size()
-        alpha = pygame.surfarray.array_alpha(surf).T
-        rows = np.flatnonzero(alpha.any(axis=1))
-        if rows.size == 0:
+        if top_src >= gh:
             return
-        top_src = int(rows[0])
         # 地平线以上没有地面：只把有内容的行放大后贴上去，省掉一次全屏混合。
         cropped = surf.subsurface(pygame.Rect(0, top_src, gw, gh - top_src))
         top = top_src * GROUND_STEP
@@ -825,23 +1236,47 @@ class Renderer:
             pygame.transform.smoothscale(cropped, (self.w, self.h - top)), (0, top)
         )
 
+    def _clip_poly_near(self, points):
+        """把世界坐标多边形裁到近裁剪面 z=NEAR，返回相机坐标顶点。
+
+        Sutherland–Hodgman：只按前向深度做一次半平面裁剪，视口外的部分
+        仍由 pygame 光栅化裁掉，因此不必再做四边裁剪。
+        """
+        cam = [self._view(p) for p in points]
+        out = []
+        n = len(cam)
+        for i in range(n):
+            a, b = cam[i], cam[(i + 1) % n]
+            ain, bin_ = a[2] > NEAR, b[2] > NEAR
+            if ain:
+                out.append(a)
+            if ain != bin_:
+                t = (NEAR - a[2]) / (b[2] - a[2])
+                out.append(tuple(a[k] + (b[k] - a[k]) * t for k in range(3)))
+        return out
+
     def _draw_floor(self, arena: float, z_floor: float = 0.0) -> None:
-        """最低高度层网格 + 空域边界：高度读数的水平参照。"""
+        """最低高度层网格 + 空域边界：去掉展台后唯一的地面参照。
+
+        网格压到 `AIR_GRID`（近黑灰），只在俯角足够时才有存在感；贴图模式
+        保留原来的 4 km 网格与边界色。
+        """
         half = arena / 2.0
-        # 4 km 一格：贴了城市地图后，1 km 的密集网格会糊成一片摩尔纹，
-        # 反而看不清地面；网格只作为空域尺度参照，不需要那么密。
-        step = 4000.0
+        slab = self.terrain != "texture"
+        step = 8000.0 if slab else 4000.0
+        grid_color = AIR_GRID if slab else GRID
+        edge_color = AIR_EDGE if slab else BORDER
         x = -half
         while x <= half:
             seg = self._clip_segment((x, -half, z_floor), (x, half, z_floor))
             if seg:
-                self._clipped_line(self.screen, GRID, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, grid_color, seg[0], seg[1], 1)
             x += step
         y = -half
         while y <= half:
             seg = self._clip_segment((-half, y, z_floor), (half, y, z_floor))
             if seg:
-                self._clipped_line(self.screen, GRID, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, grid_color, seg[0], seg[1], 1)
             y += step
 
         corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
@@ -850,12 +1285,13 @@ class Renderer:
             p1 = (*corners[(i + 1) % 4], z_floor)
             seg = self._clip_segment(p0, p1)
             if seg:
-                self._clipped_line(self.screen, BORDER, seg[0], seg[1], 1)
+                self._clipped_line(self.screen, edge_color, seg[0], seg[1], 1)
 
     def _draw_trails(self) -> None:
         for i, trail in enumerate(self.trails):
-            base = TEAM_COLORS[i]
-            arrow_color = tuple(min(255, int(c * 1.05)) for c in base)
+            # 飘带走灰白，队伍色只做 25% 染色，暗场里像一条浅色尾迹。
+            base = _mix((198, 202, 208), TEAM_COLORS[i], 0.25)
+            arrow_color = _mix((236, 238, 242), TEAM_COLORS[i], 0.18)
             if len(trail) >= 2:
                 # GPU 模式下航迹线由 OpenGL 画，这里只保留箭头与事件标记。
                 if not self.gpu:
@@ -897,22 +1333,22 @@ class Renderer:
                     continue
                 x, y = s
                 pygame.draw.polygon(
-                    self.screen, (255, 190, 66),
+                    self.screen, (242, 242, 244),
                     [(x, y - 5), (x + 5, y), (x, y + 5), (x - 5, y)],
                 )
                 pygame.draw.line(
-                    self.screen, (255, 246, 214), (x, y - 3), (x, y + 3), 1
+                    self.screen, (255, 255, 255), (x, y - 3), (x, y + 3), 1
                 )
 
-        # 导弹发射点：金色五角星 + 队伍色描边，位置就在发射瞬间的航迹点上。
+        # 导弹发射点：米白五角星 + 灰边，位置就在发射瞬间的航迹点上。
         for owner, p in self.launch_marks:
             s = self.to_screen(p)
             if s is None:
                 continue
-            edge = tuple(int(c * 0.55) for c in TEAM_COLORS[owner])
+            edge = _mix((120, 124, 130), TEAM_COLORS[owner], 0.35)
             self._draw_star(s, 7.5, LAUNCH_MARK, edge)
 
-        # 高 G 机动点：橙色菱形（比开火点大一号），同样落在 3D 航迹线上。
+        # 高 G 机动点：浅灰菱形（比开火点大一号），同样落在 3D 航迹线上。
         for i, p in self.highg_marks:
             s = self.to_screen(p)
             if s is None:
@@ -923,7 +1359,7 @@ class Renderer:
                 [(x, y - 7), (x + 7, y), (x, y + 7), (x - 7, y)],
             )
             pygame.draw.polygon(
-                self.screen, TEAM_COLORS[i],
+                self.screen, _mix((110, 114, 120), TEAM_COLORS[i], 0.3),
                 [(x, y - 4), (x + 4, y), (x, y + 4), (x - 4, y)], 1,
             )
 
@@ -1002,21 +1438,35 @@ class Renderer:
         bm = (b[0] - ox, b[1] - oy, b[2] - oz)
         if min(ap[2], am[2], bp[2], bm[2]) <= NEAR:
             return
-        # 横向拆成两半：+y 侧亮、-y 侧暗，形成一条有体积感的带子。飞机滚转
-        # 时展向跟着翻转，亮暗边随之交换——这正是“带子翻面”的视觉线索。
-        lit_side = tuple(min(255, int(c * bright * 1.15)) for c in base)
-        dark_side = tuple(min(255, int(c * bright * 0.86)) for c in base)
+        # 横向按亮度渐变：中心最亮、向两侧连续变暗，不再是两块纯色。按
+        # TRAIL_BANDS 拆成窄带，每条取该段中点的亮度；带宽只有几像素，
+        # 视觉上是连续渐变。飞机滚转时展向跟着翻转，暗边/亮边的位置随之
+        # 交换——这正是“带子翻面”的视觉线索。
+        s_am, s_ap = self._screen_of(am), self._screen_of(ap)
+        s_bm, s_bp = self._screen_of(bm), self._screen_of(bp)
+
+        def edge_pt(p, q, u: float) -> tuple[float, float]:
+            """把端部横截面的暗边 → 亮边按 u∈[0,1] 插值。"""
+            return (p[0] + (q[0] - p[0]) * u, p[1] + (q[1] - p[1]) * u)
+
+        for k in range(TRAIL_BANDS):
+            u0 = k / TRAIL_BANDS
+            u1 = (k + 1) / TRAIL_BANDS
+            u = 0.5 * (u0 + u1)
+            # t = 0 在中心、1 在边缘；两侧边缘各有自己的受光亮度。
+            t = abs(2.0 * u - 1.0)
+            edge = TRAIL_EDGE_LIT if u > 0.5 else TRAIL_EDGE_DARK
+            f = TRAIL_CENTER_LIT + (edge - TRAIL_CENTER_LIT) * t
+            col = tuple(min(255, int(c * bright * f)) for c in base)
+            pygame.draw.polygon(
+                self.screen, col,
+                [edge_pt(s_am, s_ap, u0), edge_pt(s_bm, s_bp, u0),
+                 edge_pt(s_bm, s_bp, u1), edge_pt(s_am, s_ap, u1)],
+            )
+        # 高光芯：中心一条细亮线，只比中心窄带再亮一档，整条带子保持
+        # “两边缘 → 中心”的连续渐变，而不是两根亮线夹一块暗色。
         s_a, s_b = self._screen_of(a), self._screen_of(b)
-        pygame.draw.polygon(
-            self.screen, lit_side,
-            [self._screen_of(ap), self._screen_of(bp), s_b, s_a],
-        )
-        pygame.draw.polygon(
-            self.screen, dark_side,
-            [self._screen_of(am), self._screen_of(bm), s_b, s_a],
-        )
-        # 高光芯：中心一条细亮线，远看像发光的航迹，近看有霓虹般的层次。
-        core = tuple(min(255, int(c * min(1.45, bright * 1.55))) for c in base)
+        core = tuple(min(255, int(c * min(1.28, bright * 1.28))) for c in base)
         pygame.draw.line(self.screen, core, s_a, s_b, 2)
 
     def _draw_arrow(self, s0, s1, color, size: float = 10.0) -> None:
@@ -1038,7 +1488,8 @@ class Renderer:
 
     def _draw_gun_envelopes(self, world: World) -> None:
         """机炮包线画成机体所在高度的水平圆环，透视后自然成椭圆。"""
-        self.overlay.fill((0, 0, 0, 0))
+        surf = self._overlay_begin("envelopes")
+        box = None
         for i, ac in enumerate(world.acs):
             if not ac.alive:
                 continue
@@ -1057,8 +1508,9 @@ class Renderer:
                     if s is not None:
                         ring.append(s)
                 if len(ring) >= 2:
-                    pygame.draw.lines(self.overlay, (*color, alpha), True, ring, 1)
-        self.screen.blit(self.overlay, (0, 0))
+                    r = pygame.draw.lines(surf, (*color, alpha), True, ring, 1)
+                    box = r if box is None else box.union(r)
+        self._overlay_flush("envelopes", surf, box)
 
     # ---------- 机体模型与开火特效 ----------
 
@@ -1091,41 +1543,50 @@ class Renderer:
 
     def _draw_model(self, ac, team: int, frame) -> None:
         model, k, att, _depth = frame
-        cull = model.get("cull", True)
+        # 机体系 → 相机系 的合成矩阵：机体旋转、屏幕缩放、相机旋转一次性
+        # 折进 3×3 矩阵，逐顶点只剩 9 次乘加，不再逐点调用 body_axes/_view。
+        xb, yb, zb = body_axes(*att)
+        rx, uy, fz = self.right, self.up, self.forward
+        eye = self.eye
+        pos = (ac.x, ac.y, ac.z)
+        m0 = (k * _dot(xb, rx), k * _dot(yb, rx), k * _dot(zb, rx))
+        m1 = (k * _dot(xb, uy), k * _dot(yb, uy), k * _dot(zb, uy))
+        m2 = (k * _dot(xb, fz), k * _dot(yb, fz), k * _dot(zb, fz))
+        t0 = _dot((pos[0] - eye[0], pos[1] - eye[1], pos[2] - eye[2]), rx)
+        t1 = _dot((pos[0] - eye[0], pos[1] - eye[1], pos[2] - eye[2]), uy)
+        t2 = _dot((pos[0] - eye[0], pos[1] - eye[1], pos[2] - eye[2]), fz)
+        # 光照方向与视线方向先转回机体系：面的法线在机体系里是常量，逐面
+        # 只做两次点乘，不必每帧重新叉积、归一化。
+        lbx, lby, lbz = _dot(xb, LIGHT), _dot(yb, LIGHT), _dot(zb, LIGHT)
+        vbx, vby, vbz = _dot(xb, fz), _dot(yb, fz), _dot(zb, fz)
+        w2, h2, focal = self.w / 2.0, self.h / 2.0, self.focal
         faces = []
-        for pts, kind in model["faces"]:
-            wp = [self._model_world(ac, att, p, k) for p in pts]
-            vp = [self._view(p) for p in wp]
-            if any(p[2] <= NEAR for p in vp):
+        for (pts, kind, ao), (nx, ny, nz) in zip(model["faces"], model["normals"]):
+            poly = []
+            sx = sy = sz = 0.0
+            near = False
+            for px, py, pz in pts:
+                x = m0[0] * px + m0[1] * py + m0[2] * pz + t0
+                y = m1[0] * px + m1[1] * py + m1[2] * pz + t1
+                z = m2[0] * px + m2[1] * py + m2[2] * pz + t2
+                if z <= NEAR:
+                    near = True
+                    break
+                inv = focal / z
+                poly.append((w2 + x * inv, h2 - y * inv))
+                sx += x
+                sy += y
+                sz += z
+            if near:
                 continue
-            poly = [self._screen_of(p) for p in vp]
-            normal = _norm(
-                _cross(
-                    (wp[1][0] - wp[0][0], wp[1][1] - wp[0][1], wp[1][2] - wp[0][2]),
-                    (wp[2][0] - wp[0][0], wp[2][1] - wp[0][1], wp[2][2] - wp[0][2]),
-                )
-            )
-            light = 0.62 + 0.38 * abs(_dot(normal, LIGHT))
-            # 程序化部件都是封闭体，统一剔除背面，避免远近侧面互相覆盖；
-            # OBJ 模型的绕序不统一，按双面绘制（远面先画、近面覆盖）。
-            if cull:
-                cx = sum(p[0] for p in wp) / len(wp)
-                cy = sum(p[1] for p in wp) / len(wp)
-                cz = sum(p[2] for p in wp) / len(wp)
-                to_eye = (self.eye[0] - cx, self.eye[1] - cy, self.eye[2] - cz)
-                if _dot(normal, to_eye) <= 0.0:
-                    continue
-            if kind == "canopy":
-                base = CANOPY_COLOR
-            elif kind == "intake":
-                base = INTAKE_COLOR
-            elif kind == "nozzle":
-                base = NOZZLE_COLOR
-            else:
-                base = tuple(c * PART_SHADE[kind] for c in TEAM_COLORS[team])
-            color = tuple(int(clamp(c * light, 0, 255)) for c in base)
-            depth = sum(p[2] for p in vp) / len(vp)
-            faces.append((depth, poly, color))
+            cz = sz / len(pts)
+            # 白模着色：环境项乘烘焙 AO、主光取 |n·l|（双面绘制）、
+            # 边缘光按视线余弦抬亮轮廓，暗场里的机体才不会糊成一块灰。
+            cl = abs(nx * lbx + ny * lby + nz * lbz)
+            facing = abs(nx * vbx + ny * vby + nz * vbz)
+            shade = AMB * ao + KEY * cl + RIM * (1.0 - facing) ** 2
+            color = _clay(kind, shade, team)
+            faces.append((cz, poly, color))
 
         # 尾焰和机体一起参与深度排序，近面能盖住离镜头更远的焰流。
         faces.extend(self._flame_faces(ac, model, k, att, team, _depth))
@@ -1141,7 +1602,7 @@ class Renderer:
             xs = [p[0] for p in poly]
             ys = [p[1] for p in poly]
             if max(max(xs) - min(xs), max(ys) - min(ys)) >= 6.0:
-                pygame.draw.polygon(self.screen, (10, 12, 16), poly, 1)
+                pygame.draw.polygon(self.screen, CLAY_EDGE, poly, 1)
 
     def _flame_faces(self, ac, model, k, att, team, depth) -> list:
         """尾焰：沿机尾方向铺开的锥形，长度跟随机体加速度（加速变长、减速变短）。"""
@@ -1155,9 +1616,9 @@ class Renderer:
 
         level = self._flame[team]
         ab = clamp(getattr(ac, "ab", 0.0), 0.0, 1.0)
-        # 加力时焰色从橙黄偏向蓝白，和内芯一起形成明显不同的两档外观。
-        outer = _mix((255, 138, 44), (168, 192, 255), 0.55 * ab)
-        inner = _mix((255, 238, 196), (238, 244, 255), 0.75 * ab)
+        # 展示风格：尾焰主体是灰白，加力时更亮；焰芯用唯一的那点红。
+        outer = _mix((214, 216, 220), (250, 250, 252), 0.35 + 0.45 * ab)
+        inner = _mix(ACCENT_RED, (255, 236, 232), 0.25)
         screen_len = k * model["length"] * self.focal / max(depth, NEAR)
         length = max(3.0, screen_len * (0.06 + 0.20 * level))
         width = max(1.4, length * 0.22)
@@ -1218,7 +1679,8 @@ class Renderer:
         for key in [k for k in self.missile_trails if k not in live_ids]:
             del self.missile_trails[key]
 
-        self.overlay.fill((0, 0, 0, 0))
+        surf = self._overlay_begin("missiles")
+        box = None
         for m in live:
             pts = self.missile_trails.setdefault(id(m), [])
             p = (m.x, m.y, m.z)
@@ -1227,13 +1689,15 @@ class Renderer:
                 if len(pts) > 160:
                     del pts[0]
 
-            color = TEAM_COLORS[m.owner]
-            dim = tuple(int(c * 0.55) for c in color)
+            # 弹体与尾迹都用白模调的浅灰，队伍色只做很轻的染色。
+            color = _mix(CLAY_LIT, TEAM_COLORS[m.owner], 0.25)
+            dim = (132, 136, 142)
             for a, b in zip(pts, pts[1:]):
                 seg = self._clip_segment(a, b)
                 if seg is None:
                     continue
-                pygame.draw.line(self.overlay, (*dim, 150), seg[0], seg[1], 1)
+                r = pygame.draw.line(surf, (*dim, 150), seg[0], seg[1], 1)
+                box = r if box is None else box.union(r)
 
             s = self.to_screen(p)
             if s is None:
@@ -1261,27 +1725,34 @@ class Renderer:
             )
             tail = (s[0] - sx * size, s[1] - sy * size)
             body_color = color if m.guided else (150, 150, 150)
-            pygame.draw.line(
-                self.overlay, (*body_color, 255), tail, s, max(2, int(size * 0.16))
+            r = pygame.draw.line(
+                surf, (*body_color, 255), tail, s, max(2, int(size * 0.16))
             )
-            pygame.draw.circle(self.overlay, (255, 245, 210, 255), s, max(1, int(size * 0.10)))
+            box = r if box is None else box.union(r)
+            r = pygame.draw.circle(
+                surf, (250, 250, 252, 255), s, max(1, int(size * 0.10))
+            )
+            box = box.union(r)
 
             # 预点火段（RCS 摆姿态）主发动机没点燃，不画尾焰。
             if m.ignited and m.fuel > 0.0:
                 flame = size * 0.9
                 tip = (tail[0] - sx * flame, tail[1] - sy * flame)
-                pygame.draw.line(
-                    self.overlay, (255, 176, 70, 220), tail, tip, max(2, int(size * 0.2))
+                r = pygame.draw.line(
+                    surf, (236, 238, 242, 210), tail, tip, max(2, int(size * 0.2))
                 )
-                pygame.draw.line(
-                    self.overlay, (255, 244, 200, 235), tail,
+                box = box.union(r)
+                r = pygame.draw.line(
+                    surf, (*ACCENT_RED, 235), tail,
                     (tail[0] - sx * flame * 0.45, tail[1] - sy * flame * 0.45), 1
                 )
-        self.screen.blit(self.overlay, (0, 0))
+                box = box.union(r)
+        self._overlay_flush("missiles", surf, box)
 
     def _draw_gunfire(self, world: World) -> None:
         """开火特效：炮口焰 + 沿真实炮线方向的曳光轨迹。"""
-        self.overlay.fill((0, 0, 0, 0))
+        surf = self._overlay_begin("gunfire")
+        box = None
         tick = pygame.time.get_ticks() * 0.001
         for i, ac in enumerate(world.acs):
             if not ac.alive or not ac.firing:
@@ -1305,34 +1776,38 @@ class Renderer:
                 continue
 
             # 曳光轨迹：外层辉光 + 亮芯。
-            pygame.draw.line(self.overlay, (*TEAM_COLORS[i], 46), ns, es, 7)
-            pygame.draw.line(self.overlay, (255, 154, 54, 170), ns, es, 3)
-            pygame.draw.line(self.overlay, (255, 236, 170, 235), ns, es, 1)
+            r = pygame.draw.line(surf, (*TEAM_COLORS[i], 46), ns, es, 7)
+            r = r.union(pygame.draw.line(surf, (255, 154, 54, 170), ns, es, 3))
+            r = r.union(pygame.draw.line(surf, (255, 236, 170, 235), ns, es, 1))
+            box = r if box is None else box.union(r)
 
             # 炮口焰：脉动光晕 + 星芒。
             pulse = 0.8 + 0.2 * math.sin(tick * 34.0)
             for radius, alpha in ((12, 36), (8, 80), (5, 160), (3, 235)):
-                pygame.draw.circle(
-                    self.overlay, (255, 214, 128, alpha), ns,
+                r = pygame.draw.circle(
+                    surf, (255, 214, 128, alpha), ns,
                     max(1, int(radius * pulse)),
                 )
+                box = box.union(r)
             dx, dy = es[0] - ns[0], es[1] - ns[1]
             norm = math.hypot(dx, dy) or 1.0
             ux, uy = dx / norm, dy / norm
             for span, alpha in ((16, 150), (10, 220)):
                 tip = (ns[0] + ux * span, ns[1] + uy * span)
-                pygame.draw.line(
-                    self.overlay, (255, 245, 200, alpha), ns, tip, 2
+                r = pygame.draw.line(
+                    surf, (255, 245, 200, alpha), ns, tip, 2
                 )
+                box = box.union(r)
                 for sign in (1.0, -1.0):
                     side = (
                         ns[0] - uy * span * 0.55 * sign,
                         ns[1] + ux * span * 0.55 * sign,
                     )
-                    pygame.draw.line(
-                        self.overlay, (255, 200, 120, alpha), ns, side, 1
+                    r = pygame.draw.line(
+                        surf, (255, 200, 120, alpha), ns, side, 1
                     )
-        self.screen.blit(self.overlay, (0, 0))
+                    box = box.union(r)
+        self._overlay_flush("gunfire", surf, box)
 
     def _draw_aircraft(self, world: World, agents=None) -> None:
         for i, ac in enumerate(world.acs):
@@ -1363,6 +1838,10 @@ class Renderer:
 
             # 机动原语标签随飞机移动：从机体引一条短线；靠近屏幕边缘时翻到
             # 机体另一侧，不再做贴边夹取（夹取会让标签脱开飞机停在边框上）。
+            # 结算后不再画：标签会透过半透明的结算遮罩，和结果文字叠成
+            # “SU-57 shot down 0112m”这种读不通的句子。
+            if world.result is not None:
+                continue
             primitive = getattr(agents[i], "primitive", "PURE") if agents else "PURE"
             tactic = getattr(agents[i], "tactic", "") if agents else ""
             text = f"{tactic}·{primitive} {ac.z:.0f}m" if tactic else f"{primitive} {ac.z:.0f}m"
@@ -1429,51 +1908,16 @@ class Renderer:
         for _d, poly, color in self._flame_faces(ac, model, k, att, team, depth):
             pygame.draw.polygon(self.screen, color, poly)
 
-    def _draw_altitude_ladder(self, world: World) -> None:
-        """右侧高度尺：两台飞机在垂直方向的相对位置。"""
-        x = self.w - 30
-        top, bottom = 150, self.h - 150
-        pygame.draw.line(self.screen, BORDER, (x, top), (x, bottom), 1)
-
-        zmin, zmax = world.z_floor, world.z_ceiling
-        # 高空场景下 1 km 一格太密，按总高度范围自动换挡。
-        step = 1000.0 if zmax - zmin <= 8000.0 else 5000.0
-        z = math.ceil(zmin / step) * step
-        while z <= zmax:
-            sy = bottom - (z - zmin) / (zmax - zmin) * (bottom - top)
-            pygame.draw.line(self.screen, GRID, (x - 5, sy), (x + 5, sy), 1)
-            label = self.font_small.render(f"{z / 1000:.0f}k", True, SUB)
-            self.screen.blit(label, (x - 30, sy - 8))
-            z += step
-
-        cap = self.font_small.render("ALT", True, SUB)
-        self.screen.blit(cap, (x - 18, top - 20))
-
-        for i, ac in enumerate(world.acs):
-            if not ac.alive:
-                continue
-            sy = bottom - (ac.z - zmin) / (zmax - zmin) * (bottom - top)
-            # 红蓝左右错开，高度重合时也能看出是两个点。
-            mx = x - 7 if i == 0 else x + 7
-            pygame.draw.circle(self.screen, TEAM_COLORS[i], (mx, sy), 4)
-
     def _draw_hud(self, world: World, paused: bool, agents=None) -> None:
-        for i, ac in enumerate(world.acs):
-            agent = agents[i] if agents else None
-            incoming = sum(
-                1 for m in world.missiles if m.alive and m.target == i
-            )
-            self._draw_aircraft_panel(
-                ac, agent, TEAM_COLORS[i], right=(i == 1), incoming=incoming
-            )
-
         a, b = world.acs
         dist = math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
+        d_alt = b.z - a.z
         line = (
-            f"T {world.t:5.1f}s    DIST {dist:5.0f}m    "
-            f"dALT {b.z - a.z:+5.0f}m    dE {a.energy - b.energy:6.0f} J/kg"
+            f"T {world.t:5.1f}s    DIST {self._smooth('dist', dist):5.0f}m    "
+            f"dALT {self._smooth('dalt', d_alt):+5.0f}m    "
+            f"dE {a.energy - b.energy:6.0f} J/kg"
         )
-        surf = self.font.render(line, True, TEXT)
+        surf = self.font_num.render(line, True, TEXT)
         self.screen.blit(surf, (self.w / 2 - surf.get_width() / 2, self.h - 34))
 
         hint = "ESC/Q quit    SPACE pause    R reset"
@@ -1482,51 +1926,35 @@ class Renderer:
 
         self._draw_missile_status(world)
         self._draw_attitude_panel(world)
-        self._draw_fighter_stations(world)
+        self._draw_fighter_stations(world, agents)
 
         if paused:
             ps = self.font.render("PAUSED", True, TEXT)
             self.screen.blit(ps, (self.w / 2 - ps.get_width() / 2, 18))
 
     def _draw_missile_status(self, world: World) -> None:
-        """在飞导弹状态：型号、制导状态、速度、到目标距离与三维位置。"""
+        """在飞导弹状态：只留目标与当前速度，窄条居中，不挤占主视区。"""
         live = [m for m in world.missiles if m.alive]
         if not live:
             return
-        width, row_h = 476, 15
-        height = 8 + row_h * len(live)
+        width, row_h = 216, 16
+        height = 10 + row_h * len(live)
         x = self.w // 2 - width // 2
         y = 236
-        pygame.draw.rect(self.screen, (26, 29, 34), pygame.Rect(x, y, width, height))
-        pygame.draw.rect(self.screen, (88, 94, 104), pygame.Rect(x, y, width, height), 1)
+        self._panel_bg(
+            pygame.Rect(x, y, width, height), PANEL_FILL, edge=PANEL_EDGE
+        )
 
         for k, m in enumerate(live):
             target = world.acs[m.target] if 0 <= m.target < len(world.acs) else None
-            d = (
-                math.dist((m.x, m.y, m.z), (target.x, target.y, target.z))
-                if target is not None else 0.0
-            )
+            target_name = target.spec.name if target is not None else "-"
             color = TEAM_COLORS[m.owner]
-            if not m.guided:
-                state = "BALLISTIC"
-            elif m.decoy_t > 0.0:
-                state = "DECOY"
-            elif m.spec.is_arh:
-                # 主动弹：中段靠载机雷达/数据链，末段自主截获后发射后不管。
-                state = "ACTIVE" if m.active else "MIDCRS"
-            elif m.spec.is_sarh:
-                state = "ILLUM"
-            else:
-                state = "GUIDE"
-            text = (
-                f"{m.spec.name} -> {target.spec.name if target else '-':7s} {state:9s} "
-                f"v={m.speed:5.0f}  d={d:6.0f}  "
-                f"x={m.x / 1000.0:+6.1f} y={m.y / 1000.0:+6.1f} km  alt={m.z:5.0f} m"
-            )
+            # 队伍色圆点表示是谁发射的；文字只给目标与当前速度。
+            text = f"{target_name}   {m.speed:4.0f} m/s"
             pygame.draw.circle(
-                self.screen, color, (x + 10, y + 8 + k * row_h + 5), 3
+                self.screen, color, (x + 10, y + 7 + k * row_h + 6), 3
             )
-            surf = self.font_small.render(text, True, TEXT)
+            surf = self.font_num_small.render(text, True, TEXT)
             self.screen.blit(surf, (x + 20, y + 3 + k * row_h))
 
     def _draw_counters(self, world: World) -> None:
@@ -1557,8 +1985,9 @@ class Renderer:
         px = (self.w - width) // 2
         py = 20
         self._attitude_rects = []
-        pygame.draw.rect(self.screen, (26, 29, 34), pygame.Rect(px, py, width, height))
-        pygame.draw.rect(self.screen, BORDER, pygame.Rect(px, py, width, height), 1)
+        self._panel_bg(
+            pygame.Rect(px, py, width, height), PANEL_FILL, edge=BORDER
+        )
         pygame.draw.line(
             self.screen, BORDER, (px + width // 2, py + 6),
             (px + width // 2, py + height - 6), 1,
@@ -1570,6 +1999,7 @@ class Renderer:
             color = TEAM_COLORS[i]
             name = self.font_small.render(ac.spec.name, True, color)
             self.screen.blit(name, (hx + 10, py + 5))
+            # 血量不在这里重复：它在本机 HUD 的顶部状态带里（见 _draw_hud_status）。
 
             rect = pygame.Rect(hx + 8, py + 22, half - 16, 140)
             self._attitude_rects.append(rect)
@@ -1579,7 +2009,9 @@ class Renderer:
             )
 
             # 油门滑动条：填充比例即当前功率指令；加力时整条变成白蓝色。
-            bx, by, bw, bh = hx + 46, py + 173, 104, 9
+            # 条长留出右侧读数位：读数右对齐到本半幅边缘，加力（“AB”）出现时
+            # 也不会挤到相邻半幅的标签上。
+            bx, by, bw, bh = hx + 62, py + 173, 64, 9
             thr = clamp(ac.throttle, 0.0, 1.0) if ac.alive else 0.0
             ab = clamp(getattr(ac, "ab", 0.0), 0.0, 1.0) if ac.alive else 0.0
             pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
@@ -1590,13 +2022,10 @@ class Renderer:
             )
             pygame.draw.rect(self.screen, SUB, pygame.Rect(bx, by, bw, bh), 1)
             self.screen.blit(self.font_small.render("THR", True, SUB), (hx + 10, by - 2))
-            self.screen.blit(
-                self.font_small.render(
-                    f"{thr * 100:3.0f}%{' AB' if ab > 0.05 else '   '}",
-                    True, TEXT,
-                ),
-                (bx + bw + 8, by - 2),
+            txt = self.font_num_small.render(
+                f"{thr * 100:3.0f}%{' AB' if ab > 0.05 else ''}", True, TEXT
             )
+            self.screen.blit(txt, (hx + half - 12 - txt.get_width(), by - 2))
 
             # 燃油条：加力油耗远高于军推，条长直接给出剩余油量。
             cap = ac.spec.fuel_capacity
@@ -1608,10 +2037,8 @@ class Renderer:
             )
             pygame.draw.rect(self.screen, SUB, pygame.Rect(bx, fy, bw, bh), 1)
             self.screen.blit(self.font_small.render("FUEL", True, SUB), (hx + 10, fy - 2))
-            self.screen.blit(
-                self.font_small.render(f"{frac * 100:3.0f}%", True, TEXT),
-                (bx + bw + 8, fy - 2),
-            )
+            txt = self.font_num_small.render(f"{frac * 100:3.0f}%", True, TEXT)
+            self.screen.blit(txt, (hx + half - 12 - txt.get_width(), fy - 2))
 
     def _draw_attitude_model(self, rect, world: World, i: int, ac, color,
                              bodies: bool = True) -> None:
@@ -1628,13 +2055,6 @@ class Renderer:
         view, right, up = _attitude_basis()
         cx, cy = rect.centerx, rect.centery + 6
         scale = 108.0 / length
-
-        def to_world(p):
-            return (
-                xb[0] * p[0] + yb[0] * p[1] + zb[0] * p[2],
-                xb[1] * p[0] + yb[1] * p[1] + zb[1] * p[2],
-                xb[2] * p[0] + yb[2] * p[1] + zb[2] * p[2],
-            )
 
         def project(p):
             wx = xb[0] * p[0] + yb[0] * p[1] + zb[0] * p[2]
@@ -1680,10 +2100,13 @@ class Renderer:
             if n > 1e-6:
                 fx, fy = fx / n, fy / n
 
-        base_color = color if ac.alive else (96, 100, 108)
-        # 告警色取黄橙：红蓝两队本体上用纯红都容易糊在一起，黄橙在两种底色
-        # 上都能形成清晰的方向渐变。
-        red = (255, 210, 90)
+        # 白模基色只混入少量队伍色，让两队仍可辨认，但不破坏展台白模的统一质感。
+        base_color = (
+            _mix(CLAY_LIT, TEAM_COLORS[i], TEAM_TINT)
+            if ac.alive else (110, 114, 120)
+        )
+        # 告警色只在受威胁方向上做渐变，统一用 ACCENT_RED。
+        red = ACCENT_RED
 
         # 尾焰先画，长度随油门/推力变化，机体会自然盖住焰根。
         if ac.alive and model.get("engines"):
@@ -1700,14 +2123,14 @@ class Renderer:
                 wid = 3.0 + 7.0 * level
                 tip2 = (tip[0], tip[1])
                 pygame.draw.polygon(
-                    self.screen, _mix((255, 138, 44), (168, 192, 255), 0.55 * ab), [
+                    self.screen, _mix((214, 216, 220), (250, 250, 252), 0.35 + 0.45 * ab), [
                         (tail[0] - uy * wid, tail[1] + ux * wid),
                         tip2,
                         (tail[0] + uy * wid, tail[1] - ux * wid),
                     ])
                 inner = (tail[0] + ux * n * 0.55, tail[1] + uy * n * 0.55)
                 pygame.draw.polygon(
-                    self.screen, _mix((255, 238, 196), (238, 244, 255), 0.75 * ab), [
+                    self.screen, _mix(ACCENT_RED, (255, 236, 232), 0.25), [
                         (tail[0] - uy * wid * 0.4, tail[1] + ux * wid * 0.4),
                         inner,
                         (tail[0] + uy * wid * 0.4, tail[1] - ux * wid * 0.4),
@@ -1718,31 +2141,50 @@ class Renderer:
             return
 
         faces = []
-        for poly, kind in model["faces"]:
-            wp = [to_world(p) for p in poly]
-            sp = [project(p) for p in poly]
-            center = (
-                sum(p[0] for p in wp) / len(wp),
-                sum(p[1] for p in wp) / len(wp),
-                sum(p[2] for p in wp) / len(wp),
+        # 机体系 → 姿态框屏幕系：与 _draw_model 同理，把机体旋转和等距投影
+        # 折成一个 3×3，逐顶点只做乘加，不再逐点建世界坐标再投影两次。
+        def row(axis):
+            return (
+                axis[0] * xb[0] + axis[1] * xb[1] + axis[2] * xb[2],
+                axis[0] * yb[0] + axis[1] * yb[1] + axis[2] * yb[2],
+                axis[0] * zb[0] + axis[1] * zb[1] + axis[2] * zb[2],
             )
-            depth = center[0] * view[0] + center[1] * view[1] + center[2] * view[2]
 
-            # 面法线做固定方向光照，避免纯色剪影。
-            e1 = (wp[1][0] - wp[0][0], wp[1][1] - wp[0][1], wp[1][2] - wp[0][2])
-            e2 = (wp[2][0] - wp[0][0], wp[2][1] - wp[0][1], wp[2][2] - wp[0][2])
-            normal = _norm(_cross(e1, e2))
-            light = 0.52 + 0.48 * abs(_dot(normal, LIGHT))
+        rr, uu, vv = row(right), row(up), row(view)
+        r0, r1, r2 = rr
+        u0, u1, u2 = uu
+        v0, v1, v2 = vv
+        # 法线在机体系里是常量：把光照/视线方向转回机体系后逐面只做点乘。
+        lbx, lby, lbz = _dot(xb, LIGHT), _dot(yb, LIGHT), _dot(zb, LIGHT)
+        vbx, vby, vbz = _dot(xb, view), _dot(yb, view), _dot(zb, view)
+        mini = model.get("mini_faces", model["faces"])
+        mini_normals = model.get("mini_normals", model["normals"])
+        for (poly, kind, ao), (nx, ny, nz) in zip(mini, mini_normals):
+            pts = []
+            dsum = 0.0
+            for px, py, pz in poly:
+                sr = r0 * px + r1 * py + r2 * pz
+                su = u0 * px + u1 * py + u2 * pz
+                sd = v0 * px + v1 * py + v2 * pz
+                pts.append((cx + sr * scale, cy - su * scale))
+                dsum += sd
+            depth = dsum / len(poly)
+
+            # 固定方向光照：环境项乘烘焙 AO，主光取 |n·l|，边缘光抬轮廓。
+            cl = abs(nx * lbx + ny * lby + nz * lbz)
+            facing = abs(nx * vbx + ny * vby + nz * vbz)
+            shade = AMB * ao + KEY * cl + RIM * (1.0 - facing) ** 2
 
             if kind == "canopy":
-                base = CANOPY_COLOR
+                base = CLAY_CANOPY
             elif kind == "intake":
-                base = INTAKE_COLOR
+                base = CLAY_INTAKE
             elif kind == "nozzle":
-                base = NOZZLE_COLOR
+                base = CLAY_NOZZLE
             else:
                 base = base_color
-            # 威胁渐变：面心在机体受威胁方向上的投影决定红色混入比例。
+            # 威胁渐变：面心在机体受威胁方向上的投影决定红色混入比例，
+            # 这是全图唯一允许出现红色的场景元素（告警语义）。
             if threat is not None:
                 bx_ = sum(p[0] for p in poly) / len(poly)
                 by_ = sum(p[1] for p in poly) / len(poly)
@@ -1750,146 +2192,93 @@ class Renderer:
                     0.5 + 0.5 * (bx_ * fx + by_ * fy) / max(length * 0.5, 1e-6),
                     0.0, 1.0,
                 )
-                mix = 0.85 * t
+                mix = 0.55 * t
                 base = (
                     base[0] + (red[0] - base[0]) * mix,
                     base[1] + (red[1] - base[1]) * mix,
                     base[2] + (red[2] - base[2]) * mix,
                 )
-            color_ = tuple(int(clamp(c * light, 0, 255)) for c in base)
-            faces.append((depth, [(p[0], p[1]) for p in sp], color_))
+            color_ = tuple(int(clamp(c, 0, 255)) for c in (
+                CLAY_AO[0] + (base[0] - CLAY_AO[0]) * shade,
+                CLAY_AO[1] + (base[1] - CLAY_AO[1]) * shade,
+                CLAY_AO[2] + (base[2] - CLAY_AO[2]) * shade,
+            ))
+            faces.append((depth, pts, color_))
 
         # 画家算法：远的先画，近面覆盖。
         for _depth, pts, color_ in sorted(faces, key=lambda f: f[0]):
             pygame.draw.polygon(self.screen, color_, pts)
 
-    def _draw_aircraft_panel(self, ac, agent, color, right: bool, incoming: int = 0) -> None:
-        width, height = 236, 232
-        x = self.w - width - 20 if right else 20
-        y = 20
-        pygame.draw.rect(self.screen, (26, 29, 34), pygame.Rect(x, y, width, height))
-        pygame.draw.rect(self.screen, color, pygame.Rect(x, y, width, height), 1)
-        pygame.draw.rect(self.screen, color, pygame.Rect(x, y, 4, height))
-
-        name = self.font.render(ac.spec.name, True, color)
-        self.screen.blit(name, (x + 14, y + 8))
-
-        line = f"SPD {ac.v:5.1f} m/s   G {ac.n:4.1f}"
-        self.screen.blit(self.font_small.render(line, True, TEXT), (x + 14, y + 29))
-
-        line = f"ALT {ac.z:5.0f} m   GAM {math.degrees(ac.gamma):+5.1f}"
-        self.screen.blit(self.font_small.render(line, True, SUB), (x + 14, y + 47))
-
-        # 姿态读数与 3D 模型同步，来自同一套 psi/theta/phi。
-        _psi, theta, phi = attitude_of(ac)
-        line = f"PITCH {math.degrees(theta):+5.1f}   ROLL {math.degrees(phi):+6.1f}"
-        self.screen.blit(self.font_small.render(line, True, TEXT), (x + 14, y + 65))
-
-        # 格斗弹余量与导引头状态
-        msl = ac.spec.missile
-        if msl is not None:
-            if ac.locked:
-                status, st_color = "LOCK", (255, 214, 96)
-            elif ac.lock_timer > 0.0:
-                pct = 100.0 * ac.lock_timer / msl.lock_time
-                status, st_color = f"SEEK {pct:3.0f}%", (214, 202, 142)
-            else:
-                status, st_color = "SEEK", SUB
-            line = f"MSL {ac.missiles}/{ac.spec.missile_count}  {status}"
-            self.screen.blit(self.font_small.render(line, True, st_color), (x + 14, y + 83))
-            if incoming:
-                warn = self.font_small.render(f"IN {incoming}", True, (255, 122, 88))
-                self.screen.blit(
-                    warn, (x + width - 14 - warn.get_width(), y + 83)
-                )
-
-        # 中距弹余量与雷达跟踪状态（主动弹末段截获前需要载机跟踪）
-        rsl = ac.spec.radar_missile
-        if rsl is not None:
-            if ac.radar_locked:
-                rstatus, rcolor = "LOCK", (255, 214, 96)
-            elif ac.radar_lock_timer > 0.0:
-                pct = 100.0 * ac.radar_lock_timer / rsl.lock_time
-                rstatus, rcolor = f"TRK {pct:3.0f}%", (214, 202, 142)
-            else:
-                rstatus, rcolor = "RDR", SUB
-            line = f"RDR {ac.radar_missiles}/{ac.spec.radar_missile_count}  {rstatus}"
-            self.screen.blit(self.font_small.render(line, True, rcolor), (x + 14, y + 101))
-
-        # 机动原语已改为跟随飞机的浮动标签，面板这里保留态势与干扰物余量。
-        line = f"CH {ac.chaff:2d}  FL {ac.flares:2d}"
-        self.screen.blit(self.font_small.render(line, True, SUB), (x + 14, y + 119))
-        situation = getattr(agent, "situation", "") if agent else ""
-        sit = self.font_small.render(f"SIT {situation}", True, SUB)
-        self.screen.blit(sit, (x + width - 14 - sit.get_width(), y + 119))
-
-        # 分层显示：TAC 是战术层（打什么仗），MAN 是机动层（具体怎么飞）。
-        tactic = getattr(agent, "tactic", "") if agent else ""
-        primitive = getattr(agent, "primitive", "") if agent else ""
-        self.screen.blit(
-            self.font_small.render(f"TAC {tactic}", True, color), (x + 14, y + 137)
-        )
-        self.screen.blit(
-            self.font_small.render(f"MAN {primitive}", True, TEXT), (x + 14, y + 155)
-        )
-
-        # 燃油与功率档位：AB = 加力，MIL = 军推；油尽后只能军推。
-        cap = ac.spec.fuel_capacity
-        fuel_frac = clamp(ac.fuel / cap, 0.0, 1.0) if cap > 0.0 else 1.0
-        ab_on = ac.ab > 0.05
-        line = f"FUEL {fuel_frac * 100:3.0f}%  {'AB' if ab_on else 'MIL'}"
-        self.screen.blit(
-            self.font_small.render(
-                line, True, (255, 168, 64) if ab_on else (150, 200, 160)
-            ),
-            (x + 14, y + 177),
-        )
-
-        # HP 条 + 数值
-        bx, by, bw, bh = x + 14, y + 203, 132, 12
-        pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
-        ratio = max(0.0, ac.hp / ac.spec.hp_max)
-        pygame.draw.rect(self.screen, color, pygame.Rect(bx, by, bw * ratio, bh))
-
-        hp_text = self.font_small.render(f"HP {ac.hp:5.1f}", True, TEXT)
-        self.screen.blit(hp_text, (bx + bw + 8, by + bh / 2 - hp_text.get_height() / 2))
-
     # ---------- 机载座舱显示：雷达屏 + 抬头/头瞄 + 武器显示 ----------
-    STATION_W = 340
+    # 三块仪表贴屏幕上沿独立成组（不再挤在一列里）：宽屏时雷达在角落、
+    # HUD 在它内侧并排；窄屏（录制用的 1280×800）改成竖排，雷达占满簇宽，
+    # 保证雷达屏始终是能读出距离环的方块，而不是一条细长窗口。
+    STATION_MARGIN = 20
+    STATION_TOP = 20
+    ATT_W = 440                # 顶部中央三维姿态框宽度
+    WEAPON_H = 108
+    HUD_STATUS_H = 24          # HUD 顶部状态带（左血量、右过载）
 
-    def _station_layout(self) -> tuple[int, int, int, int]:
-        """座舱面板的高度分配（总高, 抬头显示高, 雷达屏高, 武器显示高）。
+    def _stations_visible(self) -> bool:
+        """小窗口放不下左右座舱面板时隐藏，避免与主视区、底部读数互相压住。"""
+        return self.w >= 1180 and self.h >= 700
 
-        窗口高度可调（录制用 1280×800、观战用 1600×1000），所以按比例分配；
-        面板顶端给顶部信息框和中央姿态框留出至少 258 px，避免互相压住。
-        """
-        total = int(clamp(self.h * 0.62, 430, 620))
-        total = min(total, self.h - 64 - 258)
-        hud_h = int(clamp(total * 0.43, 172, 268))
-        scope_h = int(clamp(total * 0.22, 96, 140))
-        # 武器页要容纳标题 + 两栏弹药 + 底部机炮/干扰物行，至少 118 px，
-        # 不够时先压雷达屏、再压抬头显示，避免文字溢出面板（1280×800 下最容易溢出）。
-        weapon_h = total - 34 - scope_h - 6 - hud_h - 8
-        if weapon_h < 118:
-            cut = min(118 - weapon_h, scope_h - 88)
-            scope_h -= cut
-            hud_h -= min(118 - weapon_h - cut, hud_h - 156)
-            weapon_h = total - 34 - scope_h - 6 - hud_h - 8
-        return total, hud_h, scope_h, weapon_h
+    def _station_metrics(self) -> tuple[int, int, int, int, int, int, bool]:
+        """三块仪表的尺寸：(簇宽, 雷达宽, 雷达高, HUD 宽, HUD 高, 武器高, 是否竖排)。"""
+        margin = self.STATION_MARGIN
+        avail = max(320, (self.w - self.ATT_W) // 2 - margin - 8)
+        weapon_h = self.WEAPON_H
+        status_h = self.HUD_STATUS_H
+        if avail >= 520:
+            # 并排：雷达至少 220 px、HUD 至少 300 px，簇宽封顶 640。
+            cluster_w = min(avail, 640)
+            hud_w = min(352, cluster_w - 228)
+            radar_w = cluster_w - hud_w - 8
+            # HUD 主体高度跟雷达高度走（三块面板右列总高 = 雷达高），
+            # 再加回顶部状态带的高度，保证航向/俯仰区不会被状态带挤扁。
+            hud_h = int(clamp(radar_w - 8 - weapon_h, 132, 202)) + status_h
+            radar_h = max(radar_w, hud_h + 8 + weapon_h)
+            return cluster_w, radar_w, radar_h, hud_w, hud_h, weapon_h, False
+        # 竖排：雷达占满簇宽，压成 190–240 px 高的横屏也比细长条好读。
+        radar_w = avail
+        radar_h = int(clamp(min(avail * 0.58, self.h * 0.30), 190, 240))
+        return avail, radar_w, radar_h, avail, 168 + status_h, weapon_h, True
 
-    def _draw_fighter_stations(self, world: World) -> None:
-        """红方座舱区放左侧、蓝方放右侧，每块含雷达屏、头瞄视野与武器显示。
+    def _station_panels(self, i: int) -> tuple[pygame.Rect, pygame.Rect, pygame.Rect]:
+        """第 i 架的三块仪表矩形（红方贴左上、蓝方贴右上，雷达始终靠外）。"""
+        cluster_w, radar_w, radar_h, hud_w, hud_h, weapon_h, stacked = (
+            self._station_metrics()
+        )
+        top = self.STATION_TOP
+        x0 = (
+            self.STATION_MARGIN if i == 0
+            else self.w - self.STATION_MARGIN - cluster_w
+        )
+        if stacked:
+            radar = pygame.Rect(x0, top, radar_w, radar_h)
+            hud = pygame.Rect(x0, radar.bottom + 6, hud_w, hud_h)
+            weapon = pygame.Rect(x0, hud.bottom + 6, hud_w, weapon_h)
+            return radar, hud, weapon
+        radar_x = x0 if i == 0 else x0 + cluster_w - radar_w
+        radar = pygame.Rect(radar_x, top, radar_w, radar_h)
+        hud_x = x0 + radar_w + 8 if i == 0 else x0
+        hud = pygame.Rect(hud_x, top, hud_w, hud_h)
+        weapon = pygame.Rect(hud_x, hud.bottom + 8, hud_w, weapon_h)
+        return radar, hud, weapon
+
+    def _draw_fighter_stations(self, world: World, agents=None) -> None:
+        """红方座舱贴左上、蓝方贴右上，每块是雷达屏 / 头瞄视野 / 武器显示三块独立面板。
 
         目标颜色统一按火控状态：绿=已跟踪但未锁定，黄=正在锁定（可发射），
         红=已完成锁定。这样雷达屏与头瞄里的同一个目标颜色始终一致。
         """
-        total, _hud, _scope, _weapon = self._station_layout()
-        y = self.h - 64 - total
-        left_x = 20
-        right_x = self.w - 20 - self.STATION_W
-        for i, x in enumerate((left_x, right_x)):
+        if not self._stations_visible():
+            return
+        for i in range(len(world.acs)):
+            radar, hud, weapon = self._station_panels(i)
             self._draw_station(
-                world, i, pygame.Rect(x, y, self.STATION_W, total)
+                world, i, radar, hud, weapon,
+                agents[i] if agents else None,
             )
 
     def _lock_state(self, ac) -> tuple[tuple[int, int, int], str]:
@@ -1923,10 +2312,47 @@ class Renderer:
     def _alpha_rect(
         self, rect: pygame.Rect, color: tuple[int, int, int], alpha: int
     ) -> None:
-        """半透明底：座舱区压在 3D 场景上，不能把后面的空战画面盖死。"""
-        surf = pygame.Surface(rect.size, pygame.SRCALPHA)
-        surf.fill((color[0], color[1], color[2], alpha))
+        """半透明底：座舱区压在 3D 场景上，不能把后面的空战画面盖死。
+
+        纯色半透明块按 (尺寸, 颜色, 透明度) 缓存成静态面，每帧只 blit，
+        避免逐帧新建 Surface + fill（HUD 里这类底衬有 8 块以上）。
+        """
+        key = (rect.w, rect.h, tuple(color), alpha, RADIUS_CHIP)
+        surf = self._alpha_cache.get(key)
+        if surf is None:
+            surf = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(
+                surf, (color[0], color[1], color[2], alpha), surf.get_rect(),
+                border_radius=RADIUS_CHIP,
+            )
+            self._alpha_cache[key] = surf
         self.screen.blit(surf, rect.topleft)
+
+    def _overlay_begin(self, key: str) -> pygame.Surface:
+        """取用一层半透明叠加面，只清它上一次画过的脏矩形，不整屏重清。"""
+        surf = self._overlay_surfs.get(key)
+        if surf is None:
+            surf = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
+            self._overlay_surfs[key] = surf
+            self._overlay_dirty[key] = None
+        else:
+            dirty = self._overlay_dirty[key]
+            if dirty is not None:
+                surf.fill((0, 0, 0, 0), dirty)
+        return surf
+
+    def _overlay_flush(self, key: str, surf: pygame.Surface,
+                       box: pygame.Rect | None) -> None:
+        """把叠加层贴回屏幕，只贴 box 覆盖的区域（各图元返回矩形的并集）。"""
+        if box is None:
+            self._overlay_dirty[key] = None
+            return
+        r = box.inflate(6, 6).clip(self.screen.get_rect())
+        if r.width <= 0 or r.height <= 0:
+            self._overlay_dirty[key] = None
+            return
+        self.screen.blit(surf, r.topleft, r)
+        self._overlay_dirty[key] = r
 
     def _alpha_poly(
         self, rect: pygame.Rect, color: tuple[int, int, int],
@@ -1939,49 +2365,146 @@ class Renderer:
         )
         self.screen.blit(surf, rect.topleft)
 
-    def _draw_station(self, world: World, i: int, rect: pygame.Rect) -> None:
+    def _panel_bg(
+        self, rect: pygame.Rect, fill, *, alpha: int | None = None,
+        edge=None, radius: int = RADIUS_PANEL,
+        bar: tuple[str, tuple, int] | None = None,
+    ) -> None:
+        """统一的静态面板底：填充 + 圆角边框 + 可选强调条。
+
+        按 STATIC_SCALE 预渲染再 smoothscale：静态件在 1× 下得到真正的
+        1 px 发丝线，且同尺寸/同配色的面板直接复用缓存，每帧只做一次 blit。
+        """
+        key = (rect.w, rect.h, tuple(fill), alpha, edge, radius, bar, STATIC_SCALE)
+        surf = self._chrome_cache.get(key)
+        if surf is None:
+            s = STATIC_SCALE
+            w, h = rect.w * s, rect.h * s
+            big = pygame.Surface((w, h), pygame.SRCALPHA)
+            base = (fill[0], fill[1], fill[2], alpha) if alpha is not None else fill
+            pygame.draw.rect(big, base, big.get_rect(), border_radius=radius * s)
+            if edge is not None:
+                pygame.draw.rect(
+                    big, edge, big.get_rect(), 2, border_radius=radius * s
+                )
+                # 内层 1 px 高光：给不透明卡片一点“厚度”；玻璃底衬已有队伍色
+                # 强调条，再描一圈会显得花。
+                if alpha is None:
+                    pygame.draw.rect(
+                        big, PANEL_EDGE_HI,
+                        big.get_rect().inflate(-6 * s, -6 * s), s,
+                        border_radius=max(2, (radius - 3) * s),
+                    )
+            if bar is not None:
+                side, color, thick = bar
+                if side == "left":
+                    pygame.draw.rect(big, color, pygame.Rect(0, 0, thick * s, h))
+                else:
+                    pygame.draw.rect(big, color, pygame.Rect(0, 0, w, thick * s))
+            surf = pygame.transform.smoothscale(big, (rect.w, rect.h))
+            self._chrome_cache[key] = surf
+        self.screen.blit(surf, rect.topleft)
+
+    def _smooth(self, key: str, target: float) -> float:
+        """一阶插值（τ=NUM_TAU）：速度/高度/距离平滑过渡。
+
+        告警、锁定、余量这类必须即时刷新的数值不要走这里。
+        """
+        prev = self._disp.get(key)
+        if prev is None:
+            self._disp[key] = target
+            return target
+        k = 1.0 - math.exp(-self._frame_dt / NUM_TAU)
+        val = prev + (target - prev) * k
+        self._disp[key] = val
+        return val
+
+    def _draw_station(self, world: World, i: int, radar: pygame.Rect,
+                      hud: pygame.Rect, weapon: pygame.Rect,
+                      agent=None) -> None:
+        """一架飞机的三块独立面板：雷达屏、抬头显示仪、武器栏。
+
+        三块各带自己的圆角底衬与队伍色边线，可以分开摆放而不是塞进一个竖排
+        大框：雷达贴屏幕角落所以能做大方块，HUD 与武器栏在它内侧纵排。
+        """
         ac = world.acs[i]
         team = TEAM_COLORS[i]
         lock_color, lock_text = self._lock_state(ac)
-        # 玻璃感底衬：偏冷的浅色 + 低透明度，地面网格和航迹能透出来；
-        # 透明度不能太低，否则 3D 场景里的机体标签会透过面板和读数叠在一起。
-        self._alpha_rect(rect, (20, 30, 44), 140)
-        pygame.draw.rect(self.screen, team, rect, 1)
-        pygame.draw.rect(self.screen, team, pygame.Rect(rect.x, rect.y, rect.w, 3))
 
-        title = self.font_small.render(
-            f"{ac.spec.name}   {'RDR ON' if ac.radar_on else 'RDR SIL'}", True, team
+        # ---- 雷达屏 ----
+        # 页头一行交代“谁在看 / 雷达开没开 / 火控到了哪一步”，锁定过程用页头
+        # 下方一条细进度条表示，不额外占一行高度。三块面板用同一种深底，
+        # 只在边线上带队伍色，看起来是一套仪表而不是三张不同的卡片。
+        self._panel_bg(
+            radar, STATION_FILL, alpha=STATION_ALPHA,
+            edge=team, bar=("top", _mix((30, 32, 36), team, 0.30), 3),
         )
-        self.screen.blit(title, (rect.x + 10, rect.y + 6))
-        st = self.font_small.render(lock_text, True, lock_color)
-        self.screen.blit(st, (rect.right - 10 - st.get_width(), rect.y + 6))
-        # 锁定进度：黄灯阶段给一条细填充条，锁定后消失（已变红）
+        title = self.font_small.render(
+            f"{ac.spec.name} {'RDR ON' if ac.radar_on else 'RDR SIL'}",
+            True, team,
+        )
+        self.screen.blit(title, (radar.x + 10, radar.y + 6))
+        # 火控状态用 FS_TINY：窄屏雷达只有 220 px 宽，18 px 会直接撞上标题。
+        st = self.font_tiny.render(lock_text, True, lock_color)
+        self.screen.blit(st, (radar.right - 10 - st.get_width(), radar.y + 8))
         if ac.radar_lock_timer > 0.0 and not ac.radar_locked:
             rspec = ac.spec.radar_missile
             frac = (
                 clamp(ac.radar_lock_timer / max(rspec.lock_time, 1e-6), 0.0, 1.0)
                 if rspec is not None else 0.0
             )
-            bx, by, bw, bh = rect.right - 106, rect.y + 27, 96, 4
+            bx, by, bw, bh = radar.x + 10, radar.y + 27, radar.w - 20, 3
             pygame.draw.rect(self.screen, (44, 48, 55), pygame.Rect(bx, by, bw, bh))
             pygame.draw.rect(
                 self.screen, lock_color, pygame.Rect(bx, by, int(bw * frac), bh)
             )
+        scope = pygame.Rect(radar.x + 5, radar.y + 32, radar.w - 10, radar.h - 37)
+        self._draw_scope(world, i, scope, agent)
 
-        # 竖排：雷达屏在上、抬头显示器居中、武器显示在下
-        _total, hud_h, scope_h, weapon_h = self._station_layout()
-        scope_rect = pygame.Rect(rect.x + 8, rect.y + 34, rect.w - 16, scope_h)
-        self._draw_scope(world, i, scope_rect)
-        hud_rect = pygame.Rect(
-            rect.x + 8, scope_rect.bottom + 6, rect.w - 16, hud_h
+        # ---- 抬头显示仪 ----
+        # 顶部一条状态带放血量与过载，下面是航向/俯仰/速度/高度。
+        self._panel_bg(hud, STATION_FILL, alpha=STATION_ALPHA, edge=team)
+        self._draw_hud_status(
+            ac, pygame.Rect(hud.x, hud.y, hud.w, self.HUD_STATUS_H)
         )
-        self._draw_fwd_hud(world, i, hud_rect)
-        weapon_rect = pygame.Rect(
-            rect.x + 8, hud_rect.bottom + 8, rect.w - 16, weapon_h
+        self._draw_fwd_hud(
+            world, i,
+            pygame.Rect(hud.x + 1, hud.y + self.HUD_STATUS_H,
+                        hud.w - 2, hud.h - self.HUD_STATUS_H - 1),
         )
-        self._draw_weapon_rows(world, i, weapon_rect)
 
-    def _draw_scope(self, world: World, i: int, rect: pygame.Rect) -> None:
+        # ---- 武器栏 ----
+        self._draw_weapon_rows(world, i, weapon)
+
+    def _draw_hud_status(self, ac, rect: pygame.Rect) -> None:
+        """HUD 顶部状态带：左侧血量（数值 + 条），右侧当前过载。
+
+        血量原先只在上方姿态框的机名行里，座舱面板看不到；过载原先贴在速度
+        带下方，会压住滚动刻度。这两个“必须随时能瞟一眼”的量合成一条放在
+        HUD 最上沿，左右各一个，且每项全界面只出现一次。
+        """
+        hp = max(0.0, ac.hp) if ac.alive else 0.0
+        frac = clamp(hp / max(ac.spec.hp_max, 1.0), 0.0, 1.0)
+        col = HUD_WARN if frac < 0.25 else HUD_GREEN
+        y = rect.y + 3
+        lab = self.font_num_small.render(f"HP {hp:3.0f}", True, col)
+        self.screen.blit(lab, (rect.x + 8, y))
+        bar = pygame.Rect(rect.x + 8 + lab.get_width() + 8, y + 6, 52, 5)
+        pygame.draw.rect(self.screen, (26, 40, 34), bar)
+        if frac > 0.0:
+            pygame.draw.rect(
+                self.screen, col,
+                pygame.Rect(bar.x, bar.y, max(1, int(bar.w * frac)), bar.h),
+            )
+        g = self.font_num_small.render(f"G {ac.n:3.1f}", True, HUD_GREEN)
+        self.screen.blit(g, (rect.right - 8 - g.get_width(), y))
+        pygame.draw.line(
+            self.screen, PANEL_EDGE, (rect.x + 8, rect.bottom),
+            (rect.right - 8, rect.bottom), 1,
+        )
+
+    def _draw_scope(self, world: World, i: int, rect: pygame.Rect,
+                    agent=None) -> None:
         """本机机头朝上的雷达屏：只有拿到距离级接触才画目标光点。"""
         ac = world.acs[i]
         foe = world.acs[1 - i]
@@ -2010,7 +2533,7 @@ class Renderer:
             )
         # 距离档标注放在圆环下缘：目标通常出现在机头方向（画面上方）。
         for frac in (0.5, 1.0):
-            label = self.font_small.render(f"{rng * frac / 1000:.0f}", True, dim)
+            label = self.font_num_small.render(f"{rng * frac / 1000:.0f}", True, dim)
             self.screen.blit(label, (cx + 3, cy + int(radius * frac) - 17))
         pygame.draw.line(self.screen, grid, (cx - radius, cy), (cx + radius, cy), 1)
         pygame.draw.line(self.screen, grid, (cx, cy - radius), (cx, cy + radius), 1)
@@ -2029,9 +2552,9 @@ class Renderer:
             pygame.draw.line(self.screen, lock_color, (cx, cy), (tx, ty), 1)
             pygame.draw.circle(self.screen, lock_color, (int(tx), int(ty)), 4)
             pygame.draw.circle(self.screen, bg, (int(tx), int(ty)), 2)
-            tag = self.font_small.render(f"{d / 1000:4.1f}", True, lock_color)
+            tag = self.font_num_small.render(f"{d / 1000:4.1f}", True, lock_color)
             dz = foe.z - ac.z
-            alt = self.font_small.render(f"{dz / 1000:+4.1f}k", True, dim)
+            alt = self.font_num_small.render(f"{dz / 1000:+4.1f}k", True, dim)
             # 标签贴着光点放，但避开边框，避免压住距离环刻度。
             lx = tx + 8
             if lx + tag.get_width() > rect.right - 4:
@@ -2095,7 +2618,7 @@ class Renderer:
                          (bx - 4 * fx + 3.5 * px, by - 4 * fy + 3.5 * py),
                          (bx - 4 * fx - 3.5 * px, by - 4 * fy - 3.5 * py)],
                     )
-                    tag = self.font_small.render(f"{md / 1000:.1f}", True, col)
+                    tag = self.font_num_small.render(f"{md / 1000:.1f}", True, col)
                     self.screen.blit(tag, (bx + 8, by - 16))
                 else:
                     # 己方在飞弹：浅绿空心点 + 一小段速度矢量（不用队伍色，
@@ -2121,8 +2644,23 @@ class Renderer:
                     (cx + (radius - 9) * math.sin(a), cy - (radius - 9) * math.cos(a)),
                     (cx + radius * math.sin(a), cy - radius * math.cos(a)), 2,
                 )
-            lab = self.font_small.render("MSL", True, (255, 80, 72))
-            self.screen.blit(lab, (rect.x + 4, rect.bottom - 19))
+
+        # ---- 底部状态行：左侧态势、右侧来袭弹计数 ----
+        # 态势（SEPARATED / NEUTRAL / DEFENSIVE …）原在左右信息卡里，这里收进
+        # 雷达屏底边，字号降到 FS_TINY，不参与主视区读数。
+        situation = getattr(agent, "situation", "") if agent else ""
+        if situation:
+            sit = self.font_tiny.render(situation, True, dim)
+            self.screen.blit(
+                sit, (rect.x + 3, rect.bottom - 3 - sit.get_height())
+            )
+        incoming = sum(1 for m in world.missiles if m.alive and m.target == i)
+        if incoming:
+            warn = self.font_small.render(f"IN {incoming}", True, (255, 96, 88))
+            self.screen.blit(
+                warn, (rect.right - 3 - warn.get_width(),
+                       rect.bottom - 3 - warn.get_height())
+            )
 
     def _draw_fwd_hud(self, world: World, i: int, rect: pygame.Rect) -> None:
         """抬头/头瞄视野：航向带、速度/高度刻度带、俯仰梯、目标与炮线。
@@ -2202,9 +2740,12 @@ class Renderer:
                     (mx + ln * d_x, my + ln * d_y), 1,
                 )
                 if major and p != 0:
-                    lab = self.font_small.render(f"{p:+d}", True, (92, 168, 126))
+                    lab = self.font_num_small.render(f"{p:+d}", True, (92, 168, 126))
+                    # 角度标注贴在线段左端：右端要留给高度带的五位数字，
+                    # 否则 +10/+20 会直接压到 9500/10000 上。
+                    lw, lh = lab.get_size()
                     self.screen.blit(
-                        lab, (int(mx + ln * d_x) + 4, int(my + ln * d_y) - 8)
+                        lab, (int(mx - ln * d_x) - 4 - lw, int(my - ln * d_y) - lh / 2)
                     )
 
             # 水平标志：固定不随横滚转动，它与俯仰梯的夹角就是当前坡度。
@@ -2221,8 +2762,8 @@ class Renderer:
 
             # 目标框：视场内按真实方位/仰角投影，菱形框；出视场退化为头瞄指引。
             # 若只拿到方位（CONTACT_DETECT，例如雷达被干扰、仅 RWR 告警），
-            # 就在航向带上标一个琥珀色三角，并给一行方位读数——不给距离框，
-            # 避免把“只知道方向”画成“已经跟踪”。
+            # 就在航向带上用一个红色小箭头指向对应刻度——不给距离框，也不给
+            # 方位读数文字，避免把“只知道方向”画成“已经跟踪”。
             if foe.alive:
                 dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
                 dist = math.sqrt(dx * dx + dy * dy + dz * dz)
@@ -2231,14 +2772,24 @@ class Renderer:
                     elev = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
                     if abs(rel) < math.radians(52.0):
                         tx, ty = view_pt(math.degrees(rel), elev)
-                        tx = clamp(tx, rect.left + 96, rect.right - 96)
+                        # 右端让出高度值方框（宽约 63 px、贴着右边缘），
+                        # 否则菱形会直接压在读数上。
+                        tx = clamp(tx, rect.left + 96, rect.right - 120)
                         ty = clamp(ty, rect.top + 56, rect.bottom - 26)
                         self._diamond(tx, ty, 9, lock_color)
-                        lab = self.font_small.render(f"{dist / 1000:4.1f}", True, lock_color)
-                        # 距离读数做成贴菱形上缘的小标签：不管目标框落在哪儿，
-                        # 都不会压到俯仰梯的角度标注或右侧高度带。
+                        lab = self.font_num_small.render(f"{dist / 1000:4.1f}", True, lock_color)
+                        # 距离读数贴菱形放：优先放上缘，但航向带（含刻度数字）
+                        # 到 top+80 一带不能压，塞不下就改放在菱形下方。
                         lw = lab.get_width()
-                        chip = pygame.Rect(int(tx - lw / 2 - 3), ty - 26, lw + 6, 16)
+                        chip = pygame.Rect(int(tx - lw / 2 - 3), int(ty - 26), lw + 6, 16)
+                        if chip.y < rect.top + 80:
+                            chip.y = int(min(ty + 14, rect.bottom - 18))
+                        # 左右贴边时读数会横跨到速度/高度数字列：夹在两列之间，
+                        # 右边界留出高度读数框（五位数时约 63 px 宽）。
+                        lo = rect.left + 94
+                        hi = rect.right - 118 - chip.w
+                        if hi >= lo:
+                            chip.x = int(clamp(chip.x, lo, hi))
                         chip.clamp_ip(rect)
                         self._alpha_rect(chip, (10, 22, 18), 205)
                         self.screen.blit(lab, (chip.x + 3, chip.y + 2))
@@ -2257,16 +2808,6 @@ class Renderer:
                 elif ac.contact == CONTACT_DETECT or ac.rwr:
                     brg = (math.degrees(ac.psi) + math.degrees(rel)) % 360.0
                     self._bearing_marker(rect, math.degrees(ac.psi) % 360.0, brg)
-                    if self._missile_threat(world, i) is None:
-                        lab = self.font_small.render(
-                            f"TGT BRG {brg:03.0f}", True, HUD_MARK
-                        )
-                        band = pygame.Rect(
-                            int(cx - lab.get_width() / 2 - 4), rect.bottom - 43,
-                            lab.get_width() + 8, 17,
-                        )
-                        self._alpha_rect(band, (10, 22, 18), 230)
-                        self.screen.blit(lab, (band.x + 4, band.y + 2))
 
             # 机炮准星：圆形框，圆心是弹丸外弹道前推到目标距离后的落点。
             # 圆框压住目标菱形，就说明炮线真的压在目标上。
@@ -2311,7 +2852,7 @@ class Renderer:
                 wy = clamp(cy - math.cos(az) * rect.h * 0.34,
                            rect.top + 56, rect.bottom - 26)
                 pygame.draw.circle(self.screen, HUD_WARN, (int(wx), int(wy)), 5)
-                lab = self.font_small.render(
+                lab = self.font_num_small.render(
                     f"MSL {math.degrees(az):+04.0f}  {td / 1000:4.1f}km",
                     True, HUD_WARN,
                 )
@@ -2327,30 +2868,38 @@ class Renderer:
     # ---------- 抬头显示器的刻度带与读数框 ----------
 
     def _value_box(self, box: pygame.Rect, text: str) -> None:
-        """当前值方框：深底 + 亮框 + 居中数字，刻度带从它后面滚过去。"""
+        """当前值方框：深底 + 亮框 + 居中数字，刻度带从它后面滚过去。
+
+        读数宽度按实际文字量算：五位高度值比固定 44 px 的框宽，扩展时保持
+        右边线与箭头对齐、向左加宽，避免数字压在框线上。
+        """
+        t = self.font_num.render(text.strip(), True, HUD_MARK)
+        w = max(box.w, t.get_width() + 8)
+        if w > box.w:
+            box = pygame.Rect(box.right - w, box.y, w, box.h)
         surf = pygame.Surface(box.size, pygame.SRCALPHA)
         surf.fill((8, 22, 16, 236))
         self.screen.blit(surf, box.topleft)
         pygame.draw.rect(self.screen, HUD_MARK, box, 1)
-        t = self.font.render(text, True, HUD_MARK)
         self.screen.blit(
             t, (box.centerx - t.get_width() / 2, box.centery - t.get_height() / 2)
         )
 
     def _bearing_marker(self, rect: pygame.Rect, hdg: float, brg: float) -> None:
-        """仅拿到目标方位时，在顶部航向带上方标一个倒三角（随航向滚动）。
+        """仅拿到目标方位时，在航向带正上方画一个红色小箭头指向对应刻度。
 
-        尖标放在读数框上方的独立窄条里：既不会被 HUD 边框裁掉，也不会和中央
-        航向读数框、刻度数字压在一起；目标越接近正前方，尖标越贴近读数框。
+        方位角按“相对当前航向”换算成横向像素；目标越接近正前方，箭头越靠
+        近中央读数框。原来那行 “TGT BRG 123” 文字已去掉，读数直接由箭头
+        所指的刻度给出。箭头画在刻度线的上方窄带里，不压中央读数方框。
         """
         span = 200.0
         px_per_deg = rect.w / span
         delta = ((brg - hdg + 180.0) % 360.0) - 180.0
-        x = clamp(rect.centerx + delta * px_per_deg, rect.left + 16, rect.right - 16)
+        x = clamp(rect.centerx + delta * px_per_deg, rect.left + 12, rect.right - 12)
         top = rect.top + 3
         pygame.draw.polygon(
-            self.screen, HUD_MARK,
-            [(x - 7, top), (x + 7, top), (x, top + 12)],
+            self.screen, ACCENT_RED,
+            [(x - 6, top), (x + 6, top), (x, top + 11)],
         )
 
     def _heading_tape(self, rect: pygame.Rect, hdg: float) -> None:
@@ -2377,11 +2926,15 @@ class Renderer:
             ln = 9 if major else 5
             pygame.draw.line(self.screen, HUD_DIM, (x, y), (x, y - ln), 1)
             if major:
-                lab = self.font_small.render(f"{t:03.0f}", True, (100, 176, 136))
+                lab = self.font_num_small.render(f"{t:03.0f}", True, (100, 176, 136))
                 # 左右两端留出“HDG”标签的位置，避免第一个航向数字压在上面
                 if x - lab.get_width() * 0.5 < rect.left + 36:
                     continue
                 if x + lab.get_width() * 0.5 > rect.right - 10:
+                    continue
+                # 中央读数框宽 52 px，刻度数字要完整让开它（原先只跳过刻度线，
+                # 数字仍会画进框里，出现 “352” 和 “000” 叠字）。
+                if abs(x - cx) < 26.0 + lab.get_width() * 0.5 + 4.0:
                     continue
                 self.screen.blit(lab, (x - lab.get_width() / 2, y + 2))
         self._value_box(pygame.Rect(cx - 26, y - 11, 52, 22), f"{hdg:3.0f}")
@@ -2403,7 +2956,7 @@ class Renderer:
             ln = 7 if major else 4
             pygame.draw.line(self.screen, HUD_DIM, (line_x - ln, y), (line_x, y), 1)
             if major:
-                lab = self.font_small.render(f"{k:3.0f}", True, (100, 176, 136))
+                lab = self.font_num_small.render(f"{k:3.0f}", True, (100, 176, 136))
                 self.screen.blit(lab, (x + 2, y - 9))
             k += 10.0
         box = pygame.Rect(x + 46, cy - 11, 44, 22)
@@ -2416,6 +2969,9 @@ class Renderer:
     def _altitude_tape(self, right: int, top: int, bottom: int, z: float, cy: int) -> None:
         """右侧高度带：刻度随高度滚动，当前值方框 + 三角标志指向当前高度。"""
         px_per_100m = clamp((bottom - top) / 58.0, 2.6, 4.6)
+        # 五位读数宽约 55 px、字高约 20 px：矮 HUD 上 500 m 一档只有 13 px，
+        # 相邻数字会叠成一团，这时只标 1000 m 一档（刻度短线仍保留 500 m）。
+        lab_step = 500.0 if px_per_100m * 5.0 >= 18.0 else 1000.0
         line_x = right - 34
         pygame.draw.line(self.screen, HUD_DIM, (line_x, top), (line_x, bottom), 1)
         span = (bottom - top) / px_per_100m * 100.0
@@ -2427,9 +2983,11 @@ class Renderer:
             ln = 7 if major else 4
             pygame.draw.line(self.screen, HUD_DIM, (line_x, y), (line_x + ln, y), 1)
             if major:
-                lab = self.font_small.render(f"{k:5.0f}", True, (100, 176, 136))
-                # 当前值方框压住的那一行不再标数字（方框里已经是精确读数）
-                if abs(y - cy) > 16:
+                # 当前值方框压住的那几行不再标数字（方框里已经是精确读数）。
+                # 门限要含字形高度：只排除 |y-cy|≤16 时，紧邻方框的读数
+                # 仍会露出半个字，看起来像方框里多了一位。
+                if abs(y - cy) > 24 and int(k) % int(lab_step) == 0:
+                    lab = self.font_num_small.render(f"{k:5.0f}", True, (100, 176, 136))
                     # 标在刻度线左侧：右侧只剩 34 px 到面板边，五位数字摆不下
                     self.screen.blit(lab, (line_x - 9 - lab.get_width(), y - 9))
             k += 100.0
@@ -2441,10 +2999,10 @@ class Renderer:
         )
 
     def _diamond(self, x: float, y: float, r: float, color) -> None:
-        """雷达/头瞄锁定菱形框。"""
+        """雷达/头瞄锁定菱形框（2 px 描边，与其余图标统一）。"""
         pygame.draw.polygon(
             self.screen, color,
-            [(x, y - r), (x + r, y), (x, y + r), (x - r, y)], 1,
+            [(x, y - r), (x + r, y), (x, y + r), (x - r, y)], ICON_STROKE,
         )
 
     def _gun_fall_point(
@@ -2587,8 +3145,7 @@ class Renderer:
         """
         ac = world.acs[i]
         team = TEAM_COLORS[i]
-        self._alpha_rect(rect, (5, 15, 11), 214)
-        pygame.draw.rect(self.screen, team, rect, 1)
+        self._panel_bg(rect, STATION_FILL, alpha=STATION_ALPHA, edge=team)
         self.screen.blit(
             self.font_small.render("WPN", True, (104, 202, 150)),
             (rect.x + 8, rect.y + 4),
@@ -2603,6 +3160,20 @@ class Renderer:
             tag, tcol = "CLEAR", (104, 202, 150)
         t = self.font_small.render(tag, True, tcol)
         self.screen.blit(t, (rect.right - 8 - t.get_width(), rect.y + 4))
+
+        # 格斗弹导引头状态（原来在信息卡的 MSL 行）：持续留在视场内读满时间
+        # 才转 LOCK。放在页头中段，和右侧的导弹/CLEAR 状态错开。
+        msl = ac.spec.missile
+        if msl is not None:
+            if ac.locked:
+                seek, seek_col = "LOCK", (255, 214, 96)
+            elif ac.lock_timer > 0.0:
+                pct = 100.0 * ac.lock_timer / max(msl.lock_time, 1e-6)
+                seek, seek_col = f"SEEK {pct:3.0f}%", (214, 202, 142)
+            else:
+                seek, seek_col = "SEEK", (140, 178, 158)
+            s = self.font_small.render(seek, True, seek_col)
+            self.screen.blit(s, (rect.centerx - s.get_width() / 2, rect.y + 4))
 
         self._aircraft_top_view(
             ac, i,
@@ -2620,7 +3191,9 @@ class Renderer:
             ("AAM-IR", ac.spec.missile, ac.missiles,
              ac.spec.missile_count, False),
         )
-        row_gap = clamp((rect.h - 40) / 2.0, 24, 34)
+        # 两栏的起始行距要同时避开底部机炮/干扰物行：每栏约占 32 px，
+        # 行距随面板高度增加，但绝不能把第二栏的名字行推到底部行上。
+        row_gap = clamp(rect.h - 76, 24, 34)
         for k, (title, spec, have, total, left) in enumerate(groups):
             if spec is None:
                 continue
@@ -2832,18 +3405,21 @@ class Renderer:
         if hit is not None:
             return hit[0]
         verts: list[float] = []
-        for pts, kind in model["faces"]:
+        team_lit = _mix(CLAY_LIT, TEAM_COLORS[team], TEAM_TINT)
+        for pts, kind, ao in model["faces"]:
             if len(pts) < 3:
                 continue
             if kind == "canopy":
-                base = CANOPY_COLOR
+                base = CLAY_CANOPY
             elif kind == "intake":
-                base = INTAKE_COLOR
+                base = CLAY_INTAKE
             elif kind == "nozzle":
-                base = NOZZLE_COLOR
+                base = CLAY_NOZZLE
             else:
-                shade = PART_SHADE.get(kind, 1.0)
-                base = tuple(int(c * shade) for c in TEAM_COLORS[team])
+                base = team_lit
+            base = tuple(
+                int(CLAY_AO[c] + (base[c] - CLAY_AO[c]) * ao) for c in range(3)
+            )
             rgb = (base[0] / 255.0, base[1] / 255.0, base[2] / 255.0)
             e1 = (pts[1][0] - pts[0][0], pts[1][1] - pts[0][1],
                   pts[1][2] - pts[0][2])
@@ -2882,7 +3458,7 @@ class Renderer:
 
     def _gpu_ground(self, world: World) -> None:
         """把城市地图地面层作为全屏纹理画在 3D 场景最底层。"""
-        surf = self._ground_image(world)
+        surf, _top = self._ground_image(world)
         if surf is None:
             return
         ctx, mgl = self.ctx, self.mgl

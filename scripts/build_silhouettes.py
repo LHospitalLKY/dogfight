@@ -39,7 +39,7 @@ def _rasterize(model: dict, ppm: float) -> pygame.Surface:
     """把所有面片投影到 XY 平面并填充，得到实心轮廓。"""
     xs: list[float] = []
     ys: list[float] = []
-    for poly, _kind in model["faces"]:
+    for poly, _kind, _ao in model["faces"]:
         for x, y, _z in poly:
             xs.append(x)
             ys.append(y)
@@ -56,7 +56,7 @@ def _rasterize(model: dict, ppm: float) -> pygame.Surface:
     def to_px(x: float, y: float) -> tuple[float, float]:
         return (ox + y * ppm, oy - x * ppm)
 
-    for poly, _kind in model["faces"]:
+    for poly, _kind, _ao in model["faces"]:
         pts = [to_px(x, y) for x, y, _z in poly]
         if len(pts) < 3:
             continue

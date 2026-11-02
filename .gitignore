@@ -18,6 +18,9 @@ f_16c_model/
 I154-SU-57战机/
 Sukhoi_PAKFA.gif
 
+# 视觉金标截图（本地验收基线，体积大，不入库）
+docs/images/golden/
+
 # IDE / 系统文件
 .idea/
 .vscode/
