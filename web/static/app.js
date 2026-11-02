@@ -214,12 +214,229 @@
     depthWrite: false,
     side: THREE.DoubleSide,
   });
+  const deadBodyMat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(rgbHex(RGB.CLAY_AO)),
+    roughness: 0.80,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+  });
 
-  // 尾焰：单位锥体，绕 X 轴转成沿 +Z，运行时按机尾方向缩放。
-  const coneOuterGeo = new THREE.ConeGeometry(0.22, 1.0, 8, 1, false);
-  coneOuterGeo.rotateX(Math.PI / 2);
-  const coneInnerGeo = new THREE.ConeGeometry(0.12, 1.0, 8, 1, false);
-  coneInnerGeo.rotateX(Math.PI / 2);
+  // 尾焰：屏幕朝向的带状面片 + 程序化着色（与 flame_demo 同一套羽流）。
+  // 面片两端对齐喷口与羽流末端，宽度在视空间内展开，任何视角下都是柔和
+  // 光带；加力时走冷蓝，不开加力时走暖黄。
+  const plumeVert = `
+    attribute float aSide;
+    attribute float aV;
+    uniform float uLen;
+    uniform float uW0;
+    uniform float uW1;
+    uniform float uSpread;
+    uniform float uScale;
+    varying vec2 vUv;
+    void main() {
+      vUv = vec2((aSide + 1.0) * 0.5, aV);
+      vec4 p0 = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+      vec4 p1 = modelViewMatrix * vec4(0.0, 0.0, uLen, 1.0);
+      vec2 d = p1.xy - p0.xy;
+      float dl = length(d);
+      vec2 dir = dl > 1e-5 ? d / dl : vec2(0.0, 1.0);
+      vec2 perp = vec2(-dir.y, dir.x);
+      vec4 mv = mix(p0, p1, aV);
+      mv.xy += perp * (aSide * 0.5 * mix(uW0, uW1, aV) * uSpread * uScale);
+      gl_Position = projectionMatrix * mv;
+    }
+  `;
+
+  const plumeFrag = `
+    precision highp float;
+    varying vec2 vUv;
+    uniform float uTime;
+    uniform float uLevel;
+    uniform float uSeed;
+    uniform float uGain;
+    uniform float uCoreMix;
+    uniform float uAb;
+
+    vec3 rampCold(float v) {
+      vec3 white  = vec3(0.92, 0.99, 1.00);
+      vec3 cyan   = vec3(0.20, 0.82, 1.00);
+      vec3 blue   = vec3(0.16, 0.40, 1.00);
+      vec3 violet = vec3(0.62, 0.20, 1.00);
+      if (v < 0.18) return mix(white, cyan, v / 0.18);
+      if (v < 0.62) return mix(cyan, blue, (v - 0.18) / 0.44);
+      if (v < 0.80) return mix(blue, violet, (v - 0.62) / 0.18);
+      return mix(violet, vec3(0.82, 0.97, 0.56), clamp((v - 0.80) / 0.20, 0.0, 1.0));
+    }
+
+    vec3 rampWarm(float v) {
+      vec3 white  = vec3(1.00, 0.98, 0.90);
+      vec3 yellow = vec3(1.00, 0.82, 0.30);
+      vec3 orange = vec3(1.00, 0.54, 0.12);
+      vec3 amber  = vec3(0.92, 0.34, 0.06);
+      vec3 ember  = vec3(0.70, 0.18, 0.03);
+      if (v < 0.18) return mix(white, yellow, v / 0.18);
+      if (v < 0.62) return mix(yellow, orange, (v - 0.18) / 0.44);
+      if (v < 0.82) return mix(orange, amber, (v - 0.62) / 0.20);
+      return mix(amber, ember, clamp((v - 0.82) / 0.18, 0.0, 1.0));
+    }
+
+    void main() {
+      float v = vUv.y;
+      float u = (vUv.x - 0.5) * 2.0;
+
+      float core = exp(-pow(abs(u) * 2.80, 2.0));
+      float halo = exp(-pow(abs(u) * 1.00, 2.0));
+      float edge = 1.0 - smoothstep(0.52, 1.0, abs(u));
+
+      float alongCore = 1.0 - smoothstep(0.42, 1.0, v);
+      float alongHalo = 1.0 - smoothstep(0.26, 1.0, v);
+      float head = smoothstep(0.0, 0.045, v);
+      float hot = smoothstep(0.42, 0.0, v);
+
+      float diamond = 0.62 + 0.38 * cos(v * 27.0 - uTime * 2.0 + uSeed * 4.0);
+      diamond = mix(1.0, diamond, smoothstep(0.62, 0.06, v) * (0.35 + 0.65 * uAb));
+
+      float turb = 0.84
+        + 0.10 * sin(u * 7.0 + uTime * 4.0 + uSeed * 9.0)
+        + 0.06 * sin(v * 16.0 - uTime * 6.0 + uSeed * 5.0);
+
+      float a = (core * uCoreMix * alongCore + halo * 0.34 * alongHalo)
+        * head * diamond * turb * edge;
+      a *= uLevel * uGain * (1.0 + 0.25 * hot);
+      a = clamp(a, 0.0, 1.0);
+
+      vec3 colCore = mix(rampWarm(v), rampCold(v), uAb);
+      vec3 colHalo = mix(vec3(1.00, 0.46, 0.10), vec3(1.00, 0.28, 0.82), uAb);
+      vec3 col = colCore * core * uCoreMix * 1.15 + colHalo * halo * 0.30;
+      vec3 hotCol = mix(vec3(1.00, 0.93, 0.74), vec3(0.84, 0.97, 1.00), uAb);
+      col = mix(col, hotCol, 0.55 * hot);
+      float tip = smoothstep(0.56, 0.98, v);
+      vec3 tipCol = mix(vec3(1.00, 0.66, 0.20), vec3(0.88, 0.98, 0.58), uAb);
+      col = mix(col, tipCol, tip * (0.45 + 0.40 * halo));
+
+      gl_FragColor = vec4(col, a);
+    }
+  `;
+
+  const plumeGeo = new THREE.BufferGeometry();
+  plumeGeo.setAttribute("position", new THREE.Float32BufferAttribute(
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3));
+  plumeGeo.setAttribute("aSide", new THREE.Float32BufferAttribute([-1, 1, -1, 1], 1));
+  plumeGeo.setAttribute("aV", new THREE.Float32BufferAttribute([0, 0, 1, 1], 1));
+  plumeGeo.setIndex([0, 1, 2, 2, 1, 3]);
+
+  function makeGlowTexture() {
+    const s = 256;
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = s;
+    const ctx = cv.getContext("2d");
+    const grd = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+    grd.addColorStop(0.00, "rgba(235,250,255,1.00)");
+    grd.addColorStop(0.12, "rgba(150,225,255,0.85)");
+    grd.addColorStop(0.28, "rgba(110,140,255,0.55)");
+    grd.addColorStop(0.48, "rgba(230,90,220,0.28)");
+    grd.addColorStop(0.72, "rgba(150,40,140,0.10)");
+    grd.addColorStop(1.00, "rgba(0,0,0,0)");
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, s, s);
+    return new THREE.CanvasTexture(cv);
+  }
+  const glowTex = makeGlowTexture();
+
+  const PLUME_HOT_WARM = new THREE.Color(0xffd27a);
+  const PLUME_HOT_COLD = new THREE.Color(0xbfe4ff);
+  const PLUME_HALO_WARM = new THREE.Color(0xff8a2a);
+  const PLUME_HALO_COLD = new THREE.Color(0xc257ff);
+  const PLUME_LIGHT_WARM = new THREE.Color(0xffb050);
+  const PLUME_LIGHT_COLD = new THREE.Color(0x74c8ff);
+
+  function plumeMesh(seed, spread, coreMix, gain) {
+    const uniforms = {
+      uTime: { value: 0 },
+      uLevel: { value: 1.0 },
+      uSeed: { value: seed },
+      uGain: { value: gain },
+      uCoreMix: { value: coreMix },
+      uSpread: { value: spread },
+      uLen: { value: 6.6 },
+      uW0: { value: 0.62 },
+      uW1: { value: 1.60 },
+      uScale: { value: 1.0 },
+      uAb: { value: 1.0 },
+    };
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: plumeVert,
+      fragmentShader: plumeFrag,
+      uniforms,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const m = new THREE.Mesh(plumeGeo, mat);
+    m.frustumCulled = false;
+    return m;
+  }
+
+  // 每台发动机两层羽流 + 喷口高热辉光 + 中段大光晕 + 照亮机体的点光。
+  function makePlume(seed, modelLen) {
+    const sf = modelLen / REF_LENGTH;
+    const group = new THREE.Group();
+    const core = plumeMesh(seed, 1.0, 1.0, 1.70);
+    const halo = plumeMesh(seed + 0.4, 3.2, 0.0, 0.50);
+    group.add(core, halo);
+
+    const glowHot = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: PLUME_HOT_WARM, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      opacity: 0.55,
+    }));
+    glowHot.position.set(0, 0, 0.30 * sf);
+    glowHot.scale.setScalar(2.2 * sf);
+    group.add(glowHot);
+
+    const glowHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: PLUME_HALO_WARM, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      opacity: 0.26,
+    }));
+    glowHalo.position.set(0, 0, 4.2 * sf);
+    glowHalo.scale.setScalar(8.2 * sf);
+    group.add(glowHalo);
+
+    const light = new THREE.PointLight(0xffb050, 1.6, 34.0 * sf, 1.8);
+    light.position.set(0, 0, 0.9 * sf);
+    group.add(light);
+
+    group.userData = {
+      core: core.material.uniforms,
+      halo: halo.material.uniforms,
+      glowHot, glowHalo, light,
+    };
+    return group;
+  }
+
+  function setPlumeState(plume, level, ab, len, scale, sf) {
+    const g = plume.userData;
+    for (const u of [g.core, g.halo]) {
+      u.uLevel.value = level;
+      u.uAb.value = ab;
+      u.uLen.value = len;
+      u.uW0.value = 0.62 * sf;
+      u.uW1.value = (1.15 + 0.50 * level) * sf;
+      u.uScale.value = scale;
+      u.uGain.value = 1.35 + 0.35 * ab;
+    }
+    g.glowHot.material.color.copy(PLUME_HOT_WARM).lerp(PLUME_HOT_COLD, ab);
+    g.glowHot.material.opacity = 0.10 + 0.45 * level;
+    g.glowHot.position.z = 0.30 * sf;
+    g.glowHalo.material.color.copy(PLUME_HALO_WARM).lerp(PLUME_HALO_COLD, ab);
+    g.glowHalo.material.opacity = 0.08 + 0.22 * level;
+    g.glowHalo.position.z = 0.42 * len;
+    g.glowHalo.scale.setScalar((6.4 + 1.8 * level) * sf);
+    g.light.color.copy(PLUME_LIGHT_WARM).lerp(PLUME_LIGHT_COLD, ab);
+    g.light.intensity = (0.55 + 1.05 * level) * (1.0 + 0.30 * ab);
+  }
 
   function bodyQuat(psi, theta, phi) {
     const sp = Math.sin(psi), cp = Math.cos(psi);
@@ -248,6 +465,7 @@
       this.canopyMesh = null;
       this.flames = [];
       this.engineCount = -1;
+      this.modelLen = REF_LENGTH;
 
       // 高度投影线与地面圈（不随姿态旋转）。
       this.groundGeo = new THREE.BufferGeometry();
@@ -290,10 +508,12 @@
       scene.add(this.envOuter, this.envInner);
     }
 
-    setModel(name, engines) {
-      if (this.name === name && this.engineCount === engines.length) return;
+    setModel(name, engines, modelLen) {
+      const ml = modelLen || REF_LENGTH;
+      if (this.name === name && this.engineCount === engines.length && this.modelLen === ml) return;
       this.name = name;
       this.engineCount = engines.length;
+      this.modelLen = ml;
       this.modelGroup.clear();
       this.bodyMesh = null;
       this.canopyMesh = null;
@@ -304,20 +524,14 @@
         this.canopyMesh = new THREE.Mesh(geo.canopy, canopyMat);
         this.modelGroup.add(this.bodyMesh, this.canopyMesh);
       }
-      for (const eng of engines) {
-        const outer = new THREE.Mesh(coneOuterGeo, new THREE.MeshBasicMaterial({
-          color: 0xe6e8ec, transparent: true, opacity: 0.52,
-          blending: THREE.AdditiveBlending, depthWrite: false,
-        }));
-        const inner = new THREE.Mesh(coneInnerGeo, new THREE.MeshBasicMaterial({
-          color: 0xffece8, transparent: true, opacity: 0.72,
-          blending: THREE.AdditiveBlending, depthWrite: false,
-        }));
-        outer.position.set(eng[0], eng[1], eng[2]);
-        inner.position.set(eng[0], eng[1], eng[2]);
-        this.modelGroup.add(outer, inner);
-        this.flames.push({ outer, inner, base: eng });
-      }
+      engines.forEach((eng, idx) => {
+        const plume = makePlume(idx === 0 ? 0.35 : 1.75, ml);
+        plume.position.set(eng[0], eng[1], eng[2]);
+        // 双发轻微外张，单发保持正后方。
+        if (engines.length > 1) plume.rotation.y = eng[0] > 0 ? 0.05 : -0.05;
+        this.modelGroup.add(plume);
+        this.flames.push(plume);
+      });
     }
 
     update(ac, cameraDepth) {
@@ -330,14 +544,17 @@
       this.group.visible = !!ac.alive;
 
       const level = ac.alive ? clamp(ac.flame, 0, 1) : 0;
-      const len = ac.model_len * (0.06 + 0.20 * level);
+      const ab = ac.alive ? clamp(ac.ab, 0, 1) : 0;
+      const ml = this.modelLen || REF_LENGTH;
+      const len = ml * (0.10 + 0.18 * level + 0.20 * ab);
+      const phase = (performance.now() / 1000.0) % 8.0;
+      const sf = ml / REF_LENGTH;
       for (const f of this.flames) {
-        f.outer.visible = ac.alive && level > 0.01;
-        f.inner.visible = f.outer.visible;
-        f.outer.scale.setScalar(len);
-        f.inner.scale.setScalar(len * 0.55);
-        f.outer.position.set(f.base[0], f.base[1], f.base[2] + len * 0.5);
-        f.inner.position.set(f.base[0], f.base[1], f.base[2] + len * 0.275);
+        f.visible = ac.alive && level > 0.01;
+        if (!f.visible) continue;
+        f.userData.core.uTime.value = (phase / 8.0) * TAU;
+        f.userData.halo.uTime.value = (phase / 8.0) * TAU;
+        setPlumeState(f, level, ab, len, k, sf);
       }
 
       const floorY = snapshot ? snapshot.z_floor : 0;
@@ -360,17 +577,58 @@
 
   const aircraftViews = [new AircraftView(0), new AircraftView(1)];
 
-  // ---------- 航迹 ----------
+  // ---------- 航迹：渐变宽飘带 ----------
+  // 复刻 render._draw_trail_ribbon：飘带宽度沿机体 y 轴展开、屏幕厚度约
+  // 2×5px，横向中心亮、两边缘暗，并按航迹年龄整体变暗。飘带面片每个端点
+  // 两个顶点，因此渐变完全由 GPU 插值，不会出现 8 条窄带的色阶。
+  const trailVert = `
+    attribute float aSide;
+    attribute float aFade;
+    attribute float aShade;
+    varying float vSide;
+    varying float vFade;
+    varying float vShade;
+    void main() {
+      vSide = aSide;
+      vFade = aFade;
+      vShade = aShade;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `;
+  const trailFrag = `
+    precision highp float;
+    uniform vec3 uColor;
+    varying float vSide;
+    varying float vFade;
+    varying float vShade;
+    void main() {
+      float u = abs(vSide);
+      float edge = vSide < 0.0 ? 0.82 : 0.98;
+      float f = 1.14 + (edge - 1.14) * u;
+      f = max(f, 1.28 * exp(-pow(vSide * 2.4, 2.0)));
+      vec3 col = uColor * vFade * vShade * f;
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+    }
+  `;
+  const TRAIL_HALF_PX = 5.0;
+  const TRAIL_LIGHT = new THREE.Vector3(-0.35, -0.55, 0.76);
+
   const trailViews = [0, 1].map((team) => {
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(0), 3));
-    geo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(0), 3));
-    const mat = new THREE.LineBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.92,
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: trailVert,
+      fragmentShader: trailFrag,
+      uniforms: {
+        uColor: { value: new THREE.Color(rgbHex(mix([198, 202, 208], RGB.TEAM[team], 0.25))) },
+      },
+      transparent: false,
+      depthWrite: false,
+      side: THREE.DoubleSide,
     });
-    const line = new THREE.Line(geo, mat);
-    line.frustumCulled = false;
-    scene.add(line);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.frustumCulled = false;
+    mesh.visible = false;
+    scene.add(mesh);
 
     // 航迹方向箭头：每 ARROW_EVERY 个采样点一个人字形箭标（与 render 的
     // ARROW_EVERY = 25 一致），单独一个 LineSegments 承载。
@@ -383,7 +641,7 @@
     arrowLine.frustumCulled = false;
     scene.add(arrowLine);
     return {
-      geo, line, team, count: 0,
+      geo, mesh, team, segCount: 0,
       arrowGeo: ageo, arrowLine, arrowCount: 0,
     };
   });
@@ -395,42 +653,105 @@
       const pts = src.points || [];
       const view = trailViews[i];
       if (pts.length < 2) {
-        view.line.visible = false;
+        view.mesh.visible = false;
         view.arrowLine.visible = false;
         continue;
       }
-      view.line.visible = true;
+      view.mesh.visible = true;
       view.arrowLine.visible = true;
-      if (view.count !== pts.length) {
-        const pos = new Float32Array(pts.length * 3);
-        const col = new Float32Array(pts.length * 3);
+
+      const now = snap.t;
+      const axes = src.axes || [];
+      const P = pts.map((p) => w2t(p));
+      const eye = w2t(snap.camera.eye);
+      const center = new THREE.Vector3(snap.camera.cx, snap.camera.cz, -snap.camera.cy);
+      const forward = center.clone().sub(eye).normalize();
+      const focal = (window.innerHeight / 2.0)
+        / Math.tan((snap.fov || 50.0) * Math.PI / 360.0);
+      const depths = P.map((p) => Math.max(1.0, p.clone().sub(eye).dot(forward)));
+
+      const segs = pts.length - 1;
+      if (view.segCount !== segs) {
+        const nv = segs * 4;
+        const pos = new Float32Array(nv * 3);
+        const side = new Float32Array(nv);
+        const fade = new Float32Array(nv);
+        const shade = new Float32Array(nv);
+        const idx = new Uint16Array(segs * 6);
+        for (let s = 0; s < segs; s += 1) {
+          const b = s * 4;
+          idx.set([b, b + 1, b + 2, b + 2, b + 1, b + 3], s * 6);
+        }
         view.geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-        view.geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
-        view.count = pts.length;
+        view.geo.setAttribute("aSide", new THREE.BufferAttribute(side, 1));
+        view.geo.setAttribute("aFade", new THREE.BufferAttribute(fade, 1));
+        view.geo.setAttribute("aShade", new THREE.BufferAttribute(shade, 1));
+        view.geo.setIndex(new THREE.BufferAttribute(idx, 1));
+        view.segCount = segs;
       }
       const pos = view.geo.attributes.position.array;
-      const col = view.geo.attributes.color.array;
-      const base = mix([198, 202, 208], RGB.TEAM[i], 0.25);
-      const now = snap.t;
-      for (let j = 0; j < pts.length; j += 1) {
-        const p = pts[j];
-        pos[j * 3] = p[0];
-        pos[j * 3 + 1] = p[2];
-        pos[j * 3 + 2] = -p[1];
-        const age = now - (p[3] || now);
-        const fade = Math.max(0.0, 1.0 - age / TRAIL_FADE);
-        const f = 0.38 + 0.62 * fade;
-        col[j * 3] = (base[0] / 255.0) * f;
-        col[j * 3 + 1] = (base[1] / 255.0) * f;
-        col[j * 3 + 2] = (base[2] / 255.0) * f;
+      const sideA = view.geo.attributes.aSide.array;
+      const fadeA = view.geo.attributes.aFade.array;
+      const shadeA = view.geo.attributes.aShade.array;
+
+      for (let j = 1; j < pts.length; j += 1) {
+        const A = P[j - 1];
+        const B = P[j];
+        const b = (j - 1) * 4;
+        const T = B.clone().sub(A);
+        const axis = axes[j] ? w2t(axes[j]) : new THREE.Vector3(0, 1, 0);
+        let span = null;
+        if (T.lengthSq() > 1e-9) {
+          T.normalize();
+          span = axis.clone().addScaledVector(T, -axis.dot(T));
+        }
+        if (!span || span.lengthSq() <= 1e-9) {
+          // 退化段收成零面积，避免在原点拖出一个错误四边形。
+          for (let v = 0; v < 4; v += 1) {
+            pos[(b + v) * 3] = A.x;
+            pos[(b + v) * 3 + 1] = A.y;
+            pos[(b + v) * 3 + 2] = A.z;
+            sideA[b + v] = v % 2 === 0 ? -1.0 : 1.0;
+            fadeA[b + v] = 0.62;
+            shadeA[b + v] = 0.8;
+          }
+          continue;
+        }
+        span.normalize();
+
+        // 法向 = 切线 × 展向，按固定天光做单面着色（倒扣时更亮）。
+        const normal = T.clone().cross(span);
+        const lit = normal.dot(TRAIL_LIGHT);
+        const shade = 0.80 + 0.20 * Math.max(0.0, lit);
+
+        const age = now - (pts[j][3] || now);
+        const life = Math.max(0.0, 1.0 - age / TRAIL_FADE);
+        const fade = 0.62 + 0.38 * life;
+        const half = TRAIL_HALF_PX * 0.5
+          * (depths[j - 1] + depths[j]) / focal;
+
+        const verts = [
+          A.clone().addScaledVector(span, -half),
+          A.clone().addScaledVector(span, half),
+          B.clone().addScaledVector(span, -half),
+          B.clone().addScaledVector(span, half),
+        ];
+        for (let v = 0; v < 4; v += 1) {
+          pos[(b + v) * 3] = verts[v].x;
+          pos[(b + v) * 3 + 1] = verts[v].y;
+          pos[(b + v) * 3 + 2] = verts[v].z;
+          sideA[b + v] = v % 2 === 0 ? -1.0 : 1.0;
+          fadeA[b + v] = fade;
+          shadeA[b + v] = shade;
+        }
       }
-      view.geo.attributes.position.needsUpdate = true;
-      view.geo.attributes.color.needsUpdate = true;
+      for (const name of ["position", "aSide", "aFade", "aShade"]) {
+        view.geo.attributes[name].needsUpdate = true;
+      }
 
       // 方向箭头：与 render 一致，每 ARROW_EVERY 个采样点放一个人字形箭标，
       // 朝向沿该段航迹，尺寸按相机距离换算成约 12 px，远近观感稳定。
       const arrowBase = mix([236, 238, 242], RGB.TEAM[i], 0.18);
-      const focal = (window.innerHeight / 2.0) / Math.tan((50.0 * Math.PI / 180.0) / 2.0);
       const camDist = (snap.camera && snap.camera.dist) || 6000.0;
       const size = clamp(12.0 * camDist / focal, 18.0, 420.0);
       const arrowPos = [];
@@ -813,6 +1134,8 @@
     half.className = `att-half ${i === 0 ? "left" : "right"} ${i === 0 ? "team-red" : "team-blue"}`;
     const name = document.createElement("div");
     name.className = "att-name";
+    const glCv = document.createElement("canvas");
+    glCv.className = "att-canvas att-gl";
     const cv = document.createElement("canvas");
     cv.className = "att-canvas";
     const rowThr = document.createElement("div");
@@ -821,10 +1144,10 @@
     const rowFuel = document.createElement("div");
     rowFuel.className = "att-bar-row fuel";
     rowFuel.innerHTML = '<span class="att-label">FUEL</span><span class="att-bar fuel"><i></i></span><span class="att-value"></span>';
-    half.append(name, cv, rowThr, rowFuel);
+    half.append(name, glCv, cv, rowThr, rowFuel);
     attitudeEl.appendChild(half);
     return {
-      half, name, cv,
+      half, name, cv, glCanvas: glCv, gl: null,
       thrBar: rowThr.querySelector(".att-bar"),
       thrFill: rowThr.querySelector("i"),
       thrValue: rowThr.querySelector(".att-value"),
@@ -1466,9 +1789,36 @@
     return right.concat(right.slice().reverse().map((p) => [p[0], -p[1]]));
   }
 
+  const SIL_IMAGES = {};
+  for (const [key, file] of Object.entries({
+    "SU-57": "su57_top.png", "F-16V": "f16_top.png",
+  })) {
+    const img = new Image();
+    img.src = `/assets/silhouette/${file}`;
+    SIL_IMAGES[key] = img;
+  }
+
   function drawSilhouette(cv, name, team, w, h) {
     if (w <= 2 || h <= 2) return;
     const ctx = fitCanvas(cv, w, h);
+    const img = SIL_IMAGES[name];
+    if (img && img.complete && img.naturalWidth) {
+      const s = Math.min((w - 8) / img.naturalWidth, (h - 8) / img.naturalHeight);
+      const dw = img.naturalWidth * s;
+      const dh = img.naturalHeight * s;
+      const dx = (w - dw) / 2.0;
+      const dy = (h - dh) / 2.0;
+      ctx.globalAlpha = 0.92;
+      ctx.drawImage(img, dx, dy, dw, dh);
+      // 透明度只作用于轮廓像素：用队伍色轻轻染色，与 2D 版观感一致。
+      ctx.globalCompositeOperation = "source-atop";
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = C.team[team];
+      ctx.fillRect(dx, dy, dw, dh);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = 1.0;
+      return;
+    }
     const pts = silhouettePoints(name);
     let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
     for (const p of pts) {
@@ -1513,15 +1863,97 @@
     ATT_VIEW_N[0] * ATT_RIGHT_N[1] - ATT_VIEW_N[1] * ATT_RIGHT_N[0],
   ]);
 
-  function bodyAxes(psi, theta, phi) {
-    const sp = Math.sin(psi), cp = Math.cos(psi);
-    const st = Math.sin(theta), ct = Math.cos(theta);
-    const sf = Math.sin(phi), cf = Math.cos(phi);
-    return [
-      [ct * cp, ct * sp, st],
-      [cf * sp + sf * st * cp, -cf * cp + sf * st * sp, -sf * ct],
-      [-sf * sp + cf * st * cp, sf * cp + cf * st * sp, -cf * ct],
-    ];
+  // 姿态框里的飞机用 three.js 独立小场景渲染同一套 OBJ 模型：
+  // 相机固定沿 ATT_VIEW 方向，模型按机体姿态旋转，投影关系与原 2D 版一致。
+  function ensureAttitude3D(part) {
+    if (part.gl) return part.gl;
+    const renderer = new THREE.WebGLRenderer({
+      canvas: part.glCanvas, antialias: true, alpha: true,
+    });
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setClearColor(0x000000, 0);
+    const sc = new THREE.Scene();
+    // 姿态框要看清机体明暗，光照比主场景克制：环境光只托底，主光偏侧上。
+    sc.add(new THREE.AmbientLight(0xffffff, 0.25));
+    const key = new THREE.DirectionalLight(0xdfe8ff, 0.58);
+    key.position.copy(w2t(ATT_VIEW_N)).multiplyScalar(200.0);
+    sc.add(key);
+    const fill = new THREE.DirectionalLight(0xffd8c0, 0.18);
+    fill.position.copy(w2t(ATT_UP_N)).multiplyScalar(200.0);
+    sc.add(fill);
+    const cam = new THREE.PerspectiveCamera(30.0, 1.0, 0.1, 1000.0);
+    const group = new THREE.Group();
+    sc.add(group);
+    const gl = {
+      renderer, scene: sc, camera: cam, group,
+      name: "", modelLen: REF_LENGTH, engineCount: -1,
+      body: null, canopy: null, flames: [],
+    };
+    part.gl = gl;
+    return gl;
+  }
+
+  function buildAttitudeModel(gl, ac) {
+    gl.group.clear();
+    gl.flames = [];
+    gl.body = null;
+    gl.canopy = null;
+    const geo = MODEL_GEOS[ac.name];
+    const ml = ac.model_len || REF_LENGTH;
+    if (geo) {
+      gl.body = new THREE.Mesh(geo.body, ac.alive ? bodyMats[ac.team] : deadBodyMat);
+      gl.canopy = new THREE.Mesh(geo.canopy, canopyMat);
+      gl.canopy.visible = !!ac.alive;
+      gl.group.add(gl.body, gl.canopy);
+    }
+    const engines = ac.engines || [];
+    engines.forEach((eng, idx) => {
+      const plume = makePlume(idx === 0 ? 0.35 : 1.75, ml);
+      plume.position.set(eng[0], eng[1], eng[2]);
+      if (engines.length > 1) plume.rotation.y = eng[0] > 0 ? 0.05 : -0.05;
+      gl.group.add(plume);
+      gl.flames.push(plume);
+    });
+    gl.name = ac.name;
+    gl.modelLen = ml;
+    gl.engineCount = engines.length;
+  }
+
+  function renderAttitude3D(part, ac, w, h) {
+    if (!MODEL_GEOS[ac.name]) return;
+    const gl = ensureAttitude3D(part);
+    gl.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    gl.renderer.setSize(w, h, false);
+    gl.camera.aspect = w / Math.max(1.0, h);
+    const ml = ac.model_len || REF_LENGTH;
+    // 让机身长度投影到约 100 px，与原 2D 投影尺度一致。
+    const dist = (h / 2.0) / (Math.tan((30.0 * Math.PI / 180.0) / 2.0) * (100.0 / ml));
+    gl.camera.position.copy(w2t(ATT_VIEW_N)).multiplyScalar(dist);
+    gl.camera.up.copy(w2t(ATT_UP_N));
+    gl.camera.lookAt(0, 0, 0);
+    gl.camera.updateProjectionMatrix();
+
+    const engines = ac.engines || [];
+    if (gl.name !== ac.name || gl.modelLen !== ml || gl.engineCount !== engines.length) {
+      buildAttitudeModel(gl, ac);
+    }
+    if (gl.body) gl.body.material = ac.alive ? bodyMats[ac.team] : deadBodyMat;
+    if (gl.canopy) gl.canopy.visible = !!ac.alive;
+    gl.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
+
+    const level = ac.alive ? clamp(ac.flame, 0, 1) : 0;
+    const ab = ac.alive ? clamp(ac.ab, 0, 1) : 0;
+    const len = ml * (0.10 + 0.18 * level + 0.20 * ab);
+    const sf = ml / REF_LENGTH;
+    const phase = (performance.now() / 1000.0) % 8.0;
+    for (const plume of gl.flames) {
+      plume.visible = ac.alive && level > 0.01;
+      if (!plume.visible) continue;
+      plume.userData.core.uTime.value = (phase / 8.0) * TAU;
+      plume.userData.halo.uTime.value = (phase / 8.0) * TAU;
+      setPlumeState(plume, level, ab, len, 1.0, sf);
+    }
+    gl.renderer.render(gl.scene, gl.camera);
   }
 
   function drawAttitude(part, ac) {
@@ -1540,52 +1972,7 @@
     ctx.strokeStyle = "rgb(120,132,148)"; ctx.stroke();
     text(ctx, "Z", zx + 4, 8, "rgb(150,162,178)", FS_SMALL);
 
-    const psi = ac.psi, theta = ac.theta, phi = ac.phi;
-    const [xb, yb, zb] = bodyAxes(psi, theta, phi);
-    const name = ac.name;
-    const length = ac.model_len;
-    const scale = 100.0 / length;
-    const cx = w / 2.0;
-    const cy = h / 2.0 + 6;
-    const project = (p) => {
-      const wx = xb[0] * p[0] + yb[0] * p[1] + zb[0] * p[2];
-      const wy = xb[1] * p[0] + yb[1] * p[1] + zb[1] * p[2];
-      const wz = xb[2] * p[0] + yb[2] * p[1] + zb[2] * p[2];
-      return [
-        cx + (wx * ATT_RIGHT_N[0] + wy * ATT_RIGHT_N[1] + wz * ATT_RIGHT_N[2]) * scale,
-        cy - (wx * ATT_UP_N[0] + wy * ATT_UP_N[1] + wz * ATT_UP_N[2]) * scale,
-      ];
-    };
-
-    // 尾焰
-    if (ac.alive && ac.flame > 0.01) {
-      const tail = project([-length / 2.0, 0, 0]);
-      const tip = project([-length / 2.0 - length * (0.10 + 0.34 * ac.flame), 0, 0]);
-      const ddx = tip[0] - tail[0], ddy = tip[1] - tail[1];
-      const n = Math.hypot(ddx, ddy) || 1;
-      const ux = ddx / n, uy = ddy / n;
-      const wid = 3.0 + 7.0 * ac.flame;
-      ctx.beginPath();
-      ctx.moveTo(tail[0] - uy * wid, tail[1] + ux * wid);
-      ctx.lineTo(tip[0], tip[1]);
-      ctx.lineTo(tail[0] + uy * wid, tail[1] - ux * wid);
-      ctx.closePath();
-      ctx.fillStyle = rgbHex(mix([214, 216, 220], [250, 250, 252], 0.35 + 0.45 * ac.ab));
-      ctx.fill();
-    }
-
-    const pts = silhouettePoints(name);
-    ctx.beginPath();
-    pts.forEach((p, k) => {
-      const q = project([p[0] * length, p[1] * length, 0]);
-      if (k === 0) ctx.moveTo(q[0], q[1]); else ctx.lineTo(q[0], q[1]);
-    });
-    ctx.closePath();
-    ctx.fillStyle = ac.alive ? rgbHex(mix(RGB.CLAY_LIT, RGB.TEAM[ac.team], 0.10)) : "rgb(110,114,120)";
-    ctx.fill();
-    ctx.strokeStyle = "rgb(34,36,40)";
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    renderAttitude3D(part, ac, w, h);
   }
 
   function updateAttitude(snap) {
@@ -1622,6 +2009,8 @@
     for (const part of attitudeParts) {
       part.cv.style.width = `${halfW}px`;
       part.cv.style.height = "134px";
+      part.glCanvas.style.width = `${halfW}px`;
+      part.glCanvas.style.height = "134px";
     }
   }
 
@@ -1640,7 +2029,7 @@
     for (let i = 0; i < 2; i += 1) {
       const ac = snap.acs[i];
       const view = aircraftViews[i];
-      view.setModel(ac.model, ac.engines || []);
+      view.setModel(ac.model, ac.engines || [], ac.model_len);
       const depth = Math.max(1.0, cameraPos.distanceTo(w2t(ac.pos)));
       view.update(ac, depth);
     }

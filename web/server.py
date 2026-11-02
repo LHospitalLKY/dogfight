@@ -889,6 +889,10 @@ class Handler(BaseHTTPRequestHandler):
             name = os.path.basename(path)
             self._send_file(ROOT / "assets" / "font" / name, "font/ttf")
             return
+        if path.startswith("/assets/silhouette/"):
+            name = os.path.basename(path)
+            self._send_file(ROOT / "assets" / "silhouette" / name, "image/png")
+            return
         if path.startswith("/api/models/"):
             name = os.path.basename(path)
             self._send_file(MODEL_DIR / name, "text/plain; charset=utf-8")
