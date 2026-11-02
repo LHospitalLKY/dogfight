@@ -55,7 +55,6 @@ from theme import (  # noqa: E402
     FS_SMALL,
     FS_TINY,
     GLASS_ALPHA_MID,
-    GLASS_BAR_ALPHA,
     GLASS_BLUR_DIV,
     GLASS_EDGE_ALPHA,
     GLASS_HIGHLIGHT_ALPHA,
@@ -1640,11 +1639,13 @@ class Renderer:
         )
         depth = 0.5 * (a[2] + b[2])
         half = TRAIL_HALF_PX * depth / self.focal
-        ox, oy, oz = (u_cam[0] * half, u_cam[1] * half, u_cam[2] * half)
-        ap = (a[0] + ox, a[1] + oy, a[2] + oz)
-        am = (a[0] - ox, a[1] - oy, a[2] - oz)
-        bp = (b[0] + ox, b[1] + oy, b[2] + oz)
-        bm = (b[0] - ox, b[1] - oy, b[2] - oz)
+        # 注意不要用 ox/oy 命名：这两个名字是离屏面的像素偏移参数，
+        # 这里若同名会在下面的 sp() 里被当成偏移量，整条飘带整体错位。
+        hx, hy, hz = (u_cam[0] * half, u_cam[1] * half, u_cam[2] * half)
+        ap = (a[0] + hx, a[1] + hy, a[2] + hz)
+        am = (a[0] - hx, a[1] - hy, a[2] - hz)
+        bp = (b[0] + hx, b[1] + hy, b[2] + hz)
+        bm = (b[0] - hx, b[1] - hy, b[2] - hz)
         if min(ap[2], am[2], bp[2], bm[2]) <= NEAR:
             return
         # 横向按亮度渐变：中心最亮、向两侧连续变暗，不再是两块纯色。按
@@ -2661,9 +2662,8 @@ class Renderer:
     def _panel_bg(
         self, rect: pygame.Rect, fill=None, *, alpha: int | None = None,
         edge=None, radius: int = RADIUS_PANEL,
-        bar: tuple[str, tuple, int] | None = None,
     ) -> None:
-        """统一的静态面板底：外投影 + 竖向渐变底衬 + 描边 + 内高光 + 强调条。
+        """统一的静态面板底：外投影 + 竖向渐变底衬 + 描边 + 内高光。
 
         fill=None 时只画投影、描边与高光，中心保持透明，供磨砂玻璃面板
         在模糊底图上叠一层“玻璃边框”。其余情况仍是原来的不透明渐变底衬。
@@ -2674,7 +2674,7 @@ class Renderer:
         从场景上“浮”起来，顶亮底暗的底衬则避免大块纯色显得死板。
         """
         key = (rect.w, rect.h, None if fill is None else tuple(fill),
-               alpha, edge, radius, bar, STATIC_SCALE)
+               alpha, edge, radius, STATIC_SCALE)
         surf = self._chrome_cache.get(key)
         if surf is None:
             s = STATIC_SCALE
@@ -2735,14 +2735,6 @@ class Renderer:
                 big, hi, (m + radius * s, m + 2 * s),
                 (m + w - radius * s, m + 2 * s), s,
             )
-            if bar is not None:
-                side, color, thick = bar
-                if side == "left":
-                    pygame.draw.rect(big, color, pygame.Rect(m, m, thick * s, h))
-                else:
-                    pygame.draw.rect(
-                        big, color, pygame.Rect(m, m, w, thick * s)
-                    )
             surf = pygame.transform.smoothscale(big, (rect.w + 2 * PANEL_SHADOW_PAD,
                                                       rect.h + 2 * PANEL_SHADOW_PAD))
             self._chrome_cache[key] = surf
@@ -2750,7 +2742,7 @@ class Renderer:
                                 rect.y - PANEL_SHADOW_PAD))
 
     def _glass_panel(
-        self, rect: pygame.Rect, *, edge, bar=None,
+        self, rect: pygame.Rect, *, edge,
         radius: int = RADIUS_PANEL, alpha: int = GLASS_ALPHA_MID,
     ) -> None:
         """透明磨砂玻璃面板：模糊面板后方的场景，再压暗、圆角、描边。
@@ -2763,7 +2755,7 @@ class Renderer:
         if self.gpu:
             self._panel_bg(
                 rect, GLASS_TINT, alpha=alpha, edge=edge,
-                radius=radius, bar=bar,
+                radius=radius,
             )
             return
         clip = rect.clip(self.screen.get_rect())
@@ -2800,8 +2792,8 @@ class Renderer:
             special_flags=pygame.BLEND_RGBA_MULT,
         )
         self.screen.blit(blur, clip.topleft)
-        # 投影、描边、上沿高光与队伍色强调条仍走静态 chrome。
-        self._panel_bg(rect, None, edge=edge, radius=radius, bar=bar)
+        # 投影、描边与上沿高光仍走静态 chrome。
+        self._panel_bg(rect, None, edge=edge, radius=radius)
 
     def _glass_overlay(self, w: int, h: int, alpha: int) -> pygame.Surface:
         """把 tint、反光与颗粒预合成一张，逐帧只做一次 blit。"""
@@ -2832,7 +2824,11 @@ class Renderer:
         return surf
 
     def _glass_sheen(self, w: int, h: int) -> pygame.Surface:
-        """玻璃反光：顶部一抹由亮到暗的高光带 + 一条斜向反光。"""
+        """玻璃反光：顶部一抹由亮到暗的高光带。
+
+        不再画斜向反光多边形：它是硬边的半透明白块，压在深色玻璃上会
+        读成一条斜条纹（而且和后面的斜向网格混在一起更像脏痕）。
+        """
         key = ("sheen", w, h)
         surf = self._glass_cache.get(key)
         if surf is None:
@@ -2844,11 +2840,6 @@ class Renderer:
                 pygame.draw.line(
                     surf, (255, 255, 255, a), (0, row), (w, row)
                 )
-            pygame.draw.polygon(
-                surf, (255, 255, 255, 13),
-                [(int(w * 0.62), 0), (int(w * 0.86), 0),
-                 (int(w * 0.30), h), (int(w * 0.06), h)],
-            )
             self._glass_cache[key] = surf
         return surf
 
@@ -2911,12 +2902,9 @@ class Renderer:
         # ---- 雷达屏 ----
         # 页头一行交代“谁在看 / 雷达开没开 / 火控到了哪一步”，锁定过程用页头
         # 下方一条细进度条表示，不额外占一行高度。三块面板统一用磨砂玻璃底，
-        # 只在边线与顶部强调条上带队伍色，看起来是一套仪表而不是三张卡片。
+        # 只在边线与标题文字上带队伍色。
         glass_edge = (*_mix(team, (255, 255, 255), 0.40), GLASS_EDGE_ALPHA)
-        self._glass_panel(
-            radar, edge=glass_edge,
-            bar=("top", (*team, GLASS_BAR_ALPHA), 3),
-        )
+        self._glass_panel(radar, edge=glass_edge)
         title = self.font_small.render(
             f"{ac.spec.name} {'RDR ON' if ac.radar_on else 'RDR SIL'}",
             True, team, tracking=1,
@@ -3719,7 +3707,6 @@ class Renderer:
         team = TEAM_COLORS[i]
         self._glass_panel(
             rect, edge=(*_mix(team, (255, 255, 255), 0.40), GLASS_EDGE_ALPHA),
-            bar=("top", (*team, GLASS_BAR_ALPHA), 2),
         )
         self.screen.blit(
             self.font_small.render("WPN", True, (104, 202, 150), tracking=1),

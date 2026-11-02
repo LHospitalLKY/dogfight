@@ -122,7 +122,6 @@ GLASS_BLUR_DIV = 14
 # 描边与顶部高光都压到半透明，玻璃边才不会像金属框那样抢视线。
 GLASS_EDGE_ALPHA = 150
 GLASS_HIGHLIGHT_ALPHA = 54
-GLASS_BAR_ALPHA = 220
 
 
 def ease_out_cubic(t: float) -> float:
