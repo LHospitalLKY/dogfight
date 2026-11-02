@@ -39,6 +39,7 @@
     team: RGB.TEAM.map(rgbHex),
     airGrid: rgbHex(RGB.AIR_GRID),
     airEdge: rgbHex(RGB.AIR_EDGE),
+    SCENE_BG: rgbHex(RGB.SCENE_BG),
     hudDimRgb: "rgb(74,140,106)",
     greenRgb: "rgb(100,176,136)",
     ladderMajor: "rgb(104,190,146)",
