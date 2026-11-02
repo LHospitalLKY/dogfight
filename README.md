@@ -81,9 +81,11 @@
 - 机体与导弹直接读取 `assets/flighter`、`assets/missle` 下的原始 OBJ，按真实机长/弹长归一后导出到 `web/static/models/`；原始资产缺失时自动退回 `render.py` 的体素模型，服务仍能启动。
 - 机体迷彩按物体空间三平面投影实时生成；加力尾焰、导弹弹体、箔条/热诱弹云团与燃烧拖尾都是实时特效。
 - 航迹为随滚转明暗的渐变飘带，从机尾起步并带方向箭头；导弹发射星标、高 G 机动菱形与机炮开火点保留在 3D 场景里。
-- 机体旁直接标出当前 `战术族 · 机动原语`（如 `DEFENSIVE · DIVE_SPLIT`），在飞导弹标出型号与是否仍在制导。
+- 机体旁直接标出当前 `战术族 · 机动原语`（如 `SURVIVE · DIVE_OFFSET`），在飞导弹标出型号与是否仍在制导。
 - HUD 为 DOM 覆盖层：双方雷达屏、抬头显示、武器挂载页、三维姿态框与结算横幅，按窗口宽度自动重排；`SPACE` 暂停、`R` 重置、`F` 切换机尾跟拍，鼠标拖动环绕、滚轮缩放。
 - 固定分辨率采集：打开 `/?capture=1920x1080&name=j1&delay=3&frames=90&fps=30`，前端按 1920×1080 渲染并把 PNG 帧 POST 到 `/api/capture`；帧数大于 1 时服务端自动用 ffmpeg 编码成 `web/captures/j1.mp4`。采集只合成 3D 场景，DOM 上的 HUD 不在画面内（需要带 HUD 的成片请用 pygame 的 `--record`）。
+
+一局完整演示（4 分钟，1920×1200）：[demo_v1.1.mp4](https://github.com/LHospitalLKY/dogfight/releases/download/v1.1.0/demo_v1.1.mp4)
 
 ### 实验工具
 
