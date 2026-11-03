@@ -1,0 +1,60 @@
+# F-16V Block 70：单发轻型、偏角度战；带光电吊舱。
+id: F-16V
+name: F-16V
+
+airframe:
+  # 10,787.4 kg（半油 + 6 枚弹）中的空机/燃油部分 + 250 kg 光电吊舱；
+  # 挂载质量由 loader 按 loadout 自动加上。
+  base_mass_kg: 11037.4
+  wing_area_m2: 27.87
+  cl_max: 1.5
+  n_struct_g: 9
+  thrust_max_kn: 129        # F110-GE-129
+  thrust_mil_kn: 76.3
+  cd0: 0.041
+  aspect_ratio: 3.56
+  oswald: 0.85
+  cruise_mach: 0.95
+  fuel_capacity_kg: 1580
+  lapse_exp: 0.90
+  ram_r0: 0.12
+  ram_r1: 0.20
+  derate_z_m: 13000
+  derate_H_m: 9000
+  eta_install: 0.95
+  hp_max: 100
+  gun_range_m: 1000
+  gun_dps: 40
+  ammo_max: 511
+  rounds_per_sec: 110
+  length_m: 15.06
+  # M61A1 20 mm
+  muzzle_speed: 1030
+  bullet_mass_kg: 0.102
+  bullet_diameter_m: 0.020
+  gun_spread: 0.003
+
+sensors:
+  rcs: 1.2
+  rcs_front: 1.2
+  rcs_side: 3.0
+  rcs_back: 2.0
+  radar_range_km: 70
+  pod_irst_range_km: 45    # Legion 级光电吊舱
+
+loadout:
+  ir:
+    weapon: AIM-9X
+    count: 4
+  radar:
+    weapon: AIM-120C
+    count: 2
+  countermeasures:
+    chaff: 30
+    flare: 60
+
+agent:
+  aggression: 0.75
+  energy_pref: 0.40
+  lure: false
+  style: angle

@@ -1,0 +1,1432 @@
+{
+ "aircraft": {
+  "SU-57": {
+   "name": "SU-57",
+   "mass": 25300.0,
+   "wing_area": 78.8,
+   "cl_max": 1.6,
+   "n_struct": 9.0,
+   "thrust_max": 284000.0,
+   "cd0": 0.04,
+   "aspect_ratio": 2.52,
+   "oswald": 0.8,
+   "hp_max": 110.0,
+   "gun_range": 1000.0,
+   "gun_cone": 0.13962634015954636,
+   "gun_dps": 30.0,
+   "ammo_max": 150.0,
+   "rounds_per_sec": 25.0,
+   "turn_tau": 0.45,
+   "rcs": 0.5,
+   "rcs_front": 0.3,
+   "rcs_side": 1.2,
+   "rcs_back": 2.5,
+   "radar_range": 160000.0,
+   "side_array": true,
+   "lband": true,
+   "irst_range": 60000.0,
+   "pod_irst_range": 0.0,
+   "thrust_mil": 186000.0,
+   "cruise_mach": 1.3,
+   "fuel_capacity": 5500.0,
+   "lapse_exp": 0.65,
+   "ram_r0": 0.15,
+   "ram_r1": 0.2,
+   "derate_z": 18000.0,
+   "derate_H": 6000.0,
+   "eta_install": 0.95,
+   "muzzle_speed": 900.0,
+   "bullet_mass": 0.39,
+   "bullet_diameter": 0.03,
+   "gun_spread": 0.003,
+   "length": 20.1,
+   "cl_alpha": 3.85,
+   "cl0": 0.12,
+   "alpha_stall": 0.3839724354387525,
+   "cm_alpha": -1.0,
+   "cm_de": -1.2,
+   "cm_q": -8.0,
+   "cl_p": -1.5,
+   "cl_da": 0.12,
+   "cl_beta": -0.1,
+   "cl_dr": 0.02,
+   "cn_beta": 0.1,
+   "cn_r": -0.15,
+   "cn_dr": 0.08,
+   "cn_da": 0.02,
+   "cy_beta": -0.5,
+   "tvc": 0.2617993877991494,
+   "tvc_alpha_max": 0.9599310885968813,
+   "tvc_cl_bonus": 0.3,
+   "chaff_count": 24,
+   "flare_count": 18,
+   "ir_missile": {
+    "name": "R-73",
+    "mass": 105.0,
+    "length": 2.9,
+    "diameter": 0.17,
+    "max_g": 50.0,
+    "seeker_fov": 0.7853981633974483,
+    "gimbal_fov": 1.0471975511965976,
+    "seeker_range": 10000.0,
+    "lock_time": 0.8,
+    "min_range": 300.0,
+    "max_range": 30000.0,
+    "thrust": 4800.0,
+    "burn_time": 5.0,
+    "burnout_mass": 65.0,
+    "cd0": 0.9,
+    "cn_max": 10.0,
+    "warhead_damage": 100.0,
+    "lethal_radius": 11.0,
+    "pk_decay": 0.35,
+    "cm_resist": 0.6,
+    "induced_k": 0.04,
+    "life": 15.0,
+    "cooldown": 1.5,
+    "pn_gain": 4.0,
+    "guidance": "IR",
+    "loft": false,
+    "active_range": 0.0,
+    "autopilot_tau": 0.07,
+    "guidance_delay": 0.08,
+    "g_slew": 400.0,
+    "tvc_frac": 0.26,
+    "tvc_time": 2.0,
+    "ignition_delay": 0.06,
+    "ignition_align": 0.3490658503988659,
+    "rcs_slew": 4.537856055185257,
+    "ignition_timeout": 0.4,
+    "cd0_wave": 1.0,
+    "boost_thrust": 30000.0,
+    "boost_time": 1.4,
+    "dogfight_reach": 6000.0
+   },
+   "ir_count": 4,
+   "radar_missile": {
+    "name": "R-77-1",
+    "mass": 190.0,
+    "length": 3.6,
+    "diameter": 0.2,
+    "max_g": 40.0,
+    "seeker_fov": 1.0471975511965976,
+    "gimbal_fov": 1.0471975511965976,
+    "seeker_range": 35000.0,
+    "lock_time": 1.5,
+    "min_range": 1500.0,
+    "max_range": 80000.0,
+    "thrust": 16400.0,
+    "burn_time": 8.0,
+    "burnout_mass": 100.0,
+    "cd0": 0.45,
+    "cn_max": 10.0,
+    "warhead_damage": 110.0,
+    "lethal_radius": 11.0,
+    "pk_decay": 2.2,
+    "cm_resist": 1.0,
+    "induced_k": 0.15,
+    "life": 50.0,
+    "cooldown": 3.0,
+    "pn_gain": 4.0,
+    "guidance": "ARH",
+    "loft": true,
+    "active_range": 20000.0,
+    "autopilot_tau": 0.18,
+    "guidance_delay": 0.08,
+    "g_slew": 400.0,
+    "tvc_frac": 0.0,
+    "tvc_time": 0.0,
+    "ignition_delay": 0.0,
+    "ignition_align": 0.3490658503988659,
+    "rcs_slew": 0.0,
+    "ignition_timeout": 0.0,
+    "cd0_wave": 0.7,
+    "boost_thrust": 42000.0,
+    "boost_time": 3.0,
+    "dogfight_reach": 0.0
+   },
+   "radar_count": 2
+  },
+  "F-16V": {
+   "name": "F-16V",
+   "mass": 11679.0,
+   "wing_area": 27.87,
+   "cl_max": 1.5,
+   "n_struct": 9.0,
+   "thrust_max": 129000.0,
+   "cd0": 0.041,
+   "aspect_ratio": 3.56,
+   "oswald": 0.85,
+   "hp_max": 100.0,
+   "gun_range": 1000.0,
+   "gun_cone": 0.13962634015954636,
+   "gun_dps": 40.0,
+   "ammo_max": 511.0,
+   "rounds_per_sec": 110.0,
+   "turn_tau": 0.45,
+   "rcs": 1.2,
+   "rcs_front": 1.2,
+   "rcs_side": 3.0,
+   "rcs_back": 2.0,
+   "radar_range": 70000.0,
+   "side_array": false,
+   "lband": false,
+   "irst_range": 0.0,
+   "pod_irst_range": 45000.0,
+   "thrust_mil": 76300.0,
+   "cruise_mach": 0.95,
+   "fuel_capacity": 1580.0,
+   "lapse_exp": 0.9,
+   "ram_r0": 0.12,
+   "ram_r1": 0.2,
+   "derate_z": 13000.0,
+   "derate_H": 9000.0,
+   "eta_install": 0.95,
+   "muzzle_speed": 1030.0,
+   "bullet_mass": 0.102,
+   "bullet_diameter": 0.02,
+   "gun_spread": 0.003,
+   "length": 15.06,
+   "cl_alpha": 3.6,
+   "cl0": 0.12,
+   "alpha_stall": 0.3839724354387525,
+   "cm_alpha": -1.0,
+   "cm_de": -1.2,
+   "cm_q": -8.0,
+   "cl_p": -1.5,
+   "cl_da": 0.12,
+   "cl_beta": -0.1,
+   "cl_dr": 0.02,
+   "cn_beta": 0.1,
+   "cn_r": -0.15,
+   "cn_dr": 0.08,
+   "cn_da": 0.02,
+   "cy_beta": -0.5,
+   "tvc": 0.0,
+   "tvc_alpha_max": 0.0,
+   "tvc_cl_bonus": 0.0,
+   "chaff_count": 30,
+   "flare_count": 60,
+   "ir_missile": {
+    "name": "AIM-9X",
+    "mass": 84.4,
+    "length": 3.02,
+    "diameter": 0.127,
+    "max_g": 50.0,
+    "seeker_fov": 1.5707963267948966,
+    "gimbal_fov": 1.5707963267948966,
+    "seeker_range": 12000.0,
+    "lock_time": 0.5,
+    "min_range": 300.0,
+    "max_range": 16000.0,
+    "thrust": 5000.0,
+    "burn_time": 4.0,
+    "burnout_mass": 50.0,
+    "cd0": 0.9,
+    "cn_max": 12.0,
+    "warhead_damage": 110.0,
+    "lethal_radius": 10.0,
+    "pk_decay": 0.35,
+    "cm_resist": 0.45,
+    "induced_k": 0.04,
+    "life": 15.0,
+    "cooldown": 1.5,
+    "pn_gain": 4.0,
+    "guidance": "IR",
+    "loft": false,
+    "active_range": 0.0,
+    "autopilot_tau": 0.07,
+    "guidance_delay": 0.06,
+    "g_slew": 400.0,
+    "tvc_frac": 0.26,
+    "tvc_time": 1.6,
+    "ignition_delay": 0.05,
+    "ignition_align": 0.2617993877991494,
+    "rcs_slew": 5.585053606381854,
+    "ignition_timeout": 0.45,
+    "cd0_wave": 1.0,
+    "boost_thrust": 24000.0,
+    "boost_time": 1.2,
+    "dogfight_reach": 6400.0
+   },
+   "ir_count": 4,
+   "radar_missile": {
+    "name": "AIM-120C",
+    "mass": 152.0,
+    "length": 3.66,
+    "diameter": 0.178,
+    "max_g": 40.0,
+    "seeker_fov": 1.0471975511965976,
+    "gimbal_fov": 1.0471975511965976,
+    "seeker_range": 35000.0,
+    "lock_time": 1.2,
+    "min_range": 1500.0,
+    "max_range": 75000.0,
+    "thrust": 11250.0,
+    "burn_time": 7.0,
+    "burnout_mass": 80.0,
+    "cd0": 0.45,
+    "cn_max": 10.0,
+    "warhead_damage": 105.0,
+    "lethal_radius": 10.0,
+    "pk_decay": 2.2,
+    "cm_resist": 1.0,
+    "induced_k": 0.15,
+    "life": 45.0,
+    "cooldown": 3.0,
+    "pn_gain": 4.2,
+    "guidance": "ARH",
+    "loft": true,
+    "active_range": 18000.0,
+    "autopilot_tau": 0.18,
+    "guidance_delay": 0.08,
+    "g_slew": 400.0,
+    "tvc_frac": 0.0,
+    "tvc_time": 0.0,
+    "ignition_delay": 0.0,
+    "ignition_align": 0.3490658503988659,
+    "rcs_slew": 0.0,
+    "ignition_timeout": 0.0,
+    "cd0_wave": 0.7,
+    "boost_thrust": 34000.0,
+    "boost_time": 3.0,
+    "dogfight_reach": 0.0
+   },
+   "radar_count": 2
+  }
+ },
+ "run": {
+  "seconds": 300.0,
+  "seed": 3,
+  "result": "blue",
+  "reason": "kill",
+  "end_time": 254.6,
+  "stats": {
+   "min_v": 52.221114,
+   "max_v": 394.912394,
+   "max_n": 8.029729,
+   "min_z": 8261.376233,
+   "max_z": 11210.62812,
+   "max_climb": 85.634389,
+   "rounds_fired": 0.0,
+   "bullets_fired": 0,
+   "bullet_hits": 0,
+   "damage_dealt": [
+    46.68705699564738,
+    110.0
+   ],
+   "missiles_fired": 9.0,
+   "missile_hits": 3,
+   "missiles_launched": [
+    4,
+    5
+   ],
+   "missiles_hit": [
+    1,
+    2
+   ]
+  },
+  "acs": [
+   {
+    "name": "SU-57",
+    "x": 3394.914902,
+    "y": 4410.721913,
+    "z": 11210.62812,
+    "v": 52.221114,
+    "gamma": 1.159771,
+    "psi": 2.143501,
+    "hp": 0.0,
+    "ammo": 150.0,
+    "missiles": 2,
+    "radar_missiles": 0,
+    "fuel": 4688.020636,
+    "mass": 23898.020636,
+    "alive": false
+   },
+   {
+    "name": "F-16V",
+    "x": 3253.92906,
+    "y": 4915.202785,
+    "z": 10112.320117,
+    "v": 181.76158,
+    "gamma": 0.528722,
+    "psi": -1.384906,
+    "hp": 53.312943,
+    "ammo": 511.0,
+    "missiles": 1,
+    "radar_missiles": 0,
+    "fuel": 1279.571631,
+    "mass": 10821.371631,
+    "alive": true
+   }
+  ],
+  "samples": [
+   {
+    "t": 0.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -59996.709064,
+      "y": 4.7e-05,
+      "z": 9000.000964,
+      "v": 394.912394,
+      "gamma": 0.000293,
+      "psi": 8e-06,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5499.980766,
+      "mass": 25299.980766,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 59997.59498,
+      "y": 100.000055,
+      "z": 8999.998388,
+      "v": 288.602406,
+      "gamma": -0.00067,
+      "psi": -3.141581,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1579.994371,
+      "mass": 11678.994371,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "PURE",
+     "PURE"
+    ]
+   },
+   {
+    "t": 10.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -56174.704542,
+      "y": -202.687603,
+      "z": 9045.596876,
+      "v": 372.140832,
+      "gamma": 0.021421,
+      "psi": -0.117433,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5477.121438,
+      "mass": 25277.121438,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 57138.85107,
+      "y": 309.990112,
+      "z": 9028.831369,
+      "v": 285.510326,
+      "gamma": 0.024203,
+      "psi": 2.967567,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1573.255907,
+      "mass": 11672.255907,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 20.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -52589.806168,
+      "y": -762.924027,
+      "z": 9090.347566,
+      "v": 354.128072,
+      "gamma": 0.007206,
+      "psi": -0.15548,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5454.629401,
+      "mass": 25254.629401,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 54338.610808,
+      "y": 854.553312,
+      "z": 9039.567245,
+      "v": 284.770803,
+      "gamma": 0.00022,
+      "psi": 2.951143,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1566.537025,
+      "mass": 11665.537025,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 30.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -49158.98392,
+      "y": -1281.49322,
+      "z": 9115.740433,
+      "v": 340.465536,
+      "gamma": 0.007435,
+      "psi": -0.144746,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5432.438104,
+      "mass": 25232.438104,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 51541.881766,
+      "y": 1378.837858,
+      "z": 9040.195664,
+      "v": 284.344361,
+      "gamma": 0.000222,
+      "psi": 2.962394,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1559.827005,
+      "mass": 11658.827005,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 40.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -45840.829727,
+      "y": -1743.982206,
+      "z": 9141.058601,
+      "v": 330.10961,
+      "gamma": 0.007683,
+      "psi": -0.13299,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5410.467386,
+      "mass": 25210.467386,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 48742.923084,
+      "y": 1870.392925,
+      "z": 9040.827933,
+      "v": 284.034761,
+      "gamma": 0.000223,
+      "psi": 2.974135,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1553.119009,
+      "mass": 11652.119009,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 50.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -42606.403339,
+      "y": -2155.320908,
+      "z": 9166.538106,
+      "v": 322.402988,
+      "gamma": 0.00795,
+      "psi": -0.120641,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5388.671464,
+      "mass": 25188.671464,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 45940.873248,
+      "y": 2327.883834,
+      "z": 9041.462833,
+      "v": 283.811604,
+      "gamma": 0.000224,
+      "psi": 2.986477,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1546.412593,
+      "mass": 11645.412593,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 60.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -39433.063117,
+      "y": -2518.125417,
+      "z": 9192.385013,
+      "v": 316.720259,
+      "gamma": 0.008239,
+      "psi": -0.107576,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5367.014935,
+      "mass": 25167.014935,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 43135.134744,
+      "y": 2749.57824,
+      "z": 9042.099424,
+      "v": 283.651766,
+      "gamma": 0.000225,
+      "psi": 2.99954,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1539.707434,
+      "mass": 11638.707434,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 70.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -36306.385668,
+      "y": -2833.053984,
+      "z": 9218.764767,
+      "v": 312.548632,
+      "gamma": 0.008555,
+      "psi": -0.093668,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5345.489422,
+      "mass": 25145.489422,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 40327.669322,
+      "y": 3133.0244,
+      "z": 9042.736458,
+      "v": 283.538047,
+      "gamma": 0.000225,
+      "psi": 3.013451,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1533.008879,
+      "mass": 11632.008879,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 80.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -33208.661992,
+      "y": -3100.098667,
+      "z": 9245.900933,
+      "v": 309.483521,
+      "gamma": 0.008906,
+      "psi": -0.078734,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5324.04002,
+      "mass": 25124.04002,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 37513.596652,
+      "y": 3476.25949,
+      "z": 9043.374445,
+      "v": 283.457502,
+      "gamma": 0.000225,
+      "psi": 3.028392,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1526.305584,
+      "mass": 11625.305584,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 90.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -30133.48843,
+      "y": -3317.204584,
+      "z": 9273.954854,
+      "v": 307.231225,
+      "gamma": 0.009301,
+      "psi": -0.062592,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5302.671283,
+      "mass": 25102.671283,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 34695.22766,
+      "y": 3775.820059,
+      "z": 9044.01241,
+      "v": 283.400874,
+      "gamma": 0.000225,
+      "psi": 3.044545,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1519.60301,
+      "mass": 11618.60301,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 100.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -27074.484326,
+      "y": -3481.450583,
+      "z": 9303.12562,
+      "v": 305.571661,
+      "gamma": 0.009753,
+      "psi": -0.045001,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5281.373992,
+      "mass": 25081.373992,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 31872.704055,
+      "y": 4027.9512,
+      "z": 9044.649973,
+      "v": 283.361304,
+      "gamma": 0.000225,
+      "psi": 3.062153,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1512.901069,
+      "mass": 11611.901069,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 110.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -24027.310848,
+      "y": -3588.748144,
+      "z": 9333.643454,
+      "v": 304.342424,
+      "gamma": 0.010278,
+      "psi": -0.025651,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5260.142142,
+      "mass": 25060.142142,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 29046.360281,
+      "y": 4228.116317,
+      "z": 9045.286782,
+      "v": 283.33375,
+      "gamma": 0.000225,
+      "psi": 3.081524,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1506.199696,
+      "mass": 11605.199696,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 120.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -20989.265728,
+      "y": -3633.702936,
+      "z": 9365.790094,
+      "v": 303.422925,
+      "gamma": 0.0109,
+      "psi": -0.004131,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5238.972246,
+      "mass": 25038.972246,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 26216.772885,
+      "y": 4370.768999,
+      "z": 9045.922469,
+      "v": 283.314449,
+      "gamma": 0.000224,
+      "psi": 3.10307,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1499.498848,
+      "mass": 11598.498848,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 130.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -17959.058206,
+      "y": -3609.325404,
+      "z": 9399.929359,
+      "v": 302.722157,
+      "gamma": 0.011656,
+      "psi": 0.020122,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5217.862883,
+      "mass": 25017.862883,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 23384.85122,
+      "y": 4449.009949,
+      "z": 9046.556599,
+      "v": 283.300483,
+      "gamma": 0.000223,
+      "psi": 3.127359,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1492.798493,
+      "mass": 11591.798493,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 140.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -14936.769069,
+      "y": -3506.520809,
+      "z": 9436.55777,
+      "v": 302.16898,
+      "gamma": 0.012605,
+      "psi": 0.047921,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5196.814466,
+      "mass": 24996.814466,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 20551.998242,
+      "y": 4454.053618,
+      "z": 9047.1886,
+      "v": 283.28938,
+      "gamma": 0.000223,
+      "psi": -3.127979,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1486.098612,
+      "mass": 11585.098612,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 150.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -11924.049906,
+      "y": -3313.212462,
+      "z": 9476.397112,
+      "v": 301.703463,
+      "gamma": 0.013846,
+      "psi": 0.080496,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5175.82926,
+      "mass": 24975.82926,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 17720.402482,
+      "y": 4374.357539,
+      "z": 9047.817664,
+      "v": 283.278639,
+      "gamma": 0.000221,
+      "psi": -3.095339,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1479.399196,
+      "mass": 11578.399196,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 160.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -8924.725248,
+      "y": -3012.780188,
+      "z": 9520.584776,
+      "v": 301.266721,
+      "gamma": 0.015573,
+      "psi": 0.11985,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 5154.911717,
+      "mass": 24954.911717,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 14893.601839,
+      "y": 4194.10211,
+      "z": 9048.442601,
+      "v": 283.264904,
+      "gamma": 0.00022,
+      "psi": -3.055893,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1472.700249,
+      "mass": 11571.700249,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "POSITION",
+     "POSITION"
+    ]
+   },
+   {
+    "t": 170.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -5993.582466,
+      "y": -2320.517959,
+      "z": 9471.021719,
+      "v": 308.80056,
+      "gamma": -0.049653,
+      "psi": 0.122298,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 1,
+      "fuel": 5123.38949,
+      "mass": 24733.38949,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 12063.264923,
+      "y": 3922.41947,
+      "z": 9026.427979,
+      "v": 291.134745,
+      "gamma": -0.063885,
+      "psi": -3.090501,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1461.569879,
+      "mass": 11560.569879,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "F_POLE",
+     "NOTCH_DESC"
+    ]
+   },
+   {
+    "t": 180.0,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": -2874.753748,
+      "y": -2520.965248,
+      "z": 9314.681748,
+      "v": 319.43414,
+      "gamma": -0.057802,
+      "psi": 0.306048,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 0,
+      "fuel": 5066.182512,
+      "mass": 24486.182512,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 9542.335209,
+      "y": 5153.78581,
+      "z": 8725.59074,
+      "v": 304.072792,
+      "gamma": -0.106768,
+      "psi": 2.24619,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1439.631118,
+      "mass": 11538.631118,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "F_POLE",
+     "NOTCH_DESC"
+    ]
+   },
+   {
+    "t": 190.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 370.777121,
+      "y": -2006.706716,
+      "z": 9152.767523,
+      "v": 336.72311,
+      "gamma": -0.072178,
+      "psi": 0.444,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 0,
+      "fuel": 5007.755888,
+      "mass": 24427.755888,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 7529.719377,
+      "y": 7581.209095,
+      "z": 8393.970535,
+      "v": 329.366386,
+      "gamma": -0.104783,
+      "psi": 2.400546,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1416.667056,
+      "mass": 11515.667056,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "PURE",
+     "NOTCH_DESC"
+    ]
+   },
+   {
+    "t": 200.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 2440.639046,
+      "y": 500.862356,
+      "z": 8821.359089,
+      "v": 345.684415,
+      "gamma": -0.079681,
+      "psi": 1.279554,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 4,
+      "radar_missiles": 0,
+      "fuel": 4947.956636,
+      "mass": 24367.956636,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 4609.254246,
+      "y": 8731.195686,
+      "z": 8293.82706,
+      "v": 322.420513,
+      "gamma": 0.024064,
+      "psi": -2.715726,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 4,
+      "radar_missiles": 2,
+      "fuel": 1392.931305,
+      "mass": 11491.931305,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "PURE",
+     "PURE"
+    ]
+   },
+   {
+    "t": 210.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 3155.161748,
+      "y": 3952.093988,
+      "z": 8533.318046,
+      "v": 359.114786,
+      "gamma": -0.102261,
+      "psi": 1.05537,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 3,
+      "radar_missiles": 0,
+      "fuel": 4886.32687,
+      "mass": 24201.32687,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 3263.38614,
+      "y": 6421.293679,
+      "z": 8344.068901,
+      "v": 277.6723,
+      "gamma": -0.009426,
+      "psi": -0.760361,
+      "hp": 100.0,
+      "ammo": 511.0,
+      "missiles": 3,
+      "radar_missiles": 1,
+      "fuel": 1369.62813,
+      "mass": 11232.22813,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "NOTCH_DESC",
+     "IMMELMANN"
+    ]
+   },
+   {
+    "t": 220.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 3353.76384,
+      "y": 6930.495018,
+      "z": 9038.5887,
+      "v": 291.26571,
+      "gamma": 0.582857,
+      "psi": 2.565008,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 2,
+      "radar_missiles": 0,
+      "fuel": 4825.216583,
+      "mass": 24035.216583,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 5404.082509,
+      "y": 6321.452281,
+      "z": 8489.083548,
+      "v": 237.79237,
+      "gamma": 0.17678,
+      "psi": 1.276577,
+      "hp": 53.312943,
+      "ammo": 511.0,
+      "missiles": 3,
+      "radar_missiles": 1,
+      "fuel": 1347.150213,
+      "mass": 11209.750213,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "IMMELMANN",
+     "IMMELMANN"
+    ]
+   },
+   {
+    "t": 230.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 2048.725269,
+      "y": 6259.658066,
+      "z": 10109.918791,
+      "v": 188.424625,
+      "gamma": -0.111697,
+      "psi": -1.081705,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 2,
+      "radar_missiles": 0,
+      "fuel": 4772.665317,
+      "mass": 23982.665317,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 4886.337359,
+      "y": 8149.099072,
+      "z": 8914.681753,
+      "v": 208.74534,
+      "gamma": 0.148608,
+      "psi": 3.050969,
+      "hp": 53.312943,
+      "ammo": 511.0,
+      "missiles": 3,
+      "radar_missiles": 1,
+      "fuel": 1325.921113,
+      "mass": 11188.521113,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "HERBST",
+     "PURE"
+    ]
+   },
+   {
+    "t": 240.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 2971.436522,
+      "y": 4823.195723,
+      "z": 9947.128417,
+      "v": 160.974303,
+      "gamma": 0.5667,
+      "psi": -0.844891,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 2,
+      "radar_missiles": 0,
+      "fuel": 4734.110175,
+      "mass": 23944.110175,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 3220.676347,
+      "y": 7505.043605,
+      "z": 9199.060121,
+      "v": 193.089572,
+      "gamma": 0.14606,
+      "psi": -1.712665,
+      "hp": 53.312943,
+      "ammo": 511.0,
+      "missiles": 3,
+      "radar_missiles": 0,
+      "fuel": 1305.702947,
+      "mass": 11016.302947,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "IMMELMANN",
+     "PURE"
+    ]
+   },
+   {
+    "t": 250.008333,
+    "acs": [
+     {
+      "name": "SU-57",
+      "x": 3392.995585,
+      "y": 4372.360252,
+      "z": 10918.836321,
+      "v": 78.533836,
+      "gamma": 1.438167,
+      "psi": 2.056756,
+      "hp": 110.0,
+      "ammo": 150.0,
+      "missiles": 2,
+      "radar_missiles": 0,
+      "fuel": 4706.562268,
+      "mass": 23916.562268,
+      "alive": true
+     },
+     {
+      "name": "F-16V",
+      "x": 3102.524604,
+      "y": 5681.48297,
+      "z": 9731.658579,
+      "v": 192.047342,
+      "gamma": 0.422129,
+      "psi": -1.367878,
+      "hp": 53.312943,
+      "ammo": 511.0,
+      "missiles": 2,
+      "radar_missiles": 0,
+      "fuel": 1286.304887,
+      "mass": 10912.504887,
+      "alive": true
+     }
+    ],
+    "primitives": [
+     "IMMELMANN",
+     "LAG"
+    ]
+   }
+  ]
+ }
+}

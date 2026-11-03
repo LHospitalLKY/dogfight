@@ -10,24 +10,25 @@ venv/
 
 # 模拟产物与日志
 out/
+results/
+dist/
+build/
+.screenshots/
 *.mp4
 *.log
 
-# 3D 模型与贴图（体积大，本地自备，不入库）
-f_16c_model/
-I154-SU-57战机/
-Sukhoi_PAKFA.gif
-assets/flighter/
-assets/missle/
+# 3D 模型源文件（体积大，本地自备，不入库；路径登记在 configs/assets/models.yaml）
+assets/aircraft/
+assets/missiles/
 
 # 视觉金标截图（本地验收基线，体积大，不入库）
 docs/images/golden/
 
-# Web 前端启动时由 render 模型导出的简化 OBJ（生成物，不入库）
-web/static/models/
+# Web 前端启动时由 dogfight.view 导出的 three.js OBJ（生成物，不入库）
+dogfight/web/static/models/
 
 # 前端 1080p 采集上传的帧与编码视频（生成物，不入库）
-web/captures/
+dogfight/web/captures/
 
 # IDE / 系统文件
 .idea/

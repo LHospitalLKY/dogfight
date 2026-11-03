@@ -1,0 +1,12 @@
+# sdist 里需要带上运行所需的配置、字体/轮廓/地形资产、工具、测试与文档；
+# 原始 OBJ 模型体积大且不入库，仍按 .gitignore 的约定由使用者自备。
+include README.md
+include main.py
+recursive-include configs *.yaml
+recursive-include assets/fonts *.ttf *.otf
+recursive-include assets/silhouettes *.png
+recursive-include assets/terrain *.png
+recursive-include tools *.py
+recursive-include tests *.py *.json
+recursive-include docs *.md *.png *.jpg *.html *.js *.css
+recursive-include dogfight/web/static *.html *.js *.css

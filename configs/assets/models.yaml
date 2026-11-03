@@ -1,0 +1,46 @@
+# 资产注册表：把“哪个机体用哪个 OBJ、按多长缩放”从代码里分离。
+# 路径相对仓库根目录；新增机体/武器只需在这里加一项，three.js 导出、Web 兜底与轮廓生成会自动加载。
+# 机体只需要四个量：真实机长、体素抽稀尺度（米）、原始 OBJ、以及该 OBJ 的坐标换算器。
+# aircraft 的键必须与 configs/aircraft/*.yaml 里的 name 一致。
+version: web-obj-v3
+
+aircraft:
+  SU-57:
+    length_m: 20.1
+    # 兜底模型与俯视轮廓的体素尺度；原始 OBJ 直接取 web.source。
+    voxel_m: 0.30
+    web:
+      source: assets/aircraft/SU57.obj
+      file: su57.obj
+      converter: su57
+
+  F-16V:
+    length_m: 15.06
+    voxel_m: 0.28
+    # 俯视轮廓 / 兜底模型只保留机体蒙皮与座舱玻璃；
+    # 翼下导弹、副油箱、起落架在抽稀后会变成多余尖刺，Web 端仍渲染完整模型。
+    keep_materials:
+      - main_body.005
+      - glass.002
+    web:
+      source: assets/aircraft/F16.obj
+      file: f16.obj
+      converter: f16
+
+missiles:
+  R-73:
+    source: assets/missiles/R73.obj
+    length_m: 2.90
+    file: r73.obj
+  AIM-9X:
+    source: assets/missiles/AIM9.obj
+    length_m: 3.02
+    file: aim9.obj
+  R-77-1:
+    source: assets/missiles/R77.obj
+    length_m: 3.60
+    file: r77.obj
+  AIM-120C:
+    source: assets/missiles/AIM120.obj
+    length_m: 3.66
+    file: aim120.obj

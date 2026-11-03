@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tactical Map Floor Test</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #04070c; }
+  body { font-family: "Fira Code", "SFMono-Regular", Consolas, monospace; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at 50% 52%, rgba(0,0,0,0) 40%, rgba(0,0,0,0.62) 100%);
+  }
+  .tag {
+    position: fixed; pointer-events: none; letter-spacing: 1px;
+    color: #93a6bb; font-size: 14px;
+  }
+  #tag-title { left: 28px; top: 24px; color: #cfe3ff; }
+  #tag-sub { left: 28px; top: 48px; font-size: 12px; color: #66738a; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="vignette"></div>
+<div class="tag" id="tag-title">TACTICAL MAP · GROUND PLANE</div>
+<div class="tag" id="tag-sub">three.js 地面方案验证 · 200 km 空域</div>
+
+<script src="../vendor/three.min.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  const MAP_M = 200000.0;        // 地形图幅：200 km
+  const MAP_HALF = MAP_M / 2.0;
+  const SLAB_M = 330000.0;       // 网格底台：330 km，地图外仍有余量
+  const SLAB_HALF = SLAB_M / 2.0;
+
+  const canvas = document.getElementById("scene");
+  const renderer = new THREE.WebGLRenderer({
+    canvas, antialias: true, alpha: false,
+    powerPreference: "high-performance",
+    preserveDrawingBuffer: true,
+  });
+  renderer.setPixelRatio(1);
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04070c);
+
+  const camera = new THREE.PerspectiveCamera(
+    36, window.innerWidth / window.innerHeight, 10, 2e6
+  );
+  camera.position.set(0, 118000, 205000);
+  camera.lookAt(0, 0, 10000);
+
+  const camWorld = new THREE.Vector2(camera.position.x, camera.position.z);
+
+  // ---------------------------------------------------------------- 贴图
+  const texLoader = new THREE.TextureLoader();
+  const mapTex = texLoader.load("../../../assets/terrain/city_ortho.png");
+  mapTex.wrapS = mapTex.wrapT = THREE.ClampToEdgeWrapping;
+  mapTex.minFilter = THREE.LinearMipmapLinearFilter;
+  mapTex.magFilter = THREE.LinearFilter;
+  mapTex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  const edgeTex = texLoader.load("../../../assets/terrain/city_ortho_edge.png");
+  const lightsTex = texLoader.load("../../../assets/terrain/city_ortho_lights.png");
+
+  // ---------------------------------------------------------------- 磨砂倒影
+  const reflRT = new THREE.WebGLRenderTarget(4, 4, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: true,
+  });
+  const reflCam = new THREE.PerspectiveCamera(36, 1, 10, 2e6);
+  const reflDir = new THREE.Vector3();
+  function resizeRefl() {
+    reflRT.setSize(
+      Math.max(128, Math.floor(window.innerWidth / 3)),
+      Math.max(128, Math.floor(window.innerHeight / 3))
+    );
+    baseMat.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
+    baseMat.uniforms.uReflTexel.value.set(
+      1.0 / reflRT.width, 1.0 / reflRT.height
+    );
+  }
+
+  // ---------------------------------------------------------------- 底台
+  const baseMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uCam: { value: camWorld },
+      uHalf: { value: SLAB_HALF },
+      uCam3: { value: camera.position.clone() },
+      uRefl: { value: reflRT.texture },
+      uReflTexel: { value: new THREE.Vector2(1.0 / 512.0, 1.0 / 512.0) },
+      uRes: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+      uReflGain: { value: 0.85 },
+    },
+    vertexShader: `
+      varying vec2 vP;
+      varying vec3 vW;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vP = wp.xz;
+        vW = wp.xyz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vP;
+      varying vec3 vW;
+      uniform vec2 uCam;
+      uniform float uHalf;
+      uniform vec3 uCam3;
+      uniform sampler2D uRefl;
+      uniform vec2 uReflTexel;
+      uniform vec2 uRes;
+      uniform float uReflGain;
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      float gridLine(float d, float px) {
+        // px 为该像素在世界坐标下的尺寸，1.2px 线宽即可获得抗锯齿细线
+        float w = max(px * 1.1, 0.35);
+        return 1.0 - smoothstep(0.0, w, d);
+      }
+
+      void main() {
+        vec2 p = vP;
+        float r = length(p) / uHalf;
+        float dist = length(p - uCam);
+
+        // 深蓝底：中心略亮，边缘压到近黑
+        vec3 coreCol = vec3(0.030, 0.062, 0.105);
+        vec3 edgeCol = vec3(0.010, 0.017, 0.030);
+        vec3 col = mix(coreCol, edgeCol, smoothstep(0.10, 0.92, r));
+
+        // ---- 磨砂倒影：屏幕坐标采样低分辨率镜像渲染，九宫格模糊 ----
+        vec2 suv = gl_FragCoord.xy / uRes;
+        vec2 warp = vec2(hash(p * 0.9), hash(p * 0.7)) - 0.5;
+        vec2 rb = suv + warp * 0.0016;
+        vec2 o = uReflTexel * 1.6;
+        vec3 refl = texture2D(uRefl, rb).rgb * 0.20;
+        refl += texture2D(uRefl, rb + vec2( o.x,  o.y)).rgb * 0.12;
+        refl += texture2D(uRefl, rb + vec2(-o.x,  o.y)).rgb * 0.12;
+        refl += texture2D(uRefl, rb + vec2( o.x, -o.y)).rgb * 0.12;
+        refl += texture2D(uRefl, rb + vec2(-o.x, -o.y)).rgb * 0.12;
+        refl += texture2D(uRefl, rb + vec2( o.x * 2.0, 0.0)).rgb * 0.11;
+        refl += texture2D(uRefl, rb + vec2(-o.x * 2.0, 0.0)).rgb * 0.11;
+        refl += texture2D(uRefl, rb + vec2(0.0,  o.y * 2.0)).rgb * 0.11;
+        refl += texture2D(uRefl, rb + vec2(0.0, -o.y * 2.0)).rgb * 0.11;
+        float rMask = smoothstep(0.03, 0.13, max(max(refl.r, refl.g), refl.b));
+        vec3 V = normalize(uCam3 - vW);
+        float fres = pow(1.0 - clamp(abs(V.y), 0.0, 1.0), 3.0);
+        col += refl * rMask * (0.35 + 0.45 * fres) * uReflGain;
+
+        // 台面柔光
+        col += vec3(0.018, 0.033, 0.052) * (1.0 - smoothstep(0.0, 0.85, r));
+
+        // 底台本身只留渐变与边界；网格单独一层，叠在地图之上。
+        float edgeFade = 1.0 - smoothstep(0.94, 1.0, r);
+        col *= edgeFade;
+
+        // 底台边界：比网格亮一档，暗示这是一块有厚度的台面
+        float px = max(fwidth(p.x), fwidth(p.y));
+        float dEdge = min(abs(abs(p.x) - uHalf), abs(abs(p.y) - uHalf));
+        col += vec3(0.34, 0.48, 0.62) * gridLine(dEdge, px) * 0.55;
+
+        // 颗粒噪点，压住大面积纯色的塑料感
+        float grain = hash(floor(p * 0.5));
+        col += (grain - 0.5) * 0.0035;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+  });
+  const baseGeo = new THREE.PlaneGeometry(SLAB_M, SLAB_M);
+  const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+  baseMesh.rotation.x = -Math.PI / 2;
+  baseMesh.position.y = -0.8;
+  scene.add(baseMesh);
+
+  // ---------------------------------------------------------------- 地形层
+  const mapMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uMap: { value: mapTex },
+      uEdge: { value: edgeTex },
+      uLights: { value: lightsTex },
+      uCam: { value: camWorld },
+      uTime: { value: 0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec2 vP;
+      void main() {
+        vUv = uv;
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vP = wp.xz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vUv;
+      varying vec2 vP;
+      uniform sampler2D uMap;
+      uniform sampler2D uEdge;
+      uniform sampler2D uLights;
+      uniform vec2 uCam;
+      uniform float uTime;
+
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      void main() {
+        vec3 tex = texture2D(uMap, vUv).rgb;
+        float lum = dot(tex, vec3(0.22, 0.42, 0.16));
+
+        // 原图是彩色城市图：先去色，再压成冷蓝灰阶，橙色建成区变成浅色斑块
+        vec3 deep = vec3(0.028, 0.052, 0.086);
+        vec3 land = vec3(0.165, 0.225, 0.300);
+        vec3 col = mix(deep, land, clamp(lum * 1.02, 0.0, 1.0));
+        col += vec3(0.004, 0.012, 0.024) * smoothstep(0.35, 1.0, lum);
+
+        // 城市灯光：细颗粒闪点，冷白偏蓝，只留最亮的一批
+        float lights = texture2D(uLights, vUv).r;
+        lights = smoothstep(0.35, 1.0, lights);
+        float flick = 0.72 + 0.28 * sin(uTime * 1.7 + hash(floor(vUv * 900.0)) * 6.28);
+        col += vec3(0.72, 0.86, 1.00) * lights * 0.65 * flick;
+
+        // 海岸线：冷白描边，外圈略柔
+        float coast = texture2D(uEdge, vUv).r;
+        col += vec3(0.80, 0.91, 1.00) * pow(coast, 1.45) * 1.00;
+
+        // 远处混入冷灰雾
+        float dist = length(vP - uCam);
+        col = mix(col, vec3(0.115, 0.16, 0.20), smoothstep(150000.0, 330000.0, dist) * 0.55);
+
+        // 图幅边缘羽化
+        float e = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
+        float alpha = smoothstep(0.0, 0.018, e);
+
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+  });
+  // three 的 GLSL1 需要显式开启标准导数扩展，fwidth 才能用于网格抗锯齿。
+  baseMat.extensions = { derivatives: true };
+  const mapGeo = new THREE.PlaneGeometry(MAP_M, MAP_M);
+  const mapMesh = new THREE.Mesh(mapGeo, mapMat);
+  mapMesh.rotation.x = -Math.PI / 2;
+  mapMesh.position.y = 0.4;
+  scene.add(mapMesh);
+
+  // ---------------------------------------------------------------- 网格叠加层
+  // 单独一层压在地图之上：地图、海面、外圈都有同一套网格，且能各自控制亮度。
+  const gridMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uCam: { value: camWorld },
+      uHalf: { value: SLAB_HALF },
+    },
+    vertexShader: `
+      varying vec2 vP;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vP = wp.xz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vP;
+      uniform vec2 uCam;
+      uniform float uHalf;
+
+      float gridLine(float d, float px, float wScale) {
+        float w = max(px * wScale, 0.30);
+        return 1.0 - smoothstep(0.0, w, d);
+      }
+
+      void main() {
+        vec2 p = vP;
+        float dist = length(p - uCam);
+        float px = max(fwidth(p.x), fwidth(p.y));
+
+        float dMin = min(
+          abs(fract(p.x / 2000.0 + 0.5) - 0.5) * 2000.0,
+          abs(fract(p.y / 2000.0 + 0.5) - 0.5) * 2000.0
+        );
+        float dMaj = min(
+          abs(fract(p.x / 10000.0 + 0.5) - 0.5) * 10000.0,
+          abs(fract(p.y / 10000.0 + 0.5) - 0.5) * 10000.0
+        );
+        float dBig = min(
+          abs(fract(p.x / 50000.0 + 0.5) - 0.5) * 50000.0,
+          abs(fract(p.y / 50000.0 + 0.5) - 0.5) * 50000.0
+        );
+
+        float fade = 1.0 - smoothstep(120000.0, 330000.0, dist);
+        float aMin = gridLine(dMin, px, 1.0) * 0.24;
+        float aMaj = gridLine(dMaj, px, 1.15) * 0.52;
+        float aBig = gridLine(dBig, px, 1.35) * 0.78;
+        float a = (aMin + aMaj + aBig) * fade;
+
+        // 细线偏冷蓝，粗线偏冷白，层次更像战术底图。
+        vec3 col = vec3(0.44, 0.60, 0.78);
+        col = mix(col, vec3(0.72, 0.84, 0.96), aBig / max(a, 1e-4));
+
+        gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+  });
+  gridMat.extensions = { derivatives: true };
+  const gridMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(SLAB_M, SLAB_M), gridMat
+  );
+  gridMesh.rotation.x = -Math.PI / 2;
+  gridMesh.position.y = 3.2;
+  scene.add(gridMesh);
+
+  // ---------------------------------------------------------------- 边框 / 光晕
+  const frameGroup = new THREE.Group();
+  scene.add(frameGroup);
+
+  function glowBar(w, h, color, opacity, y) {
+    const m = new THREE.Mesh(
+      new THREE.PlaneGeometry(w, h),
+      new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      })
+    );
+    m.rotation.x = -Math.PI / 2;
+    m.position.y = y;
+    frameGroup.add(m);
+    return m;
+  }
+
+  const EDGE = MAP_HALF;
+  const lineW = 900.0;
+  const haloW = 9000.0;
+  const frameCol = 0xa9d4f2;
+
+  // 软边光带：中轴最亮、两侧指数衰减，避免平涂矩形出现硬边。
+  function glowStrip(w, h, color, peak, y) {
+    const mat = new THREE.ShaderMaterial({
+      uniforms: {
+        uColor: { value: new THREE.Color(color) },
+        uPeak: { value: peak },
+        uHoriz: { value: w > h },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        varying vec2 vUv;
+        uniform vec3 uColor;
+        uniform float uPeak;
+        uniform bool uHoriz;
+        void main() {
+          float t = uHoriz ? vUv.y : vUv.x;
+          float a = uPeak * exp(-pow((t - 0.5) * 2.0, 2.0) * 3.4);
+          gl_FragColor = vec4(uColor, a);
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+    m.rotation.x = -Math.PI / 2;
+    m.position.y = y;
+    frameGroup.add(m);
+    return m;
+  }
+
+  // 四条边线 + 外扩光晕
+  for (const [w, h, x, z] of [
+    [MAP_M, lineW, 0, EDGE],
+    [MAP_M, lineW, 0, -EDGE],
+    [lineW, MAP_M, EDGE, 0],
+    [lineW, MAP_M, -EDGE, 0],
+  ]) {
+    glowBar(w, h, frameCol, 0.88, 6).position.set(x, 6, z);
+    if (w === MAP_M) {
+      glowStrip(w, haloW, frameCol, 0.26, 5).position.set(x, 5, z);
+    } else {
+      glowStrip(haloW, h, frameCol, 0.26, 5).position.set(x, 5, z);
+    }
+  }
+
+  // 四角括号
+  const cornerLen = 12000.0;
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      glowStrip(cornerLen, 3000, 0xcfe8ff, 0.85, 8)
+        .position.set(sx * (EDGE - cornerLen / 2), 8, sz * EDGE);
+      glowStrip(3000, cornerLen, 0xcfe8ff, 0.85, 8)
+        .position.set(sx * EDGE, 8, sz * (EDGE - cornerLen / 2));
+    }
+  }
+
+  // 底台外缘：更淡的一圈，拉开台面与外围的距离
+  for (const [w, h, x, z] of [
+    [SLAB_M, lineW, 0, SLAB_HALF],
+    [SLAB_M, lineW, 0, -SLAB_HALF],
+    [lineW, SLAB_M, SLAB_HALF, 0],
+    [lineW, SLAB_M, -SLAB_HALF, 0],
+  ]) {
+    if (w === SLAB_M) {
+      glowStrip(w, 16000, 0x6f9fbf, 0.22, 3).position.set(x, 3, z);
+    } else {
+      glowStrip(16000, h, 0x6f9fbf, 0.22, 3).position.set(x, 3, z);
+    }
+  }
+
+  // ---------------------------------------------------------------- 刻度尺
+  function makeRulerTexture(withNumbers) {
+    const W = 2048, H = 160;
+    const cv = document.createElement("canvas");
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(188,214,238,0.90)";
+    ctx.fillStyle = "rgba(214,232,250,0.92)";
+    ctx.lineWidth = 2;
+    ctx.font = "26px 'Fira Code', monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.beginPath();
+    ctx.moveTo(0, 10); ctx.lineTo(W, 10);
+    ctx.stroke();
+
+    const ticks = 20;
+    for (let i = 0; i <= ticks; i += 1) {
+      const x = (i / ticks) * (W - 1);
+      const major = i % 5 === 0;
+      const len = major ? 48 : 26;
+      ctx.lineWidth = major ? 2.6 : 1.4;
+      ctx.beginPath();
+      ctx.moveTo(x, 10); ctx.lineTo(x, 10 + len);
+      ctx.stroke();
+      if (major && withNumbers) {
+        ctx.fillText(`${i * 10}`, Math.min(W - 20, Math.max(20, x)), 68);
+      }
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    return tex;
+  }
+
+  const rulerH = 15000.0;
+  function rulerMesh(tex, w, h, x, z, rotZ) {
+    const mat = new THREE.MeshBasicMaterial({
+      map: tex, transparent: true, depthWrite: false,
+      opacity: 0.85, side: THREE.DoubleSide,
+    });
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+    m.rotation.x = -Math.PI / 2;
+    m.rotation.z = rotZ;
+    m.position.set(x, 10, z);
+    scene.add(m);
+    return m;
+  }
+  // 南边：唯一带数字的主刻度尺；其余三边只画刻度，避免文字方向打架。
+  const rulerTexNums = makeRulerTexture(true);
+  const rulerTexTicks = makeRulerTexture(false);
+  rulerMesh(rulerTexNums, MAP_M, rulerH, 0, MAP_HALF - rulerH / 2 - 1200, 0);
+  rulerMesh(rulerTexNums, MAP_M, rulerH, 0, -MAP_HALF + rulerH / 2 + 1200, Math.PI);
+  for (const side of [-1, 1]) {
+    const tex = rulerTexTicks.clone();
+    tex.needsUpdate = true;
+    tex.center.set(0.5, 0.5);
+    tex.rotation = side > 0 ? Math.PI / 2 : -Math.PI / 2;
+    rulerMesh(tex, rulerH, MAP_M, side * (MAP_HALF - rulerH / 2 - 1200), 0, 0);
+  }
+
+  // ---------------------------------------------------------------- 台面侧壁 / 前景亮边
+  const lipMat = new THREE.ShaderMaterial({
+    uniforms: { uCol: { value: new THREE.Color(0xb8dcf5) } },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vUv;
+      uniform vec3 uCol;
+      void main() {
+        float top = smoothstep(0.0, 0.10, vUv.y);
+        float fade = pow(1.0 - vUv.y, 1.6);
+        float a = top * fade * 0.85;
+        gl_FragColor = vec4(uCol, a);
+      }
+    `,
+    transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  });
+  const wallH = 9000.0;
+  const wall = new THREE.Mesh(new THREE.PlaneGeometry(SLAB_M, wallH), lipMat);
+  wall.position.set(0, -wallH / 2, SLAB_HALF);
+  scene.add(wall);
+  // 顶边亮线
+  const lipLine = new THREE.Mesh(
+    new THREE.PlaneGeometry(SLAB_M, 1600),
+    new THREE.MeshBasicMaterial({
+      color: 0xbfe2ff, transparent: true, opacity: 0.35,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    })
+  );
+  lipLine.rotation.x = -Math.PI / 2;
+  lipLine.position.set(0, 2, SLAB_HALF - 800);
+  scene.add(lipLine);
+
+  // 台面前沿的软光带：把底边之外的黑区压成深蓝辉光，像桌面边缘的反射。
+  const frontGlow = glowStrip(SLAB_M, 26000, 0x7fb6de, 0.38, 2);
+  frontGlow.position.set(0, 2, SLAB_HALF + 12000);
+
+  // 竖向侧壁：左右两侧各补一条，避免只看到正面的纸片。
+  for (const side of [-1, 1]) {
+    const sideWall = new THREE.Mesh(new THREE.PlaneGeometry(SLAB_M, wallH), lipMat);
+    sideWall.rotation.y = side * Math.PI / 2;
+    sideWall.position.set(side * SLAB_HALF, -wallH / 2, 0);
+    scene.add(sideWall);
+  }
+
+  // ---------------------------------------------------------------- 扫描 / 噪点叠加
+  const scanMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uRes: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+    },
+    vertexShader: `
+      varying vec2 vP;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vP = wp.xz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      precision highp float;
+      varying vec2 vP;
+      uniform float uTime;
+      uniform vec2 uRes;
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+      void main() {
+        float scan = 0.5 + 0.5 * sin(gl_FragCoord.y * 3.14159265);
+        float sweepY = mod(uTime * 90.0, uRes.y + 220.0) - 110.0;
+        float sweep = exp(-pow((gl_FragCoord.y - sweepY) / 55.0, 2.0));
+        float n = hash(gl_FragCoord.xy + uTime * 60.0);
+        float a = scan * 0.022 + sweep * 0.055 + (n - 0.5) * 0.012;
+        gl_FragColor = vec4(0.42, 0.66, 0.92, a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const scan = new THREE.Mesh(new THREE.PlaneGeometry(SLAB_M, SLAB_M), scanMat);
+  scan.rotation.x = -Math.PI / 2;
+  scan.position.y = 14;
+  scene.add(scan);
+
+  // 仅用于验收倒影：?probe=1 时在地台上方放几个自发光体
+  if (location.search.indexOf("probe") >= 0) {
+    const probe = new THREE.Group();
+    for (const [x, y, z, c, s] of [
+      [-35000, 22000, 30000, 0x8fe3ff, 2600],
+      [20000, 46000, -10000, 0xffa04a, 3200],
+      [52000, 14000, 42000, 0xd77dff, 1800],
+    ]) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(s, 20, 14),
+        new THREE.MeshBasicMaterial({ color: c })
+      );
+      m.position.set(x, y, z);
+      probe.add(m);
+    }
+    scene.add(probe);
+  }
+
+  // ---------------------------------------------------------------- 渲染
+  const clock = new THREE.Clock();
+  function frame() {
+    const t = clock.getElapsedTime();
+    mapMat.uniforms.uTime.value = t;
+    scanMat.uniforms.uTime.value = t;
+
+    // 镜像相机：反射地台平面 y = 0 以下的场景，供磨砂倒影采样
+    camera.getWorldDirection(reflDir);
+    reflCam.position.set(camera.position.x, -camera.position.y, camera.position.z);
+    reflCam.up.set(0, -1, 0);
+    reflCam.lookAt(
+      camera.position.x + reflDir.x,
+      -(camera.position.y + reflDir.y),
+      camera.position.z + reflDir.z
+    );
+    reflCam.projectionMatrix.copy(camera.projectionMatrix);
+    reflCam.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+    renderer.setRenderTarget(reflRT);
+    renderer.render(scene, reflCam);
+    renderer.setRenderTarget(null);
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(frame);
+  }
+  resizeRefl();
+  frame();
+
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    scanMat.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
+    resizeRefl();
+  });
+})();
+</script>
+</body>
+</html>

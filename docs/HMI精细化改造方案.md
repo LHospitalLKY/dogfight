@@ -1,5 +1,8 @@
 # HMI 精细化改造方案（车机级一致性与 60 fps）
 
+> **历史文档（1.1.1 起）**：本文记录的是 pygame 软件渲染阶段的 HMI 规范，`render.py` / `theme.py` 及其 HUD 绘制已在“Web 观战端”重构中移除，当前可视化只有 three.js 浏览器端（`dogfight/web/`）。
+> 文中 `theme.py` 现为 `dogfight/view/theme.py`，`scripts/` 下保留的脚本已迁到 `tools/maintenance/`；路径与行号仅作当时记录。
+
 本方案把“车机 HMI 那种高 DPI、干净、统一、稳定 60 帧”的标准落到当前的 pygame + CPU 软件渲染实现上。
 前提：本项目不启用 GPU 路径（`moderngl` 上下文在 WSLg 下不可用，`render.py` 的 `_init_gpu()` 会自动回退到 CPU），
 因此所有精细度手段必须是 CPU 可承受的：**不做逐帧全屏 2× 超采样，改为静态件 2× 预渲染 + 字形缓存**。

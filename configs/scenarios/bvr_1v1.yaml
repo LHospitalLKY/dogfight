@@ -1,0 +1,27 @@
+# 默认场景：Su-57 vs F-16V，120 km 对头，300 s 时限，双方雷达常开。
+id: bvr-1v1
+time_limit_s: 300
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 60000          # 每架距空域中心 60 km，总间距 120 km
+  altitude_m: 9000
+  y_offset_m: 100
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    aircraft: SU-57
+    radar_policy: auto
+  - name: blue
+    aircraft: F-16V
+    radar_policy: auto
+
+awacs: false
+# seed: 3
+
+# seed 不写即每次启动随机占位；需要复现某一局时用 --seed N，
+# 或在此填入整数（如 seed: 3）。

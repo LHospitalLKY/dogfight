@@ -1,0 +1,66 @@
+# Su-57：双发重型、偏能量战；隐身修形主要压前向 RCS。
+id: SU-57
+name: SU-57
+
+airframe:
+  # 空机 + 半油；挂载质量由 loader 按 loadout 自动加到作战全重。
+  base_mass_kg: 24500
+  wing_area_m2: 78.8
+  cl_max: 1.6
+  n_struct_g: 9
+  thrust_max_kn: 284        # AL-41F1 双发加力
+  thrust_mil_kn: 186        # 双发军用推力
+  cd0: 0.040
+  aspect_ratio: 2.52        # 翼展 14.1 m / 面积 78.8 m²
+  oswald: 0.80
+  cl_alpha: 3.85
+  cruise_mach: 1.30
+  fuel_capacity_kg: 5500
+  lapse_exp: 0.65
+  ram_r0: 0.15
+  ram_r1: 0.20
+  derate_z_m: 18000
+  derate_H_m: 6000
+  eta_install: 0.95
+  hp_max: 110
+  gun_range_m: 1000
+  gun_dps: 30
+  ammo_max: 150
+  rounds_per_sec: 25
+  length_m: 20.1
+  # 30 mm 机炮（GSh-30-1 量级）
+  muzzle_speed: 900
+  bullet_mass_kg: 0.390
+  bullet_diameter_m: 0.030
+  gun_spread: 0.003
+  # AL-41F1 三元矢量喷口
+  tvc_deg: 15
+  tvc_alpha_max_deg: 55
+  tvc_cl_bonus: 0.30
+
+sensors:
+  rcs: 0.5
+  rcs_front: 0.3
+  rcs_side: 1.2
+  rcs_back: 2.5
+  radar_range_km: 160
+  side_array: true
+  lband: true
+  irst_range_km: 60
+
+loadout:
+  ir:
+    weapon: R-73
+    count: 4
+  radar:
+    weapon: R-77-1
+    count: 2
+  countermeasures:
+    chaff: 24
+    flare: 18
+
+agent:
+  aggression: 0.85
+  energy_pref: 0.65
+  lure: true
+  style: energy

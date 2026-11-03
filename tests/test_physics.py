@@ -5,8 +5,8 @@ import math
 
 import pytest
 
-from main import F16V_SPEC, SU57_SPEC, R73, R77_1
-from sim import (
+from dogfight.app.main import F16V_SPEC, SU57_SPEC, R73, R77_1
+from dogfight.core.sim import (
     cd0_at,
     drag_divergence,
     proximity_pk,

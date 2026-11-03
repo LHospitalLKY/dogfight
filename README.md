@@ -1,9 +1,11 @@
 # 空战狗斗模拟器
 
-基于 Python 的 1v1 空战对抗模拟：6DOF / 3DOF / 2DOF 动力学内核 + 四层战术 Agent + 透视 3D 可视化。
+基于 Python 的 1v1 空战对抗模拟：6DOF / 3DOF / 2DOF 动力学内核 + 四层战术 Agent + three.js 浏览器 3D 可视化。
 目标是研究**机体性能参数如何影响超视距（BVR）与近距格斗（WVR）的战术选择**，而不是做一个飞行模拟器。
 
-两种观战方式共用同一套内核：pygame 窗口（原生渲染、录制 mp4），或浏览器里的 three.js 观战端（实时 3D、可交互相机、1080p 采集）。
+唯一可视化入口是浏览器里的 three.js 观战端（实时 3D、可交互相机、1080p 采集）；主程序本身只用终端输出过程与结果。
+
+当前版本：**1.1.1**（构建方式见[构建发行版](#构建发行版)）。
 
 ![Web 观战：开局 120 km 对头](docs/images/06_web_opening.jpg)
 
@@ -64,26 +66,23 @@
 
 ### 可视化
 
-- 渲染优先走 OpenGL（moderngl），无可用 GL 上下文时自动回退 pygame 软件渲染，`--no-gpu` 可强制软件路径。
-- 轨道相机默认取两机中点（双方同框），录制时可用 `--follow` 改为单机机尾跟拍。默认地面只留 8 km 一格的极淡空域网格与空域边界（暗场背景 + 45° 极淡斜纹 + 暗角），给高度一个参照但不抢画面重心；`--terrain texture` 可切回 1500 m 城市贴图地面。
-- HUD 左侧为速度刻度、右侧为高度刻度，数值以方框滚条式变动，高度线用三角标志指向当前高度；中央有固定水平标志，与俯仰梯的夹角即当前横滚；顶部航向带显示相对地面的当前航向。窗口缩放时座舱面板按安全区自动重排（窗口过小则隐藏座舱面板）。
-- 机炮火控框为圆形，按外弹道模型画在预计落点；雷达锁定框为菱形。只有方位、没有距离时（`DETECT`/RWR），在航向带上用一个小红箭头指向对应刻度，不再给方位读数文字。
-- 顶部中央的三维姿态框给出双方实时姿态、油门/加力条与燃油条；在飞导弹居中的窄条里只给目标与当前速度，不再挤占主视区。
-- 界面文字按“同一信息只出现一次”收敛：速度/高度/航向/俯仰由刻度带与俯仰梯承载；血量与过载合成 HUD 顶部的状态带（左 `HP` + 血量条，右 `G`），低于 25% 血量转红；雷达屏左下角小字为战术态势（`SEPARATED/POSITIVE/DEFENSIVE…`）、右下角红字 `IN n` 为本机来袭弹数；武器页页头给出导引头状态（`SEEK` / `SEEK xx%` / `LOCK`）。原先分列左右上角的双方状态卡与右侧全局高度尺已删除。
-- 界面字体统一为 `assets/font/FiraCode-Regular.ttf`（Fira Code），数字按定宽槽位渲染，读数逐帧变化时整行宽度不抖动。
-- 座舱显示：红方贴左上、蓝方贴右上，各由三块独立面板组成——雷达屏贴屏幕角（可以做大方块）、抬头显示仪在它内侧、武器挂载页在 HUD 下方；窗口不够宽（如录制用的 1280×800）时三块改为竖排、雷达占满簇宽。三块面板统一为半透明磨砂玻璃：模糊后方的空战场景，叠顶部高光、斜向反光与低透明度颗粒，只用队伍色边线和顶部强调条区分归属。雷达屏为机头朝上，含距离环、目标光点与来袭弹红楔形；武器挂载页中央是按 OBJ 模型正交俯视生成的机体轮廓（Su-57 / F-16V 按真实比例），左右两栏各带弹体 logo（已挂载亮、已打掉压暗），逐行给出 `READY/EMPTY`、余量、在飞弹数，底部一行机炮与干扰物余量。目标颜色按火控状态统一：绿=已跟踪未锁定，黄=正在锁定（可发射），红=已锁定。窗口模式默认 1920×1080（可拖拽缩放），录制默认 1920×1080，可用 `--record-size WxH` 指定（如 1280×800）。
-- 实时轨迹为带方向箭头的宽飘带（中心最亮、向两侧连续变暗的渐变横截面，带高光芯，按机体滚转明暗），并标注机炮开火点、导弹发射点（金色星标）、高 G 机动点（橙色菱形）；发动机尾焰随推力变化；机体所在高度还画出机炮射程圆环（透视后成椭圆）。
+3D 画面只在浏览器端呈现（见下节），尾焰、导弹、箔条/热诱弹云团与航迹都是实时渲染。界面字体统一为 `assets/fonts/FiraCode-Regular.ttf`（Fira Code），数字按定宽槽位排版，读数逐帧变化时整行宽度不抖动。
 
 ### Web 观战（three.js）
 
-`web/server.py` 复用同一套内核，用 SSE 把 24 Hz 快照推给浏览器；three.js 为本地 vendored 文件，不依赖 CDN 与外网。
+`dogfight/web/server.py` 复用同一套内核，用 SSE 把 24 Hz 快照推给浏览器；three.js 为本地 vendored 文件，不依赖 CDN 与外网。
 
-- 机体与导弹直接读取 `assets/flighter`、`assets/missle` 下的原始 OBJ，按真实机长/弹长归一后导出到 `web/static/models/`；原始资产缺失时自动退回 `render.py` 的体素模型，服务仍能启动。
+- 机体与导弹直接读取 `assets/aircraft`、`assets/missiles` 下的原始 OBJ，按真实机长/弹长归一后导出到 `dogfight/web/static/models/`；俯视轮廓与兜底模型从同一份 OBJ 体素抽稀，几何完全一致。
 - 机体迷彩按物体空间三平面投影实时生成；加力尾焰、导弹弹体、箔条/热诱弹云团与燃烧拖尾都是实时特效。
+- 地面为战术地图：4096² 城市贴图叠加海岸线与灯光 mask，中心 100 km 自动换成 24 m/px 精细层；底台是带平面反射的磨砂玻璃，随视角产生模糊倒影。独立地形 demo 在 `/static/terrain_demo/index.html`。
 - 航迹为随滚转明暗的渐变飘带，从机尾起步并带方向箭头；导弹发射星标、高 G 机动菱形与机炮开火点保留在 3D 场景里。
 - 机体旁直接标出当前 `战术族 · 机动原语`（如 `SURVIVE · DIVE_OFFSET`），在飞导弹标出型号与是否仍在制导。
 - HUD 为 DOM 覆盖层：双方雷达屏、抬头显示、武器挂载页、三维姿态框与结算横幅，按窗口宽度自动重排；`SPACE` 暂停、`R` 重置、`F` 切换机尾跟拍，鼠标拖动环绕、滚轮缩放。
-- 固定分辨率采集：打开 `/?capture=1920x1080&name=j1&delay=3&frames=90&fps=30`，前端按 1920×1080 渲染并把 PNG 帧 POST 到 `/api/capture`；帧数大于 1 时服务端自动用 ffmpeg 编码成 `web/captures/j1.mp4`。采集只合成 3D 场景，DOM 上的 HUD 不在画面内（需要带 HUD 的成片请用 pygame 的 `--record`）。
+- HUD 布局：红方贴左上、蓝方贴右上，各由雷达屏、抬头显示仪与武器挂载页三块面板组成；窗口不够宽时三块改为竖排。面板为半透明磨砂玻璃，只用队伍色边线与顶部强调条区分归属。
+- 雷达屏机头朝上，含距离环、目标光点与来袭弹红楔形；武器挂载页中央是按 OBJ 正交俯视生成的机体轮廓，左右两栏逐行给出 `READY/EMPTY`、余量、在飞弹数，底部为机炮与干扰物余量。目标颜色按火控状态统一：绿=已跟踪未锁定，黄=正在锁定（可发射），红=已锁定。
+- 抬头显示：左侧速度刻度、右侧高度刻度，数值以方框滚条式变动；中央固定水平标志与俯仰梯的夹角即当前横滚；顶部航向带显示当前航向。只有方位、没有距离时（`DETECT`/RWR），航向带上用小红箭头指向对应刻度。
+- 界面文字按“同一信息只出现一次”收敛：血量与过载合成 HUD 顶部状态带（左 `HP` + 血量条，右 `G`），低于 25% 血量转红；雷达屏左下角为战术态势（`SEPARATED/POSITIVE/DEFENSIVE…`），右下角红字 `IN n` 为来袭弹数；武器页页头给出导引头状态（`SEEK` / `SEEK xx%` / `LOCK`）。
+- 固定分辨率采集：打开 `/?capture=1920x1080&name=j1&delay=3&frames=90&fps=30`，前端按 1920×1080 渲染并把 PNG 帧 POST 到 `/api/capture`；帧数大于 1 时服务端自动用 ffmpeg 编码成 `dogfight/web/captures/j1.mp4`。采集只合成 3D 场景，DOM 上的 HUD 不在画面内。
 
 一局完整演示（4 分钟，1920×1200）：[demo_v1.1.mp4](https://github.com/LHospitalLKY/dogfight/releases/download/v1.1.0/demo_v1.1.mp4)
 
@@ -91,54 +90,71 @@
 
 | 命令 | 说明 |
 | --- | --- |
-| `--headless` | 无窗口跑一局并打印过程与结果 |
+| `--headless` | 跑一局并打印过程与结果（默认行为，保留该参数以兼容脚本） |
 | `--baseline` | 双方改用纯追踪基线，作为战术 Agent 的对照组 |
 | `--dof {2,3,6}` | 切换动力学内核（默认 6） |
-| `--seconds S` | 对局时限（默认 300 s） |
+| `--scenario NAME_OR_PATH` | 场景名或 YAML 路径（默认 `bvr-1v1`） |
+| `--config-dir DIR` | 配置根目录（默认仓库内 `configs/`） |
+| `--radar-policy TEAM=POLICY` | 按队伍名或机体 id 覆盖雷达策略，可重复 |
+| `--seconds S` | 对局时限（默认取场景配置的 `time_limit_s`） |
 | `--ab` | 同一套 Agent 在 3DOF / 6DOF 下的 A/B 对比 |
 | `--ab-suite` | 跨内核 × 跨站位 × 多初始偏移的 12 局镜像矩阵 |
-| `--record PATH` | 无窗口渲染并录制 mp4，同时输出全局轨迹图 |
-| `--track-plot PATH` | 全局轨迹图输出路径（仅 `--record` 时生成） |
-| `--track-interval S` | 轨迹采样间隔（默认 10 s） |
-| `--fps N` | 录制帧率（默认 20） |
-| `--record-size WxH` | 录制分辨率（默认 1920×1080，例如 1280×800） |
-| `--start S` | 录制起始时间：之前的时间只跑仿真、不渲染（默认 0） |
-| `--follow N` | 录制时跟随的飞机索引 |
 | `--seed N` | 固定开局随机占位，复现实验用 |
-| `--f16-radar {always,silent,auto}` | F-16V 雷达策略：常开 / 全程静默 / 静默+40 km 迎头短时开机 |
-| `--su57-radar {always,silent,auto}` | Su-57 雷达策略，取值同上 |
-| `--terrain {slab,texture}` | 地面风格：默认暗场 + 极淡空域网格；`texture` 切到城市贴图 |
-| `--compare-radar` | 固定 seed=3，F-16V 三种雷达策略各跑一局并对比辐射后果 |
-| `--awacs / --no-awacs` | 预警机开关，默认开启 |
-| `--no-gpu` | 强制使用 CPU 软件渲染（默认尝试 OpenGL，失败自动回退） |
+| `--f16-radar {always,silent,auto}` | **[弃用]** 等价于 `--radar-policy F-16V=...` |
+| `--su57-radar {always,silent,auto}` | **[弃用]** 等价于 `--radar-policy SU-57=...` |
+| `--compare-radar` | 固定 seed=3，场景中被观察方三种雷达策略各跑一局并对比辐射后果 |
+| `--awacs / --no-awacs` | 预警机开关，默认取场景配置 |
+
+### 分析工具
+
+离线量测脚本都在 `tools/` 下，按 `python -m <模块>` 运行，产物写到 `out/`（已 gitignore）：
+
+| 命令 | 说明 |
+| --- | --- |
+| `python -m tools.analysis.missile_g_analysis --seed 12` | 单发中距弹的需用过载 / 可用过载时程，叠加弹目距离与马赫数 |
+| `python -m tools.analysis.missile_tracks` | 自动挑选「命中 / 常规近失 / 需用过载爆表 / 近距发射」四类交战，画俯视比例导引弹道（含目标机航迹、最近点与脱靶距离） |
+| `python -m tools.analysis.radar_notch_demo` | 多普勒盲区演示：目标横穿 → 落入主瓣杂波凹口 → 重新截获（MP4） |
+| `python -m tools.analysis.radar_detection_map` | 分向 RCS + 多普勒可见度下的雷达探测范围图 |
+| `python -m tools.analysis.bell_diag` | 克沃丘尔钟摆单点诊断（机头指向、角速度、迎角） |
+| `python -m tools.analysis.validate_models_v2` | 第二版物理模型的离线校验（包线 / 加速 / 爬升 / 阻力） |
+| `python -m tools.maintenance.build_silhouettes` | 由 OBJ 正交投影生成俯视轮廓 |
+| `python -m tools.maintenance.build_terrain_detail` | 生成城市地面精细层与灯光 mask |
+| `python -m tools.maintenance.check_contrast` | 按 WCAG 校验 HMI 颜色对比度 |
+| `python -m tools.maintenance.golden_snapshot` | 固定 seed / 分辨率生成视觉金标截图 |
+
+分析脚本与内核共用同一套物理：`missile_g_analysis.fly()` 直接跑 `bvr-1v1` 对局并逐拍读取 `Missile.g_req` / `g_avail`，`missile_tracks` 复用同一份采样画弹道，不另写制导近似。
+
+## 配置文件
+
+机体、武器、场景与模型资产都在 `configs/` 下，换装只需改 YAML，不改代码：
+
+- `configs/aircraft/*.yaml`：气动、推进、传感器、挂载与 Agent 个性；`base_mass_kg` 是裸机重量，全重由挂载自动累加。
+- `configs/weapons/*.yaml`：导弹与干扰物参数。
+- `configs/scenarios/*.yaml`：队伍、初始几何、时限、物理步长与预警机。
+- `configs/assets/models.yaml`：OBJ 源文件、缩放、尾喷口与 Web 导出参数。
+
+配置使用人读单位（deg / km / kN / kg / m²），加载时统一换成 SI：
+
+```bash
+python -m dogfight validate configs          # 校验字段/单位/范围/引用
+python -m dogfight dump bvr-1v1              # 打印解析后的场景
+python -m dogfight --scenario bvr-1v1 --headless
+```
 
 ## 截图
 
-| | |
-| --- | --- |
-| ![超视距互射](docs/images/02_bvr.png) | ![防御机动](docs/images/03_defense.png) |
-| 超视距阶段 ~20 km 互射：SU-57 执行 F-pole 偏置保持照射，F-16V 横转下高（NOTCH_DESC）规避来弹 | 近距被锁后转入横转下高（NOTCH_DESC）规避，油门到加力，姿态框同步显示来袭方向 |
-| ![近距格斗](docs/images/04_dogfight.png) | ![结算](docs/images/05_result.png) |
-| 近距格斗（最近 615 m）：双方同时进入殷麦曼，轨迹上金色星标为导弹发射点、橙色菱形为高 G 机动点 | 对局结算，完整航迹与事件标记一并保留 |
-
-![全局轨迹](docs/images/global_track.png)
-
-每 10 s 采样的全局三维轨迹，颜色表示时间，箭头为机头朝向与翼展方向，附带全部导弹发射点与高 G 机动点。
-
-## Web 观战截图
-
-同一局（seed 见 `web/server.py --seed`）在浏览器端的画面，HUD 为 DOM 覆盖层，3D 场景由 three.js 实时渲染：
+同一局（`python -m dogfight.web --seed 3 --seconds 300`）在浏览器端的画面，HUD 为 DOM 覆盖层，3D 场景由 three.js 实时渲染，按浏览器原生分辨率截取：
 
 | | |
 | --- | --- |
 | ![开局](docs/images/06_web_opening.jpg) | ![超视距](docs/images/07_web_bvr.jpg) |
-| 开局 120 km 对头接近：双方站位分开，机体标签给出当前战术族与机动原语 | 超视距阶段：R-77-1 已在飞，F-16V 转入 `NOTCH_DESC`，右侧雷达屏显示两枚来袭弹 |
-| ![钟摆与诱饵](docs/images/08_web_defense.jpg) | ![终局缠斗](docs/images/09_web_dogfight.jpg) |
-| 低能量近距段：SU-57 拉 `GUNS · IMMELMANN` 抢位，下方橙色亮点是刚投放的热诱弹 | 终局：SU-57 用 `DIVE_OFFSET` 甩 AIM-9X，双方航迹绞在一起 |
+| 开局对头接近：双方相距约 100 km，机体标签给出当前战术族与机动原语 | 超视距：R-77-1 以约 344 m/s 逼近，弹目距离 20.9 km，两侧雷达进入 `TRACK` |
+| ![导弹防御](docs/images/08_web_defense.jpg) | ![近距缠斗](docs/images/09_web_dogfight.jpg) |
+| 导弹防御：SU-57 的 R-77-1 已压到 4.3 km，F-16V 横转脱离，双方同时处于机动 | 近距缠斗（弹目 1.6 km）：SU-57 拉 `IMMELMANN` 抢位，F-16V 开加力脱离 |
 
 ![结算](docs/images/10_web_result.jpg)
 
-对局结算：`F-16V WINS`，双方完整航迹与干扰物、导弹事件标记继续留在场上。
+对局结算：`F-16V WINS`（time-up, HP advantage），完整航迹与导弹/干扰物事件标记保留。
 
 ## 仿真模拟结果
 
@@ -197,56 +213,77 @@
 ```bash
 conda create -n dogfight python=3.10 -y
 conda activate dogfight
-pip install pygame numpy matplotlib imageio moderngl
+pip install pyyaml                   # 配置解析（运行时唯一第三方依赖）
+pip install pillow                   # 可选：重新生成机体轮廓图
 
-python main.py                      # 窗口观战（默认 6DOF、300 s、1920×1080）
-python main.py --headless --seconds 300
-python main.py --record out/match.mp4 --follow 0
-python main.py --ab-suite --seconds 300
+python -m dogfight                     # 终端跑一局（默认 6DOF、300 s）
+python -m dogfight --headless --seconds 300
+python -m dogfight --ab-suite --seconds 300
 
-python web/server.py                # 浏览器观战：http://127.0.0.1:8765/
-python web/server.py --seed 3 --seconds 300   # 固定开局复现实验
+python -m dogfight.web                 # 浏览器观战：http://127.0.0.1:8765/
+python -m dogfight.web --seed 3 --seconds 300   # 固定开局复现实验
 ```
 
-窗口模式操作：`ESC` 退出、`SPACE` 暂停、`R` 重置。
+`python main.py` 保留为等价入口（转发到 `python -m dogfight`）。
 
-浏览器观战支持同一套参数（`--dof`、`--baseline`、`--seed`、`--seconds`、`--f16-radar`、`--su57-radar`、`--no-awacs`）；默认每次启动随机占位，要复现某局请固定 `--seed`。浏览器内按 `SPACE` 暂停、`R` 重置、`F` 切换跟拍，鼠标拖动旋转、滚轮缩放。
+浏览器观战支持同一套参数（`--dof`、`--baseline`、`--seed`、`--seconds`、`--scenario`、`--radar-policy`、`--no-awacs`；旧的 `--f16-radar` / `--su57-radar` 仍可用）；默认每次启动随机占位，要复现某局请固定 `--seed`。浏览器内按 `SPACE` 暂停、`R` 重置、`F` 切换跟拍，鼠标拖动旋转、滚轮缩放。
+
+## 构建发行版
+
+```bash
+pip install build
+python -m build            # sdist 与 wheel 一并写到 dist/
+```
+
+版本号在 `pyproject.toml` 的 `version` 字段（当前 1.1.1）；`sdist` 通过 `MANIFEST.in` 带上 `configs/`、`assets/fonts`、`assets/silhouettes`、`assets/terrain`、`tools/`、`tests/` 与文档，解包后可直接 `python -m dogfight` 运行（原始 OBJ 模型体积大，仍按 `.gitignore` 排除，需自备）。
 
 ## 目录结构
 
 ```
-sim.py        动力学内核、裁判、导弹/干扰物/命中判定
-agents.py     几何态势判定 + 战术族/机动原语/控制层
-render.py     透视 3D 渲染、座舱 HUD、轨迹与特效
-main.py       入口、参数表、无头/录制/矩阵实验工具
-web/          浏览器观战服务（server.py）与 three.js 前端（static/）
-assets/       地面城市地图、机体俯视轮廓，以及 Web 端使用的原始 OBJ
-scripts/      生成贴图、机动演示与验证脚本
-docs/         进度文档与 README 截图
+dogfight/                 唯一的 Python 包
+  app/main.py             入口、参数表、无头/矩阵实验工具
+  core/sim.py             动力学内核、裁判、导弹/干扰物/命中判定
+  tactics/agents.py       几何态势判定 + 战术族/机动原语/控制层
+  view/                   three.js 观战端共享的模型/几何层 + HMI 颜色 token
+  web/                    浏览器观战服务（server.py）与 three.js 前端（static/）
+  specs/                  机体/武器规格与气动数值（无配置依赖）
+  config/                 YAML 解析、校验、注册表与场景
+  assets/                 模型资产注册表
+configs/                  机体、武器、场景与模型资产 YAML
+assets/                   原始 OBJ（aircraft/missiles）、字体、俯视轮廓、地形
+tools/                    维护脚本（轮廓/地形/对比度/金标）与实验分析脚本
+tests/                    单元测试与 golden 基线
+docs/                     设计文档、README 截图与独立前端示例
+out/                      实验产物（PNG/CSV/MP4，已 gitignore）
+dist/                     发行包（sdist / wheel，已 gitignore）
+main.py                   等价入口（转发到 python -m dogfight）
 ```
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [仿真模型与战术设计](docs/仿真模型与战术设计.md) | 动力学、感知层、战术 Agent、武器与判定的完整模型说明 |
+| [验证与飞行包线测试方案](docs/验证与飞行包线测试方案.md) | 三类证据与数值收敛 / 包线 / 蒙特卡洛的验证路线 |
+| [现实性评审复核与第二版修改验证方案](docs/现实性评审复核与第二版修改验证方案.md) | 评审 10 项问题的复核结论与第二版修改清单（历史文档） |
+| [HMI精细化改造方案](docs/HMI精细化改造方案.md) · [画面精致化方案](docs/画面精致化方案.md) · [场景渲染风格改造方案](docs/场景渲染风格改造方案.md) | pygame 软件渲染阶段的 HMI 规范（历史文档，渲染端已改 three.js） |
+| [progress-20261027.md](docs/progress-20261027.md) | 2026-10-27 的阶段性进展记录（历史文档） |
+| [docs/examples/flame_demo](docs/examples/flame_demo/index.html) | 独立的双发加力尾焰特效 demo |
 
 ## 模型资源
 
-机体模型与贴图体积较大（约 120 MB），未纳入版本库，需要自备：
+机体与导弹模型体积较大，未纳入版本库，需要自备；文件路径、真实尺寸与坐标换算器统一登记在 `configs/assets/models.yaml`。
 
-- `I154-SU-57战机/I154-SU-57战机_OBJ.obj`（含 mtl 与贴图）
-- `f_16c_model/f_16c.obj`（含贴图）
+- `assets/aircraft/SU57.obj`、`assets/aircraft/F16.obj`
+- `assets/missiles/R73.obj`、`assets/missiles/AIM9.obj`、`assets/missiles/R77.obj`、`assets/missiles/AIM120.obj`
 
-缺失时 `render.py` 无法加载模型，窗口与录制模式会报错；`--headless` 不依赖渲染，可直接运行。
+服务启动时会把它们换算到 three.js 机体系并导出到 `dogfight/web/static/models/`（生成物，已 gitignore），浏览器按 `MODEL_TAG` 拉取新版本，不会读到旧缓存。机体俯视轮廓与兜底模型也从同一份 OBJ 按 `voxel_m` 抽稀，因此轮廓、兜底与浏览器渲染的几何完全一致。
 
-Web 观战端优先读取另一组按真实尺寸归一过的 OBJ（同样不入库，缺失时自动退回体素模型）：
+缺少原始 OBJ 时 Web 观战端启动会报错并指出缺失文件；`--headless` 不依赖模型，可直接运行。
 
-- `assets/flighter/SU57.obj`、`assets/flighter/F16.obj`
-- `assets/missle/R73.obj`、`assets/missle/AIM9.obj`、`assets/missle/R77.obj`、`assets/missle/AIM120.obj`
+机体俯视轮廓由 OBJ 模型正交投影生成（已入库）：
 
-服务启动时会把它们重新采样并导出到 `web/static/models/`（生成物，已 gitignore），浏览器按 `MODEL_TAG` 拉取新版本，不会读到旧缓存。
-
-程序运行还依赖 `assets/` 下的两类生成贴图（已入库）：
-
-- `assets/terrain/city_map.png`：城市平面图原图（9000×9000）；`scripts/build_city_map.py` 会去掉底部标题/水印文字、按海/陆/绿地/建成区重着色为深蓝冷调，输出 4096×4096 的 `assets/terrain/city_ortho.png` 作为地面贴图。
-- `assets/silhouette/{su57,f16}_top.png`：由 OBJ 模型正交俯视投影生成的机体轮廓，`scripts/build_silhouettes.py` 重新生成，`top_views.png` 为两者拼图。
-
-地面贴图缺失时 `_draw_ground()` 直接跳过，3D 场景仍可运行但看不到城市底图。
+- `assets/silhouettes/{su57,f16}_top.png`：`python -m tools.maintenance.build_silhouettes` 重新生成，`top_views.png` 为两者拼图。
 
 ## 参数来源
 

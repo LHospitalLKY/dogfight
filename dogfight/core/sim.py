@@ -1,0 +1,3006 @@
+"""M2 内核：2DOF / 3DOF 点质量 + 6DOF 刚体狗斗模型。
+
+坐标约定
+--------
+x 向东、y 向北、z 向上（单位米），psi 为航向角（从 x 轴逆时针），
+gamma 为航迹倾角（抬头为正），v 为真空速（m/s）。
+
+2DOF/3DOF 控制量为过载 n（g）、滚转角 phi（rad）和油门：
+
+    v_dot  = (T - D)/m - g sin(gamma)
+    gamma_dot = g/v * (n cos(phi) - cos(gamma))
+    psi_dot   = g/(v cos(gamma)) * n sin(phi)
+
+6DOF 在此基础上把战术层的 (bank, n) 交给增稳内回路，翻译成副翼/升降舵/
+方向舵偏度，再由刚体六自由度方程（气动力/力矩 + 陀螺耦合 + 欧拉运动学）
+积分。机体系 x 前、y 右、z 下（右手系），phi 右滚为正、theta 抬头为正。
+
+比能量 E = g z + v^2/2，所以爬升与加速可以互相兑换（能量机动的基础）。
+"""
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+
+from dogfight.specs.aero import (
+    G,
+    _smoothstep,
+    air_density,
+    cd0_at,
+    clamp,
+    drag_divergence,
+    isa_temperature,
+    mach_number,
+    speed_of_sound,
+    thrust_lapse,
+)
+from dogfight.specs.aircraft import AircraftSpec
+from dogfight.specs.weapon import MissileSpec
+MAX_BANK = math.radians(80.0)      # 常规滚转角刻度（Action.bank=1 对应的角度）
+# 战术层允许指令到倒扣：Action.bank 以 MAX_BANK 为单位，最大可到 ±180°。
+BANK_CMD_MAX = math.pi / MAX_BANK
+# 航迹角/俯仰角不再被人为夹断：筋斗与半滚倒转都必须能越过 ±90°。
+# 只在 3DOF 的 psi_dot 坐标奇点处给一个角速度上限，避免 cos(gamma)->0 时数值爆掉。
+PSI_DOT_LIMIT = math.radians(70.0)
+N_MIN = -3.0                       # 战斗机负过载极限约 -3 g
+MISSILE_SLEW_RATE = math.radians(90.0)  # 弹体轴转向目标视线的最大角速度
+# 弹体轴与速度矢量的最大夹角（可用迎角）。弹体可以比速度矢量转得快，
+# 但迎角超过气动极限后翼面失速、升力反而下降。近距弹在大迎角下靠
+# 气动舵面 + 助推段推力沿弹体轴的转弯分量获得很高的初始转向能力，
+# 这也是 R-73/AIM-9X 能做大离轴发射的物理基础。
+MISSILE_ALPHA_MAX = math.radians(20.0)
+# 预点火段的姿态角限制：此时主发动机未点火，弹体靠 RCS/燃气发生器主动摆头，
+# 姿态不受气动升力限制（弹体可以指向速度矢量的侧方甚至接近正侧方），
+# 因此允许把弹体轴摆到离速度矢量很大的角度，对准目标后再点火。
+RCS_ALPHA_MAX = math.radians(85.0)
+# 点火后姿态角限制从 RCS_ALPHA_MAX 收敛到气动极限 MISSILE_ALPHA_MAX 的时间 s：
+# 点火瞬间推力沿弹体轴把速度矢量迅速拉向弹体轴，迎角随之自然收敛，
+# 这里用一个短过渡避免弹体轴在点火瞬间硬跳回 20° 锥内。
+IGNITION_ALPHA_BLEND = 0.35
+# 离轴发射的自身安全：前推 1.5 s 弹道，若弹与载机的最近距离小于
+# 战斗部杀伤半径 + 该余量，就视为“可能把自己打下来”，放弃这次发射。
+# 大离轴角 + 载机低速时转弯半径很小，弹有可能在载机前方掉头时擦过自己。
+SELF_HIT_MARGIN = 45.0      # m
+SELF_HIT_HORIZON = 1.5      # s
+SELF_HIT_DT = 0.02          # s
+
+
+# ---------- 主动减速（减速板 / 扰流板 / 差动舵面） ----------
+# 战斗机靠减速板、扰流板、垂尾方向舵差动与可动鸭翼来“主动减速”，
+# 而不是只能收油门等阻力。这里按等效零升阻力系数增量建模：全开时
+# 额外增加 BRAKE_CD 的阻力系数，作用在机翼参考面积上。
+# 0.08 约相当于 2.2 m² 的等效阻力板（F-16 的减速板约 0.8 m²，Su-57
+# 没有独立减速板但能用差动舵面/鸭翼产生几倍于它的阻力），
+# 300 m/s、9 km 高度下大约产生 0.3–0.4 g 的减速度，足够在几秒内
+# 从高速压到角点速度，又不会让飞机瞬间掉到失速。
+BRAKE_CD = 0.08
+
+# 载机雷达对目标的照射/数据链锥：半主动弹全程需要，主动弹只在末段截获前需要。
+SARH_ILLUM_FOV = math.radians(60.0)
+
+# ---------- 发动机功率设置：军用推力 / 加力 ----------
+# 涡扇有两个明显不同的功率区间：军用推力（不开加力）与加力推力。
+# 单位耗油率按公开量级折算成 kg/(N·s)：军推约 0.67 lb/(lbf·h)，
+# 加力约 1.97 lb/(lbf·h)，即加力的油耗约为军推的三倍。
+TSFC_MIL = 1.90e-5   # kg/(N·s)，军推
+TSFC_AB = 5.60e-5    # kg/(N·s)，加力
+
+# ---------- 雷达隐身 ----------
+# 雷达方程里探测距离与目标 RCS 的四次方根成正比。RCS_REF 取 1 m²，
+# 所有机载雷达/导引头的标称距离都按这个基准值给出。
+RCS_REF = 1.0
+
+# ---------- 机炮扳机窗口 ----------
+GUN_TRIGGER_RANGE_FRAC = 0.90   # 扳机窗口的射程 = 机炮射程 × 该系数
+GUN_TRIGGER_CONE = math.radians(15.0)  # 扳机窗口的半锥角
+# 扳机是“压住扳机打连发”，不是“只在精确炮口解那一瞬扣一下”：0.1 s 的决策
+# 延迟内机头会多次穿越 8° 门限，只按决策时刻的 in_gun_cone 放弹，真正的
+# 炮口解几乎必然漏掉。所以 Agent 用更宽的扳机窗口，弹丸照常沿炮线出膛，
+# 命中仍由外弹道与散布决定——打偏的弹是真实的浪费，而不是被代码吞掉。
+
+
+def rcs_scale(rcs: float) -> float:
+    """目标 RCS 对雷达探测距离的缩放系数（相对 1 m²）。"""
+    return (max(rcs, 0.001) / RCS_REF) ** 0.25
+
+
+# ---------- 感知层：传感器等级与视场 ----------
+# 接触质量分四级，战术层只认“能拿到多少信息”：
+# 0 无接触；1 仅探测/告警（只有方位，无距离）；2 稳定跟踪（有距离/角度，
+# 可做 IRST/光电/目视/预警机/侧阵）；3 火控级（本机机头雷达照射，才能
+# 发射雷达制导中距弹）。
+CONTACT_NONE = 0
+CONTACT_DETECT = 1
+CONTACT_TRACK = 2
+CONTACT_FIRE = 3
+
+# 机头雷达火控照射锥（半角）：与 SARH 照射锥同源，但探测可以更宽。
+RADAR_FIRE_FOV = SARH_ILLUM_FOV
+RADAR_DETECT_FOV = math.radians(90.0)
+# Su-57 的侧阵：相对机头 ±35°–145°，探测距离为机头阵的 0.55 倍，
+# 只能形成 track，不能给中距弹提供火控。
+SIDE_ARRAY_MIN = math.radians(35.0)
+SIDE_ARRAY_MAX = math.radians(145.0)
+SIDE_ARRAY_SCALE = 0.55
+# Su-57 的 L 波段襟翼雷达：前向 ±45°，200 km，仅探测。
+LBAND_FOV = math.radians(45.0)
+LBAND_RANGE_REF = 200000.0
+# 红外搜索跟踪（IRST）：被动，±30° 视场；开加力时尾焰更亮，探测距离 ×1.5。
+IRST_FOV = math.radians(30.0)
+IRST_AB_BOOST = 1.5
+# 目视：迎头/尾后约 9 km、侧向约 11 km，全向，给 tally（角度+粗距离）。
+VISUAL_HEAD_TAIL = 9000.0
+VISUAL_SIDE = 11000.0
+# 预警机：400 km @1 m²，10 s 更新一次，只给 track（不能当火控）。
+AWACS_RANGE_REF = 400000.0
+AWACS_UPDATE = 10.0
+# 无目视接触（tally）时机炮仍可开火，但散布 ×2.5，且只允许 600 m 内。
+GUN_NO_TALLY_RANGE = 600.0
+GUN_NO_TALLY_SPREAD = 2.5
+
+
+def directional_rcs(ac: "Aircraft", sensor_pos) -> float:
+    """目标在某个传感器方向上的 RCS（前/侧/后分向）。
+
+    隐身修形主要压前向回波：迎头时 RCS 最小，侧向次之，尾后最大。
+    传感器位于目标机头前方（角度≈0）取 rcs_front，正侧方取 rcs_side，
+    尾后取 rcs_back；三段之间线性过渡，避免方位角抖动导致探测距离跳变。
+    """
+    spec = ac.spec
+    front = spec.rcs_front if spec.rcs_front > 0.0 else spec.rcs
+    side = spec.rcs_side if spec.rcs_side > 0.0 else spec.rcs
+    back = spec.rcs_back if spec.rcs_back > 0.0 else spec.rcs
+    try:
+        nx, ny, nz = nose_direction(ac)
+        dx = sensor_pos[0] - ac.x
+        dy = sensor_pos[1] - ac.y
+        dz = sensor_pos[2] - ac.z
+        d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if d < 1e-6:
+            return front
+        cosang = clamp((nx * dx + ny * dy + nz * dz) / d, -1.0, 1.0)
+    except AttributeError:
+        # 测试里可能传入只有 spec 的假目标：退化为全向 RCS。
+        return front
+    ang = math.acos(cosang)
+    if ang <= math.radians(60.0):
+        return front
+    if ang >= math.radians(120.0):
+        return back
+    if ang <= math.radians(90.0):
+        t = (ang - math.radians(60.0)) / math.radians(30.0)
+        return front + (side - front) * t
+    t = (ang - math.radians(90.0)) / math.radians(30.0)
+    return side + (back - side) * t
+
+
+def military_endurance(spec: "AircraftSpec", fuel: float) -> float:
+    """剩余燃油按军用推力折算的可持续秒数（跨机型统一的“还能打多久”口径）。
+
+    燃料流量 ≈ 军推 × 军推耗油率。Bingo 约束与超时裁决都用这一口径，
+    而不是“燃油百分比”：Su-57 与 F-16 的油箱、发动机差了一个量级，
+    只有换算成时间，两边的续航才可比。
+    """
+    if spec.fuel_capacity <= 0.0:
+        return float("inf")
+    return max(fuel, 0.0) / max(spec.mil_thrust() * TSFC_MIL, 1e-9)
+
+# 导弹的终端物理：动压不足时舵面已经压不出升力，导弹只能按弹道坠落。
+MISSILE_MIN_Q = 1200.0          # Pa，低于该动压判定失去控制能力
+MISSILE_FALL_SPEED = 120.0      # m/s，无控弹减速到该值近似为坠落
+# 远程半主动弹的 loft 弹道：助推段先把“虚拟瞄准点”抬到目标上方，末段再压回来，
+# 用高度换射程。直接加向上的加速度会被比例导引拉回视线，抬不起来，
+# 所以这里改成抬高制导视线的仰角，让弹用自身可用过载飞出拱形弹道。
+MISSILE_LOFT_ANGLE = math.radians(18.0)  # 抬升段的最大视线仰角偏置
+MISSILE_LOFT_TIME = 10.0        # s，抬升段持续时间（前 60% 满偏置，之后线性收回）
+MISSILE_LOFT_MIN_RANGE = 9000.0  # m，只有远距发射才抬升
+
+# ---------- 中距弹发射决策的命中概率估计 ----------
+# 不可逃逸区取有效雷达包线的该比例：再远，目标有足够时间掉头把弹拖进尾追，
+# 弹的末端能量撑不到近炸半径。
+NEZ_FRACTION = 0.55
+# 目标已经在逃逸（速度背离本机）时，不可逃逸区按该系数进一步缩水。
+NEZ_ASPECT_PENALTY = 0.45
+# 概率曲线的过渡带宽度（相对 NEZ）：越小，越接近“进了 NEZ 才算高效”。
+PK_TRANSITION = 0.22
+
+# ---------- 机载干扰物（箔条 / 红外热诱弹） ----------
+# 箔条是金属丝云，对雷达导引头形成强反射；热诱弹是高温燃烧源，骗红外导引头。
+# 两者都由机载投放器自动/手动投放，离开载机后迅速减速、随风飘落。
+CHAFF_LIFE = 4.0            # s，箔条云有效持续时间
+FLARE_LIFE = 2.5            # s，热诱弹燃烧时间
+CHAFF_SEDUCE_RANGE = 2000.0  # m，箔条对雷达导引头的有效诱骗距离
+FLARE_SEDUCE_RANGE = 1800.0  # m，热诱弹对红外导引头的有效诱骗距离
+CHAFF_SEDUCE_RATE = 0.28     # 1/s，箔条每秒诱骗成功的概率
+FLARE_SEDUCE_RATE = 0.28     # 1/s，热诱弹每秒诱骗成功的概率
+# 自动投放距离必须落在导引头的有效诱骗距离附近，而不是越远越好：
+# 干扰物寿命只有几秒，在 5 km 外撒出去，等弹飞到早就烧完/飘散了。
+AUTO_CHAFF_RANGE = 3500.0    # m，雷达弹逼近到该距离自动投箔条
+AUTO_FLARE_RANGE = 2000.0    # m，红外弹逼近到该距离自动投热诱弹
+CM_DROP_CD = 1.5             # s，同一种干扰物的投放间隔
+CM_DECOY_KEEP = 1.5          # s，诱骗成功后导弹继续追诱饵的时间
+# 引信/点火延迟：干扰物离机后要经过点火、展开才能形成有效回波/热源，
+# 这个窗口内它骗不走任何导引头。没有这一项，干扰弹等于“撒手即生效”，
+# 近距弹在 5 km 内几乎百分之百被诱骗。
+CM_ARM_TIME = 0.5            # s，投放后生效延迟
+# 热诱弹按“连投”使用：一次投放 2 枚，形成一片红外诱饵云，而不是单发。
+FLARE_SALVO = 2              # 枚/次，一次投放消耗的热诱弹数量
+# 热诱弹的近界：几百米内载机几乎占满导引头视场，诱饵脱离视场的速度也最快，
+# 此时已经进入末段跟踪的弹基本骗不走；诱骗概率从这个距离起线性衰减。
+FLARE_MIN_SEDUCE_RANGE = 400.0  # m，近于此距离热诱弹诱骗率归零
+# 箔条只有和载机落在同一个多普勒通道里才骗得走雷达导引头：迎头/尾追时
+# 载机径向速度很大，箔条一撒出去就和载机分开，所以必须配合横转/三九投放。
+CHAFF_NOTCH_MIN = 0.55       # 横转程度（0=迎头/尾追，1=正侧方）低于该值不投放
+
+# ---------- 近炸引信的杀伤概率 ----------
+# 破片战斗部不是“进圈即必杀”：中心命中概率约 0.9，越靠边缘越低，
+# 交会速度越高引信/战斗部的有效作用窗口越短，还要再打折。
+PK_CENTER = 0.95
+PK_DECAY = 2.2
+
+
+
+
+
+def proximity_pk(miss_dist: float, lethal_radius: float,
+                 decay: float = PK_DECAY) -> float:
+    """近炸引信触发后的杀伤概率（0–0.95）。
+
+    以脱靶量相对战斗部半径归一化：正中心约 0.95，等于引信半径时约 0.10。
+    破片在这个范围内快速稀疏，所以按平方指数衰减。decay 按弹种可调：
+    近距弹战斗部相对目标更大，脱靶几米内仍是高杀伤，衰减比中距弹缓。
+    """
+    d = clamp(miss_dist / max(lethal_radius, 1e-3), 0.0, 4.0)
+    return clamp(PK_CENTER * math.exp(-decay * d * d), 0.0, 0.95)
+
+
+def notch_quality(ac: "Aircraft", mx: float, my: float, mz: float) -> float:
+    """载机相对来袭弹的横转程度：0=迎头/尾追，1=正侧方。
+
+    箔条离机后迅速减速，只有载机几乎不带径向速度（三九/横转）时，
+    箔条云与载机才处于同一多普勒通道，导引头才会被诱走。
+    """
+    dx, dy, dz = mx - ac.x, my - ac.y, mz - ac.z
+    d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    vx, vy, vz = world_velocity(ac)
+    radial = abs((vx * dx + vy * dy + vz * dz) / max(d, 1e-6))
+    return clamp(1.0 - radial / max(ac.v, 1.0), 0.0, 1.0)
+
+
+# ---------- 多普勒雷达的速度盲区（物理盲区） ----------
+# 脉冲多普勒雷达不是“看到回波就能跟踪”：它先做多普勒滤波，靠目标相对
+# 地面杂波的径向速度把回波从杂波里挑出来。目标正侧方横穿时径向速度
+# 趋近 0，回波落进主瓣杂波凹口，距离再近也看不见——这就是 BVR 里的
+# “多普勒盲区 / notch”，也是三九机动的物理依据。
+MDV_RADAR = 30.0        # m/s，机载雷达最小可检测径向速度
+MDV_SEEKER = 15.0       # m/s，弹载主动导引头（带宽更窄、平台更快）
+NOTCH_BAND = 15.0       # m/s，从完全盲区到稳定跟踪的过渡带宽度
+# 盲区不是“一帧丢锁”：目标横穿时回波短暂落进杂波凹口，导引头会丢几拍，
+# 但只要它退出盲区就还能重新捕获；只有连续盲这么久才真正转无控。
+MISSILE_BLIND_MAX = 2.0     # s，主动导引头连续盲区容忍时间
+MISSILE_FOV_MAX = 1.0       # s，连续越出导引头视场的容忍时间
+MISSILE_MIDCOAST_MAX = 2.0  # s，中制导失照后惯导/数据链外推的容忍时间
+# 下视时地面杂波把多普勒谱展宽，等效 MDV 抬高；高差越大越明显。
+LOOKDOWN_MDV_GAIN = 0.55
+LOOKDOWN_REF_DZ = 4000.0
+
+
+def doppler_visibility(pos, tgt_pos, tgt_vel, mdv=MDV_RADAR,
+                       band=NOTCH_BAND, lookdown=0.0) -> float:
+    """目标相对雷达/导引头的多普勒可见度（0=掉进杂波凹口，1=稳定可见）。
+
+    这里只取**目标自身（对地）速度**在视线上的投影：多普勒凹口是对着地杂波
+    开的，载机/导弹自身的运动在“目标－杂波”的相对多普勒里正好抵消，
+    所以同速尾追并不必然致盲，真正致盲的是目标自己横穿到径向速度≈0。
+    `lookdown` 是下视杂波对 MDV 的放大系数（0 表示不抬高）。
+    """
+    dx = tgt_pos[0] - pos[0]
+    dy = tgt_pos[1] - pos[1]
+    dz = tgt_pos[2] - pos[2]
+    d = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d < 1e-6:
+        return 1.0
+    radial = abs((tgt_vel[0] * dx + tgt_vel[1] * dy + tgt_vel[2] * dz) / d)
+    gate = mdv * (1.0 + lookdown)
+    return clamp((radial - gate) / max(band, 1e-6), 0.0, 1.0)
+
+
+def radar_visibility(ac: "Aircraft", foe: "Aircraft",
+                     mdv: float = MDV_RADAR) -> float:
+    """载机雷达对目标的多普勒可见度，含下视杂波对 MDV 的抬高。"""
+    dz = ac.z - foe.z
+    lookdown = LOOKDOWN_MDV_GAIN * clamp(dz / LOOKDOWN_REF_DZ, 0.0, 1.0)
+    return doppler_visibility(
+        (ac.x, ac.y, ac.z), (foe.x, foe.y, foe.z), world_velocity(foe),
+        mdv=mdv, lookdown=lookdown,
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def wrap_pi(angle: float) -> float:
+    """把角度收敛到 (-pi, pi]。"""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+@dataclass
+class Action:
+    """Agent 的输出，3DOF 的原始控制量。
+
+    bank 是滚转角比例 [-1, 1]，映射到 ±MAX_BANK；
+    n 是期望过载 (g)，World 会按结构/升力限制裁剪。
+    """
+
+    bank: float = 0.0
+    n: float = 1.0
+    throttle: float = 1.0
+    afterburner: float = 0.0      # 加力开度 0..1，与 throttle 独立
+    fire: bool = False
+    launch: bool = False          # 本决策周期请求发射一枚格斗弹
+    launch_radar: bool = False    # 本决策周期请求发射一枚雷达制导中距弹
+    post_stall: bool = False      # 过失速指令：把机头拉到矢量喷口可维持的超大迎角
+    # 垂直机动（筋斗/半滚倒转/殷麦曼）用：过顶时机体滚转必须自由演化，
+    # 否则内回路会一直把欧拉滚转角拽向地平线，飞机根本过不了顶。
+    roll_free: bool = False
+    # 桶滚用：直接给滚转角速度指令 (rad/s)，正值与 bank 同号（左滚）。
+    roll_rate: float = 0.0
+    # 俯仰角速度直接指令 (rad/s)，正值抬头。钟摆/库尔比特这类要连续绕过顶
+    # 360° 的动作靠它：按迎角指令最多把机头拉到失速迎角就停住，过不了顶。
+    pitch_rate: float = 0.0
+    # 舵面偏航用：直接给偏航角速度指令 (rad/s)，正值机头右偏。
+    # 与 roll_rate 的区别是它只动方向舵，机体不滚转——克沃丘尔钟摆
+    # 那种“机头拉起的同时靠舵面把机头甩向一侧”就靠这一路。
+    yaw_rate: float = 0.0
+    # 三元矢量喷口的偏航偏角（归一化 -1..1，正值机头右偏）。近零速段
+    # 方向舵没有动压、给不出偏航力矩，只有 TVC 能直接施加偏航力矩；
+    # 非矢量机型保持 0（退回方向舵）。
+    tvc_yaw: float = 0.0
+    # 主动减速：0..1 的减速板/扰流板开度，直接叠加额外零升阻力。
+    brake: float = 0.0
+    # 机载雷达开关请求：None=保持现状。静默伏击时关掉发射源，
+    # 对方 RWR 收不到告警，本机也拿不到火控级接触（不能发中距弹）。
+    radar_on: bool | None = None
+
+
+@dataclass
+class Observation:
+    """给 Agent 的观测，不含任何未来状态。"""
+
+    # 相对几何
+    dist: float
+    dist_h: float
+    dz: float                    # 对方高度 - 本机高度
+    los_az: float                # 视线水平方位（世界系）
+    los_el: float                # 视线仰角
+    off_az: float                # 视线相对机头的水平偏差
+    off_el: float                # 视线相对航迹的俯仰偏差
+    angle_off_nose: float        # 三维机头指向误差
+    aspect: float                # 对方机尾与视线的夹角：0=我咬尾，180=对头
+    foe_off_nose: float          # 对方机头指向我的角度
+    closure: float               # 接近率，正为接近
+    in_gun_range: bool
+    in_gun_cone: bool
+    # 扳机窗口：比 900 m / 8° 的炮口锥宽一圈。飞行员在接近炮口解时就压住
+    # 扳机，实际出膛由火控按每个物理步的瞬时炮口解放行——0.1 s 的决策
+    # 延迟足以让机头在门限内外穿越好几次，只看决策时刻必然漏掉真正的窗口。
+    in_gun_trigger: bool
+
+    # 本机状态
+    own_speed: float
+    own_speed_frac: float        # 当前速度 / 失速速度
+    own_alt: float
+    own_psi: float
+    own_gamma: float
+    own_n_avail: float
+    own_n: float                 # 当前实际过载
+    own_n_sustain: float         # 该高度/速度能长期维持的过载
+    own_ps: float                # 当前过载下的比剩余功率 (m/s)
+    own_ps_level: float          # 1g 平飞时的比剩余功率 (m/s)，<0 即超过能量升限
+    own_hp: float
+    own_hp_frac: float
+    own_ammo: float
+
+    # 对方状态
+    foe_speed: float
+    foe_alt: float
+    foe_psi: float
+    foe_gamma: float
+    foe_hp: float
+    foe_hp_frac: float
+
+    # 能量与空间
+    energy_diff: float           # 本方比能量 - 对方比能量
+    edge_margin: float           # 到水平空域边界的最小距离
+    z_margin_low: float          # 距地面的余量
+    z_margin_high: float         # 距高度上限的余量
+    center_az: float             # 指向空域中心的水平方位
+    # 对方到水平边界的最小距离：围堵补射用它判断对手的横向逃逸空间是否
+    # 已经被压缩（贴边时再补一发，对手只能往一个方向转）。
+    foe_edge_margin: float = 1e9
+
+    # 机头姿态：6DOF 下炮口方向与航迹方向存在迎角/侧滑偏置
+    own_nose_az: float = 0.0
+    own_nose_el: float = 0.0
+    # 滤波后的目标航迹角速度（rad/s）：轨迹预测按它积分，而不是只沿速度
+    # 切线外推。目标在回旋时预测点会沿圆弧走，不会飘到切线方向上去。
+    foe_psi_rate: float = 0.0
+    foe_gamma_rate: float = 0.0
+    # 目标速度矢量的方向（航迹角）：6DOF 下与机头 foe_psi/foe_gamma 差一个
+    # 迎角/侧滑角，外推轨迹必须用速度方向，否则 1 s 内会有几十米的横向偏差。
+    foe_track_psi: float = 0.0
+    foe_track_gamma: float = 0.0
+    own_bank: float = 0.0            # 当前滚转角 rad，用于限制规避动作的爬升
+    # 当前侧滑角 rad：舵面混控里会叠加 0.6β 的侧滑对齐项，战术层要给方向舵
+    # 一个明确的偏航指令时，必须把它扣掉，否则大侧滑下舵面会反向。
+    own_beta: float = 0.0
+    dof: int = 3                     # 当前内核自由度，过失速只在 6DOF 生效
+    own_tvc: bool = False            # 本机是否带推力矢量喷口
+    own_fuel_frac: float = 1.0       # 剩余燃油比例
+    # 剩余燃油按军推折算的续航秒数（见 military_endurance）：Bingo 判据与
+    # 超时裁决的统一口径，不同机型的油箱/耗油率因此可以直接比较。
+    own_mil_endurance: float = 0.0
+    own_ab: bool = False             # 当前是否在开加力
+    own_thrust_frac: float = 0.0     # 当前推力 / 最大加力推力
+    own_cruise_throttle: float = 0.8  # 维持当前速度所需的军推油门（巡航功率）
+
+    # 近距格斗弹：锁定需要目标持续留在导引头视场内累计时间
+    own_missiles: int = 0
+    own_missiles_in_flight: int = 0   # 仅统计近距红外弹，中距弹另见 own_radar_in_flight
+    own_locked: bool = False
+    own_lock_progress: float = 0.0   # 0..1，达到 1 即完成锁定
+    in_missile_envelope: bool = False
+    missile_nez: bool = False         # 目标是否已在近距弹不可逃逸区
+    missile_pk_est: float = 0.0       # 现在发射近距弹的估计命中概率
+    missile_min_range: float = 0.0
+    missile_max_range: float = 0.0
+    foe_missiles: int = 0
+    foe_locked: bool = False            # 对方是否已经锁定本机
+    foe_lock_progress: float = 0.0      # 对方锁定进度 0..1
+    incoming_missile_dist: float = 1e9   # 最近一枚向我发射的在飞弹距离
+    incoming_missile_az: float = 0.0     # 该弹相对机头的水平方位
+    incoming_missile_ttg: float = 1e9    # 该弹预计命中时间 s（按接近率估算）
+    incoming_missile_sarh: bool = False  # 该弹是否为半主动雷达制导（需要载机持续照射）
+    incoming_missile_radar: bool = False # 该弹是否为雷达制导（含主动弹，告警距离更远）
+    incoming_missile_guided: bool = False # 该弹是否仍在制导（丢制导后只剩惯性弹道）
+
+    # 雷达制导中距弹：发射前需要雷达稳定跟踪；主动弹在中制导段仍需载机
+    # 提供目标信息（数据链），末段自主截获后才完全脱离。
+    own_radar_missiles: int = 0
+    own_radar_in_flight: int = 0
+    own_radar_support: bool = False       # 仍有在飞雷达弹需要载机照射/数据链
+    own_radar_ttg: float = 1e9            # 我方在飞中距弹预计命中对方的时间 s
+    own_radar_locked: bool = False
+    own_radar_lock_progress: float = 0.0
+    in_radar_envelope: bool = False
+    radar_tracking: bool = False          # 目标仍在雷达照射范围内
+    radar_min_range: float = 0.0
+    radar_max_range: float = 0.0
+    # 弹上主动导引头截获距离（按目标 RCS 缩放）：发射后飞到该距离内就
+    # 转成“发射后不管”。远于这个距离发射，弹要在载机照射下飞很长一段
+    # 中制导，对手一横转/三九就能把照射打断，实际命中率远低于静态估计。
+    radar_active_range: float = 0.0
+    foe_radar_missiles: int = 0
+    foe_radar_locked: bool = False
+    # 中距弹发射决策：现在发射的估计命中概率，以及目标是否已在不可逃逸区。
+    # pk 来自“目标按最优逃逸”的弹道前推，NEZ 表示那样也躲不掉。
+    radar_pk_est: float = 0.0
+    radar_nez: bool = False
+
+    # ---- 感知层 ----
+    # contact: 0 无接触 / 1 仅探测或告警（只有方位）/ 2 稳定跟踪 / 3 火控级。
+    # 只有 quality>=2 时上面的 foe_* 几何才有效；quality<2 时给搜索方位。
+    contact: int = 0
+    contact_quality: int = 0
+    tally: bool = False            # 目视接触（决定机炮精度）
+    rwr: bool = False              # 对方雷达正在照射本机（只有方位）
+    rwr_az: float = 0.0            # RWR 告警相对机头的方位
+    radar_on: bool = True          # 本机雷达当前是否开机
+    foe_radar_on: bool = False     # 对方雷达是否开机（RWR 可推断）
+    gun_accuracy: float = 1.0      # 机炮散布倍率；无目视接触时 >1
+
+
+@dataclass
+class Aircraft:
+    spec: AircraftSpec
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    psi: float = 0.0
+    gamma: float = 0.0
+    v: float = 200.0
+    hp: float = 100.0
+    ammo: float = 300.0
+    alive: bool = True
+    n: float = 1.0
+    bank: float = 0.0
+    # 滤波后的航迹角速度（rad/s），由 _integrate 每步从速度矢量的方向变化
+    # 求出：轨迹预测与 UI 的预测点都按它积分，2/3/6DOF 口径一致。
+    # track_psi/track_gamma 是速度矢量的方向（航迹角），6DOF 下与机头
+    # psi/gamma 相差一个迎角/侧滑角，不能混用。
+    track_psi: float = 0.0
+    track_gamma: float = 0.0
+    psi_rate: float = 0.0
+    gamma_rate: float = 0.0
+    throttle: float = 1.0
+    ab: float = 0.0               # 当前加力开度 0..1
+    fuel: float = 0.0             # 剩余燃油 kg
+    thrust: float = 0.0           # 当前总推力 N（供 HUD / 尾焰读数）
+    firing: bool = False          # 本物理步是否在开火，供渲染层画炮口特效
+
+    # ---- 近距格斗弹状态 ----
+    missiles: int = 0             # 剩余挂弹数
+    mass: float = 0.0             # 含剩余挂弹的当前质量；0 表示沿用 spec.mass
+    locked: bool = False
+    lock_timer: float = 0.0
+    launch_cd: float = 0.0
+
+    # ---- 雷达制导中距弹状态 ----
+    radar_missiles: int = 0
+    radar_locked: bool = False
+    radar_lock_timer: float = 0.0
+    radar_cd: float = 0.0
+
+    # ---- 干扰物余量与投放冷却 ----
+    chaff: int = 0
+    flares: int = 0
+    chaff_cd: float = 0.0
+    flare_cd: float = 0.0
+
+    # ---- 6DOF 刚体状态 ----
+    # 机体系：x 前、y 右、z 下（右手系）；phi 右滚为正、theta 抬头为正。
+    rigid: bool = False          # 是否由刚体方程驱动
+    u: float = 200.0
+    vb: float = 0.0
+    wb: float = 0.0
+    p: float = 0.0
+    q: float = 0.0
+    r: float = 0.0
+    phi: float = 0.0
+    theta: float = 0.0
+    # 姿态四元数 (w,x,y,z)，机体系→世界系。数值积分只更新四元数，
+    # phi/theta/psi 是每步由它反解的派生量（见 euler_from_quat）。
+    quat: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
+    # 本物理步矢量喷口的实际偏转指令（rad，正=抬头方向），供观战与诊断使用。
+    tvc_cmd: float = 0.0
+    # 机炮待发弹丸的累计余量：射速高于物理步频时，按帧补发而不是每帧固定一发。
+    gun_pending: float = 0.0
+    # 越过验证高度上限只记录一次事件，不再判定“解体”。
+    ceiling_warned: bool = False
+
+    # ---- 感知层状态（World._update_sensors 每步写入） ----
+    radar_on: bool = True          # 机载雷达是否开机（会暴露给对手 RWR）
+    contact: int = 0               # 对目标的接触等级 0/1/2/3
+    tally: bool = False            # 是否目视接触
+    rwr: bool = False              # 是否收到对方雷达照射告警
+    rwr_az: float = 0.0            # 告警方位（相对本机机头）
+    last_known: tuple[float, float, float] | None = None   # 最后已知目标位置
+    last_known_t: float = -1e9     # 最后接触时刻
+
+    @property
+    def energy(self) -> float:
+        """比能量 (J/kg)：高度与速度的统一记账单位。"""
+        return G * self.z + 0.5 * self.v * self.v
+
+    @property
+    def weight(self) -> float:
+        """当前全机重量，随格斗弹发射实时下降。"""
+        return (self.mass if self.mass > 0.0 else self.spec.mass) * G
+
+    @property
+    def velocity(self) -> tuple[float, float, float]:
+        return world_velocity(self)
+
+
+@dataclass
+class Missile:
+    """在飞格斗弹：点质量 + 比例导引 + 有限舵面过载 + 近炸引信。
+
+    速度矢量直接在世界系积分，机体轴近似取速度方向。
+    """
+
+    spec: MissileSpec
+    owner: int
+    target: int
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+    mass: float
+    fuel: float
+    t: float = 0.0
+    alive: bool = True
+    guided: bool = True          # 导引头是否仍咬住目标
+    active: bool = False         # 主动雷达弹是否已进入末段自主截获（pitbull）
+    # 弹体轴：发射瞬间沿挂架/机头，之后以有限角速度对准速度矢量。
+    # 导引头视场是相对弹体轴的，不能直接用速度方向，否则大迎角发射会瞬间丢锁。
+    nx: float = 0.0
+    ny: float = 0.0
+    nz: float = 1.0
+    # 被干扰物诱骗：decoy 是诱饵点（箔条云/热诱弹），decoy_t 归零后导弹转无控。
+    decoy: tuple[float, float, float] | None = None
+    decoy_t: float = 0.0
+    # 短暂失锁的计时：盲区/出视场/中制导失照都先按“外推”处理，超时才真丢。
+    blind_t: float = 0.0         # s，主动导引头连续处于多普勒盲区的时长
+    fov_t: float = 0.0           # s，连续越出导引头视场的时长
+    mid_t: float = 0.0           # s，中制导失去载机照射/数据链的时长
+    # 自动驾驶仪状态：当前实际建立的横向加速度 N，按一阶滞后跟踪制导指令。
+    gx: float = 0.0
+    gy: float = 0.0
+    gz: float = 0.0
+    # 近炸命中的随机源：按发射时刻与发射方定种，保证实验可复现。
+    roll_seed: int = 0
+    # 主发动机点火状态：近距弹离架后先用 RCS 摆姿态，对准后才点火；
+    # 点火时刻之前的推力、燃气舵窗口都从 t_ign 起算。
+    ignited: bool = True
+    t_ign: float = 0.0
+    # 每步制导遥测：PN 算出的需用过载、当前状态下的可用过载（单位 g）。
+    # 需用过载是钳位/舵机滞后之前的原始指令，可用过载是结构与动压的合成上限。
+    g_req: float = 0.0
+    g_avail: float = 0.0
+
+    @property
+    def speed(self) -> float:
+        return math.sqrt(self.vx * self.vx + self.vy * self.vy + self.vz * self.vz)
+
+    @property
+    def position(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
+@dataclass
+class Countermeasure:
+    """一枚已投放的干扰物（箔条云或热诱弹）。
+
+    离开载机后按指数减速并受重力下落，寿命结束后失效；导弹可以锁定它，
+    从而把原本指向载机的制导回路骗到诱饵上。
+    """
+
+    kind: str                    # "chaff" 箔条 / "flare" 热诱弹
+    owner: int
+    x: float
+    y: float
+    z: float
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+    t: float = 0.0
+    life: float = CHAFF_LIFE
+    alive: bool = True
+    # 投放时的横转程度（0=迎头/尾追，1=正侧方）：箔条只有落在载机同一
+    # 多普勒通道里才骗得走导引头，所以这个值直接缩放诱骗概率。
+    quality: float = 1.0
+
+    @property
+    def position(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
+@dataclass
+class Bullet:
+    """一发机炮外弹道弹丸。
+
+    旧实现是“炮口在视锥内就按秒伤扣血”，命中与飞行时间无关，也没有
+    提前量/下坠。现在弹丸按真实初速（载机速度 + 炮口速度）、高斯散布、
+    二次阻力与重力飞行，命中用线段-球判定，单发伤害 = gun_dps/射速。
+    """
+
+    owner: int
+    x: float
+    y: float
+    z: float
+    vx: float
+    vy: float
+    vz: float
+    mass: float
+    drag_k: float        # ρ·C_D·A/(2m)，二次阻力系数 1/m
+    damage: float        # 单发命中伤害
+    t: float = 0.0
+    life: float = 2.5
+    alive: bool = True
+
+    @property
+    def position(self) -> tuple[float, float, float]:
+        return (self.x, self.y, self.z)
+
+
+def body_axes(psi: float, theta: float, phi: float):
+    """机体轴（前/右/下）在世界系（东/北/上）中的方向余弦。"""
+    sp, cp = math.sin(psi), math.cos(psi)
+    st, ct = math.sin(theta), math.cos(theta)
+    sf, cf = math.sin(phi), math.cos(phi)
+    xb = (ct * cp, ct * sp, st)
+    yb = (
+        cf * sp + sf * st * cp,
+        -cf * cp + sf * st * sp,
+        -sf * ct,
+    )
+    zb = (
+        -sf * sp + cf * st * cp,
+        sf * cp + cf * st * sp,
+        -cf * ct,
+    )
+    return xb, yb, zb
+
+
+# ---------------------------------------------------------------------------
+# 四元数姿态（6DOF）
+# ---------------------------------------------------------------------------
+# 欧拉角在 theta=±90° 处有万向节锁，且旧实现直接把 theta 夹在 ±80°，
+# 筋斗/半滚倒转/垂直剪刀因此全部退化为“爬到 80° 再掉回来”。现在姿态用
+# 四元数积分，欧拉角只作为派生量输出给观测、武器与渲染，物理上不再夹断。
+#
+# 本项目的 psi 从 x 轴逆时针计量，机体系 z 轴朝下，因此零姿态对应的旋转
+# 是绕机体 x 轴 180°（R = Rx(pi)），欧拉合成顺序为 Rz(psi)·Ry(-theta)·Rx(pi+phi)。
+# ---------------------------------------------------------------------------
+
+def _quat_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def _quat_axis(axis: str, angle: float):
+    half = 0.5 * angle
+    c, s = math.cos(half), math.sin(half)
+    if axis == "x":
+        return (c, s, 0.0, 0.0)
+    if axis == "y":
+        return (c, 0.0, s, 0.0)
+    return (c, 0.0, 0.0, s)
+
+
+def quat_from_euler(phi: float, theta: float, psi: float):
+    """按本项目欧拉约定合成四元数（机体系→世界系）。"""
+    q = _quat_mul(_quat_axis("z", psi), _quat_axis("y", -theta))
+    return _quat_mul(q, _quat_axis("x", math.pi + phi))
+
+
+def quat_to_matrix(q) -> tuple[tuple[float, float, float], ...]:
+    w, x, y, z = q
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)),
+        (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+        (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
+    )
+
+
+def euler_from_quat(q) -> tuple[float, float, float]:
+    """从四元数反解 (phi, theta, psi)。
+
+    theta 由 asin 给出，天然落在 [-90°, 90°]：过顶后 psi/phi 会接管方向，
+    机体轴仍连续。调用方应把 theta 当作显示量，而不是积分状态。
+    """
+    m = quat_to_matrix(q)
+    theta = math.asin(clamp(m[2][0], -1.0, 1.0))
+    ct = math.cos(theta)
+    if abs(ct) < 1e-6:
+        # 万向节锁：任选 psi，保证 phi 仍能把机头/机腹方向还原。
+        psi = math.atan2(m[0][1], m[1][1])
+        phi = math.atan2(-m[2][1], -m[2][2]) if abs(m[2][1]) > 1e-9 else 0.0
+    else:
+        psi = math.atan2(m[1][0], m[0][0])
+        phi = math.atan2(-m[2][1], -m[2][2])
+    return wrap_pi(phi), theta, wrap_pi(psi)
+
+
+def world_velocity(ac: Aircraft) -> tuple[float, float, float]:
+    """世界系速度。3DOF/2DOF 由 (v, gamma, psi) 给出，6DOF 由机体速度给出。"""
+    if ac.rigid:
+        xb, yb, zb = body_axes(ac.psi, ac.theta, ac.phi)
+        return (
+            xb[0] * ac.u + yb[0] * ac.vb + zb[0] * ac.wb,
+            xb[1] * ac.u + yb[1] * ac.vb + zb[1] * ac.wb,
+            xb[2] * ac.u + yb[2] * ac.vb + zb[2] * ac.wb,
+        )
+    cg = math.cos(ac.gamma)
+    return (
+        ac.v * cg * math.cos(ac.psi),
+        ac.v * cg * math.sin(ac.psi),
+        ac.v * math.sin(ac.gamma),
+    )
+
+
+def predict_path(
+    pos: tuple[float, float, float],
+    speed: float,
+    psi: float,
+    gamma: float,
+    psi_rate: float,
+    gamma_rate: float,
+    t: float,
+    steps: int = 8,
+) -> tuple[float, float, float]:
+    """按当前航迹角速度把飞机向前外推 t 秒，返回预测位置。
+
+    匀速直线只是特例：速度方向始终是轨迹的切线，目标在盘旋/爬升时如果只
+    沿切线外推，预测点会越飘越离谱（回旋时能差出几百米）。这里用滤波后的
+    ψ̇/γ̇ 积分圆弧，t 为负时反向积分（滞后追踪要看目标“刚才在哪”）。
+    """
+    x, y, z = pos
+    if t == 0.0:
+        return (x, y, z)
+    dt = t / steps
+    # 角速度限幅：数值微分偶尔会给出毛刺，别让预测点甩出去。
+    psi_rate = clamp(psi_rate, -math.radians(60.0), math.radians(60.0))
+    gamma_rate = clamp(gamma_rate, -math.radians(60.0), math.radians(60.0))
+    g_lim = math.radians(85.0)
+    for _ in range(steps):
+        g = clamp(gamma, -g_lim, g_lim)
+        cg = math.cos(g)
+        x += speed * cg * math.cos(psi) * dt
+        y += speed * cg * math.sin(psi) * dt
+        z += speed * math.sin(g) * dt
+        psi = wrap_pi(psi + psi_rate * dt)
+        gamma = clamp(gamma + gamma_rate * dt, -g_lim, g_lim)
+    return (x, y, z)
+
+
+def predict_position(
+    ac: Aircraft, t: float, steps: int = 8,
+) -> tuple[float, float, float]:
+    """机体按当前转弯/爬升率外推 t 秒后的位置（供 UI 与提前量使用）。"""
+    return predict_path(
+        (ac.x, ac.y, ac.z), ac.v, ac.track_psi, ac.track_gamma,
+        ac.psi_rate, ac.gamma_rate, t, steps,
+    )
+
+
+def nose_direction(ac: Aircraft) -> tuple[float, float, float]:
+    """机头指向的单位向量。6DOF 用机体 x 轴（真实炮口方向），点质量用速度方向。"""
+    if ac.rigid:
+        return body_axes(ac.psi, ac.theta, ac.phi)[0]
+    vx, vy, vz = world_velocity(ac)
+    n = max(math.sqrt(vx * vx + vy * vy + vz * vz), 1e-6)
+    return (vx / n, vy / n, vz / n)
+
+
+def gun_direction(ac: Aircraft) -> tuple[float, float, float]:
+    """炮线方向：弹丸速度 = 载机速度 + 炮口初速沿机头。
+
+    点质量模型没有机体姿态，机头即速度方向，所以结果与 nose_direction 一致。
+    初速取机型参数（20 mm 约 1030 m/s、30 mm 约 900 m/s），不再是全局常数。
+    """
+    nx, ny, nz = nose_direction(ac)
+    if not ac.rigid:
+        return (nx, ny, nz)
+    vx, vy, vz = world_velocity(ac)
+    vm = ac.spec.muzzle_speed
+    gx = vx + vm * nx
+    gy = vy + vm * ny
+    gz = vz + vm * nz
+    g = max(math.sqrt(gx * gx + gy * gy + gz * gz), 1e-6)
+    return (gx / g, gy / g, gz / g)
+
+
+def _trim_rigid(spec: AircraftSpec, z0: float, v0: float,
+                mass: float | None = None) -> tuple[float, float]:
+    """按 1g 配平迎角初始化机体速度，避免 6DOF 开局掉高度或抬头。"""
+    m = spec.mass if mass is None else mass
+    qbar = 0.5 * air_density(z0) * v0 * v0
+    cl_need = m * G / max(qbar * spec.wing_area, 1e-6)
+    alpha = clamp(
+        (cl_need - spec.cl0) / spec.cl_alpha, -spec.alpha_stall, spec.alpha_stall
+    )
+    return v0 * math.cos(alpha), v0 * math.sin(alpha)
+
+
+def _cruise_throttle(spec: AircraftSpec, z: float, v: float) -> float:
+    """维持巡航速度所需的军用油门：推力刚好抵消该速度下的零升阻力。"""
+    mach = mach_number(v, z)
+    q = 0.5 * air_density(z) * v * v
+    drag = q * cd0_at(mach, spec.cd0) * spec.wing_area
+    mil = spec.mil_thrust() * spec.lapse(z, mach)
+    return clamp(drag / max(mil, 1e-6), 0.25, 0.95)
+
+
+def launch_envelope(ac: "Aircraft", mspec: MissileSpec,
+                    foe: "Aircraft") -> tuple[float, float]:
+    """统一的发射包线 (min_range, max_range)。
+
+    红外导引头只看目标的热信号，与雷达散射截面无关；雷达导引头按雷达方程
+    随 RCS 的四次方根缩放。此前观测、锁定、发射三处各写了一遍，出现
+    “观测说能打、锁定却打不出”的不一致，这里收成唯一入口。
+    """
+    reach = mspec.seeker_range
+    if mspec.is_radar:
+        # RCS 决定雷达截面积，多普勒盲区决定“看没看见”：目标横穿掉进
+        # 速度凹口时，雷达既锁不住也支持不了中制导，包线直接归零。
+        # 分向 RCS：迎头看前向、尾追看尾后；隐身机前向的收益最大。
+        reach *= (
+            rcs_scale(directional_rcs(foe, (ac.x, ac.y, ac.z)))
+            * radar_visibility(ac, foe)
+        )
+    return mspec.min_range, min(mspec.max_range, reach)
+
+
+class World:
+    """固定步长、确定性的三维对局环境。"""
+
+    def __init__(
+        self,
+        specs: list[AircraftSpec],
+        dt: float = 1.0 / 120.0,
+        arena: float = 8000.0,
+        time_limit: float = 90.0,
+        z0: float = 1500.0,
+        z_floor: float = 0.0,
+        z_ceiling: float = 6000.0,
+        dof: int = 6,
+        y_offset: float = 100.0,
+        x_offset: float = 1500.0,
+        awacs: bool = True,
+    ) -> None:
+        if dof not in (2, 3, 6):
+            raise ValueError("dof 只支持 2、3 或 6")
+        self.dof = dof
+        self.dt = dt
+        self.arena = arena
+        self.time_limit = time_limit
+        self.awacs = awacs
+        self.z0 = z0
+        self.z_floor = z_floor
+        self.z_ceiling = z_ceiling
+        self.t = 0.0
+        self.result: str | None = None   # "red" / "blue" / "draw"
+        self.reason: str = ""
+        self.reason_code: str = ""       # kill / boundary / timeout / draw
+        # 一方被击落后若还有导弹在飞，先把判负结果挂起，等弹落地/命中再结算。
+        self._pending_finish: tuple[int, str, str] | None = None
+        self.events: list[tuple[float, str]] = []
+        self.stats = {
+            "min_v": math.inf,
+            "max_v": 0.0,
+            "max_n": 0.0,
+            "min_z": math.inf,
+            "max_z": 0.0,
+            "max_climb": 0.0,
+            "rounds_fired": 0.0,
+            "bullets_fired": 0,
+            "bullet_hits": 0,
+            "damage_dealt": [0.0, 0.0],
+            "missiles_fired": 0.0,
+            "missile_hits": 0,
+            "missiles_launched": [0, 0],
+            "missiles_hit": [0, 0],
+        }
+        # 感知层实验用的时间戳：首次获得稳定跟踪、首次开火。
+        self.first_track_t: list[float | None] = [None, None]
+        self.first_fire_contact_t: list[float | None] = [None, None]
+        self.first_fire_t: list[float | None] = [None, None]
+        # 在飞格斗弹；命中/寿命结束后 alive=False，保留在身上供渲染层读数。
+        self.missiles: list[Missile] = []
+        # 在飞机炮弹丸：按真实初速/散布/阻力飞行，线段-球判定命中。
+        self.bullets: list[Bullet] = []
+        # 已投放的干扰物（箔条云 / 热诱弹），失效后保留到清理，供渲染层读数。
+        self.counters: list[Countermeasure] = []
+        # 干扰诱骗用的随机源固定种子，保证回放与实验可复现。
+        self._rng = random.Random(20261027)
+
+        # 蓝机在 y 方向带一点初始偏移，避免完全镜像导致的确定性对称僵局。
+        # 2DOF 只是缺少垂直自由度，初始高度仍取 z0。
+        # 6DOF 额外按各自的 1g 配平迎角初始化机体速度与俯仰角。
+        start_z = z0
+        # 开局速度按各自的巡航马赫数换算成当地真空速，不再统一写死 200 m/s。
+        sonic = speed_of_sound(start_z)
+        v0s = [sonic * spec.cruise_mach for spec in specs]
+        rigid = dof == 6
+        specs_trim = [
+            _trim_rigid(spec, start_z, v0s[i], spec.mass) if rigid else (v0s[i], 0.0)
+            for i, spec in enumerate(specs)
+        ]
+        self.acs = [
+            Aircraft(specs[0], x=-x_offset, y=0.0, z=start_z, psi=0.0, v=v0s[0],
+                     hp=specs[0].hp_max, ammo=specs[0].ammo_max,
+                     mass=specs[0].mass, missiles=specs[0].missile_count,
+                     radar_missiles=specs[0].radar_missile_count,
+                     chaff=specs[0].chaff_count, flares=specs[0].flare_count,
+                     fuel=specs[0].fuel_capacity,
+                     throttle=_cruise_throttle(specs[0], start_z, v0s[0]),
+                     rigid=rigid, u=specs_trim[0][0], wb=specs_trim[0][1],
+                     theta=math.atan2(specs_trim[0][1], specs_trim[0][0])),
+            Aircraft(specs[1], x=x_offset, y=y_offset, z=start_z, psi=math.pi, v=v0s[1],
+                     hp=specs[1].hp_max, ammo=specs[1].ammo_max,
+                     mass=specs[1].mass, missiles=specs[1].missile_count,
+                     radar_missiles=specs[1].radar_missile_count,
+                     chaff=specs[1].chaff_count, flares=specs[1].flare_count,
+                     fuel=specs[1].fuel_capacity,
+                     throttle=_cruise_throttle(specs[1], start_z, v0s[1]),
+                     rigid=rigid, u=specs_trim[1][0], wb=specs_trim[1][1],
+                     theta=math.atan2(specs_trim[1][1], specs_trim[1][0])),
+        ]
+        self.stats["min_z"] = start_z
+        self.stats["max_z"] = start_z
+        # 6DOF 的姿态状态只有四元数：用初始欧拉角（含配平迎角）合成一次。
+        for ac in self.acs:
+            if ac.rigid:
+                ac.quat = quat_from_euler(ac.phi, ac.theta, ac.psi)
+            # 航迹角初值：取速度矢量的方向，供轨迹预测的起点使用。
+            vx, vy, vz = world_velocity(ac)
+            ac.track_psi = math.atan2(vy, vx)
+            ac.track_gamma = math.atan2(vz, math.hypot(vx, vy))
+        # 开局先算一次传感器状态，保证第一拍 observe 就带 contact。
+        self._update_sensors()
+
+    # ---------- 感知层 ----------
+
+    def _update_sensors(self) -> None:
+        """每个物理步更新双方的接触等级、RWR 与最后已知位置。
+
+        传感器是“被动/主动”的混合：
+        - 机头雷达（主动，需 radar_on）：火控级（可发中距弹），受分向 RCS
+          与多普勒盲区约束；
+        - 侧阵/L 波段（Su-57 专有）：只做 track/detect，不能火控；
+        - IRST/光电吊舱（被动）：track，不受 RCS 影响，但受视场与距离限制；
+        - 目视：tally，迎头/尾后 9 km、侧向 11 km；
+        - 预警机：400 km 级 track（按 RCS 缩放），不能当火控。
+        RWR 只给“被谁照射”的方位，没有距离。
+        """
+        for i, ac in enumerate(self.acs):
+            foe = self.acs[1 - i]
+            ac.contact = CONTACT_NONE
+            ac.tally = False
+            ac.rwr = False
+            ac.rwr_az = 0.0
+            if not ac.alive or not foe.alive:
+                continue
+
+            dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < 1e-6:
+                continue
+            ux, uy, uz = dx / dist, dy / dist, dz / dist
+            nx, ny, nz = nose_direction(ac)
+            nose_ang = math.acos(clamp(ux * nx + uy * ny + uz * nz, -1.0, 1.0))
+            nose_az = math.atan2(ny, nx)
+            los_az = math.atan2(dy, dx)
+
+            # ---- RWR：对方机头雷达对着本机开机 ----
+            if foe.radar_on and foe.spec.radar_range > 0.0:
+                fnx, fny, fnz = nose_direction(foe)
+                # 从对方看本机的方位，判断本机是否落在对方火控照射锥内。
+                bx, by, bz = -ux, -uy, -uz
+                foe_ang = math.acos(clamp(bx * fnx + by * fny + bz * fnz, -1.0, 1.0))
+                if foe_ang <= RADAR_FIRE_FOV:
+                    ac.rwr = True
+                    ac.rwr_az = wrap_pi(los_az - nose_az)
+
+            quality = CONTACT_NONE
+            # ---- 本机机头雷达（主动）----
+            if ac.radar_on and ac.spec.radar_range > 0.0:
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = (
+                    ac.spec.radar_range
+                    * rcs_scale(rcs)
+                    * radar_visibility(ac, foe)
+                )
+                if dist <= reach:
+                    if nose_ang <= RADAR_FIRE_FOV:
+                        quality = CONTACT_FIRE
+                    elif nose_ang <= RADAR_DETECT_FOV:
+                        quality = CONTACT_DETECT
+            # ---- 侧阵：±35°–145°，0.55×，只 track ----
+            if ac.spec.side_array and (
+                SIDE_ARRAY_MIN <= nose_ang <= SIDE_ARRAY_MAX
+            ):
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = (
+                    ac.spec.radar_range * SIDE_ARRAY_SCALE
+                    * rcs_scale(rcs) * radar_visibility(ac, foe)
+                )
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+            # ---- L 波段襟翼雷达：±45°，200 km，只 detect ----
+            if ac.spec.lband and nose_ang <= LBAND_FOV:
+                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+                reach = LBAND_RANGE_REF * rcs_scale(rcs)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_DETECT)
+            # ---- IRST / 光电吊舱（被动）----
+            irst = max(ac.spec.irst_range, ac.spec.pod_irst_range)
+            if irst > 0.0 and nose_ang <= IRST_FOV:
+                reach = irst * (IRST_AB_BOOST if foe.ab > 0.05 else 1.0)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+            # ---- 目视：全向，给 tally ----
+            fnx, fny, fnz = nose_direction(foe)
+            # 对方机头与“对方→本机”视线的夹角：0/180 为迎头/尾后，90 为侧向。
+            foe_off = math.acos(clamp(
+                (fnx * -ux + fny * -uy + fnz * -uz), -1.0, 1.0
+            ))
+            visual = (
+                VISUAL_HEAD_TAIL
+                if (foe_off < math.radians(45.0) or foe_off > math.radians(135.0))
+                else VISUAL_SIDE
+            )
+            if dist <= visual:
+                ac.tally = True
+                quality = max(quality, CONTACT_TRACK)
+            # ---- 预警机（track，不能火控）----
+            if self.awacs:
+                # 预警机大多从侧上方看目标，取侧向/尾向里较大的值。
+                rcs = max(
+                    directional_rcs(foe, (ac.x, ac.y, ac.z)),
+                    foe.spec.rcs,
+                )
+                reach = AWACS_RANGE_REF * rcs_scale(rcs)
+                if dist <= reach:
+                    quality = max(quality, CONTACT_TRACK)
+
+            ac.contact = quality
+            if quality >= CONTACT_TRACK:
+                ac.last_known = (foe.x, foe.y, foe.z)
+                ac.last_known_t = self.t
+                if self.first_track_t[i] is None:
+                    self.first_track_t[i] = self.t
+            if quality >= CONTACT_FIRE and self.first_fire_contact_t[i] is None:
+                # 火控级接触（本机机头雷达照射）：才允许发射雷达中距弹。
+                self.first_fire_contact_t[i] = self.t
+
+    # ---------- 对外接口 ----------
+
+    # ---------- 中距弹发射决策：命中概率 / 不可逃逸区估计 ----------
+
+    def _intercept_estimate(self, i: int) -> tuple[float, bool]:
+        """估计现在发射中距弹的命中概率，以及目标是否已在不可逃逸区。
+
+        只做决策用的量级估计，不逐拍复刻弹道（理想逃逸下的弹道前推对末段
+        十几米的脱靶量过于敏感，反而给不出单调可用的概率）：
+        - 有效包线取载机雷达跟踪距离（按目标 RCS 缩放）与弹最大射程的较小值；
+        - 不可逃逸区取包线的 NEZ_FRACTION。再远，目标有足够时间掉头把弹拖进
+          尾追，弹的末端能量保不住，进不了近炸半径；
+        - 目标已经在背离逃逸时，上述距离同步缩水；
+        - 命中概率是以 NEZ 为中心的 logistic 曲线：进 NEZ 迅速逼近 1，
+          远于 NEZ 时快速衰减。
+        """
+        me, foe = self.acs[i], self.acs[1 - i]
+        spec = me.spec.radar_missile
+        if spec is None or me.radar_missiles <= 0 or not foe.alive:
+            return 0.0, False
+        dx, dy, dz = foe.x - me.x, foe.y - me.y, foe.z - me.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist < 1e-6:
+            return 0.95, True
+        losx, losy, losz = dx / dist, dy / dist, dz / dist
+
+        # 有效包线与发射包线同源：目标横穿掉进多普勒盲区时包线归零。
+        _, envelope = launch_envelope(me, spec, foe)
+        # 目标速度沿视线的分量：正数表示正在背离本机逃逸。
+        fvx, fvy, fvz = world_velocity(foe)
+        fleeing = clamp(
+            (fvx * losx + fvy * losy + fvz * losz) / max(foe.v, 1.0), -1.0, 1.0
+        )
+        aspect = 0.5 * (1.0 + fleeing)     # 0=迎头，1=完全尾追逃逸
+        nez = NEZ_FRACTION * envelope * (1.0 - NEZ_ASPECT_PENALTY * aspect)
+        nez = max(nez, spec.min_range)
+
+        pk = 1.0 / (1.0 + math.exp((dist - nez) / max(PK_TRANSITION * nez, 1.0)))
+        return clamp(pk, 0.0, 0.95), dist <= nez
+
+    def observe(self, i: int) -> Observation:
+        me = self.acs[i]
+        foe = self.acs[1 - i]
+        dx, dy, dz = foe.x - me.x, foe.y - me.y, foe.z - me.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        dist_h = math.hypot(dx, dy)
+        if dist < 1e-6:
+            dist = 1e-6
+        ux, uy, uz = dx / dist, dy / dist, dz / dist
+
+        los_az = math.atan2(dy, dx) if dist_h > 1e-6 else me.psi
+        los_el = math.atan2(dz, dist_h)
+
+        mvx, mvy, mvz = me.velocity
+        fvx, fvy, fvz = foe.velocity
+        gnx, gny, gnz = gun_direction(me)
+        fnx, fny, fnz = nose_direction(foe)
+
+        angle_off_nose = math.acos(clamp(ux * gnx + uy * gny + uz * gnz, -1.0, 1.0))
+        # 瞄准误差按炮线（弹丸出膛方向）算：6DOF 下它与航迹、机头都不重合。
+        nose_az = math.atan2(gny, gnx) if me.rigid else me.psi
+        nose_el = math.asin(clamp(gnz, -1.0, 1.0)) if me.rigid else me.gamma
+        # 经典 gross aspect：0 = 对方背对我（我咬尾），180 = 对头。
+        aspect = math.acos(clamp(ux * fnx + uy * fny + uz * fnz, -1.0, 1.0))
+        foe_off = math.acos(clamp(-(ux * fnx + uy * fny + uz * fnz), -1.0, 1.0))
+
+        closure = -((fvx - mvx) * ux + (fvy - mvy) * uy + (fvz - mvz) * uz)
+        in_range = dist <= me.spec.gun_range
+        in_cone = in_range and angle_off_nose <= me.spec.gun_cone
+        trigger = (
+            dist <= me.spec.gun_range * GUN_TRIGGER_RANGE_FRAC
+            and angle_off_nose <= GUN_TRIGGER_CONE
+        )
+
+        # 导引头包线：弹轴（机头）视场 + 锁定距离，与机炮炮线分开计算。
+        mspec = me.spec.missile
+        msl_max = msl_min = 0.0
+        in_msl = False
+        lock_progress = 0.0
+        if mspec is not None and me.missiles > 0:
+            msl_min, msl_max = launch_envelope(me, mspec, foe)
+            nnx, nny, nnz = nose_direction(me)
+            seeker_ang = math.acos(
+                clamp(ux * nnx + uy * nny + uz * nnz, -1.0, 1.0)
+            )
+            # 离轴发射：锁定扇区取万向支架极限（R-73 ±60°、AIM-9X ±90°），
+            # 不再要求机头对准目标 ±45° 以内。
+            in_msl = (
+                msl_min <= dist <= msl_max and seeker_ang <= mspec.gimbal
+            )
+            lock_progress = clamp(me.lock_timer / max(mspec.lock_time, 1e-6), 0.0, 1.0)
+
+        # 近距弹的不可逃逸区估计：包线 × 系数，目标逃逸时按 aspect 缩水。
+        # 但近距弹不能直接拿导引头/射程包线做基数：导引头能看到 10–12 km，
+        # 末段弹速掉到 2–5 g 时转弯半径 3–5 km，根本够不到一个 9 g 急转的目标。
+        # 用 dogfight_reach（R-73/AIM-9X 约 3 km，即“目标会机动”时的有效射程）
+        # 收口，再叠加 aspect 惩罚，就不会再出现 6 km 迎头的礼节性发射。
+        msl_nez, msl_pk = False, 0.0
+        if mspec is not None and me.missiles > 0 and foe.alive and msl_max > 0.0:
+            msl_flee = clamp(
+                (fvx * ux + fvy * uy + fvz * uz) / max(foe.v, 1.0), -1.0, 1.0
+            )
+            msl_aspect = 0.5 * (1.0 + msl_flee)
+            reach = msl_max
+            if not mspec.is_radar and mspec.dogfight_reach > 0.0:
+                reach = min(reach, mspec.dogfight_reach)
+            msl_nez_rng = max(
+                NEZ_FRACTION * reach * (1.0 - NEZ_ASPECT_PENALTY * msl_aspect),
+                mspec.min_range,
+            )
+            msl_pk = 1.0 / (
+                1.0 + math.exp(
+                    (dist - msl_nez_rng) / max(PK_TRANSITION * msl_nez_rng, 1.0)
+                )
+            )
+            msl_nez = dist <= msl_nez_rng
+
+        # 红外弹与中距弹是两条独立的发射通道：中距弹在飞时仍可补射近距弹，
+        # 因此 in_flight 只统计红外弹，避免一条中距弹把整个发射架锁死。
+        in_flight = sum(
+            1 for m in self.missiles
+            if m.alive and m.owner == i and not m.spec.is_radar
+        )
+        radar_in_flight = sum(
+            1 for m in self.missiles
+            if m.alive and m.owner == i and m.spec.is_radar
+        )
+        # 主动弹打完末段自主截获后，载机不必再保持照射/数据链；已经丢制导
+        # （guided=False）的弹弹道再也修正不了，同样不该占用照射通道，否则
+        # 战术层会一直以为“还在中制导段”，永远不补射。
+        radar_support = any(
+            m.alive and m.owner == i and m.spec.is_radar and m.guided and not m.active
+            for m in self.missiles
+        )
+
+        # 雷达包线：中距弹发射前需要雷达稳定跟踪，照射锥比导引头宽得多。
+        # 弹已经打完时仍要给出照射状态，供战术层判断“要不要保持机头指向”。
+        rspec = me.spec.radar_missile
+        radar_max = radar_min = 0.0
+        radar_active = 0.0
+        in_radar = False
+        radar_progress = 0.0
+        radar_tracking = False
+        if rspec is not None and (me.radar_missiles > 0 or radar_in_flight > 0):
+            # 隐身机（RCS 小）被雷达截获的距离按四次方根缩短。
+            radar_min, radar_max = launch_envelope(me, rspec, foe)
+            nnx, nny, nnz = nose_direction(me)
+            radar_ang = math.acos(
+                clamp(ux * nnx + uy * nny + uz * nnz, -1.0, 1.0)
+            )
+            in_radar = (
+                radar_min <= dist <= radar_max and radar_ang <= rspec.seeker_fov
+            )
+            radar_tracking = (
+                dist <= radar_max and radar_ang <= SARH_ILLUM_FOV
+            )
+            radar_active = rspec.active_range * rcs_scale(foe.spec.rcs)
+            radar_progress = clamp(
+                me.radar_lock_timer / max(rspec.lock_time, 1e-6), 0.0, 1.0
+            )
+
+        # 现在发射值不值：前推一次弹道，得到估计命中概率与 NEZ 判定。
+        radar_pk, radar_nez = 0.0, False
+        if rspec is not None and me.radar_missiles > 0 and foe.alive:
+            radar_pk, radar_nez = self._intercept_estimate(i)
+
+        # 导弹告警：只统计仍在制导、指向本机的弹。
+        incoming_dist = 1e9
+        incoming_az = 0.0
+        incoming_ttg = 1e9
+        incoming_sarh = False
+        incoming_radar = False
+        incoming_guided = False
+        mevx, mevy, mevz = me.velocity
+        for m in self.missiles:
+            if not m.alive or m.target != i:
+                continue
+            ddx, ddy, ddz = m.x - me.x, m.y - me.y, m.z - me.z
+            dd = math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
+            # 弹与本机的接近率：用来估算剩余命中时间，供 F-pole 决策。
+            vc = (
+                (mevx - m.vx) * ddx + (mevy - m.vy) * ddy
+                + (mevz - m.vz) * ddz
+            ) / max(dd, 1e-6)
+            # 丢制导的弹不再被“制导中”过滤掉：它会按惯性继续飞、仍然能
+            # 近炸命中，把它当成不存在会让防御方在弹还没过顶时就提前改出。
+            # 只有明显已经在远离的弹（接近率为负）才不再计入威胁；制导中的
+            # 弹也按同一门限，避免弹已经从身边飞过后还一直被当成来袭目标，
+            # 让防御方白白横转、掉高掉速。
+            if vc < 100.0 and (not m.guided or vc < -50.0):
+                continue
+            if dd < incoming_dist:
+                incoming_dist = dd
+                incoming_az = wrap_pi(math.atan2(ddy, ddx) - nose_az)
+                incoming_sarh = m.spec.is_sarh
+                incoming_radar = m.spec.is_radar
+                incoming_guided = m.guided
+                incoming_ttg = dd / max(vc, 50.0)
+
+        # 我方在飞中距弹的剩余命中时间：F-pole 的判据是“我的弹先到”。
+        own_radar_ttg = 1e9
+        fvx, fvy, fvz = foe.velocity
+        for m in self.missiles:
+            if not m.alive or m.owner != i or not m.spec.is_radar:
+                continue
+            rx, ry, rz = foe.x - m.x, foe.y - m.y, foe.z - m.z
+            dd = math.sqrt(rx * rx + ry * ry + rz * rz)
+            # 弹向目标飞：接近率取 (弹速 - 目标速度) 在视线方向的投影。
+            vc = (
+                (m.vx - fvx) * rx + (m.vy - fvy) * ry + (m.vz - fvz) * rz
+            ) / max(dd, 1e-6)
+            # 已经追不上对方的弹（接近率低于 150 m/s，典型是尾追远逃目标或
+            # 药柱烧完的僵尸弹）不算“我的弹先到”：否则 dd/vc 会算出几十上百
+            # 秒的假命中时间，F-pole 判据永远不成立。
+            if vc < 150.0:
+                continue
+            own_radar_ttg = min(own_radar_ttg, dd / vc)
+
+        half = self.arena / 2.0
+        foe_lock_progress = 0.0
+        if foe.spec.missile is not None and foe.missiles > 0:
+            foe_lock_progress = clamp(
+                foe.lock_timer / max(foe.spec.missile.lock_time, 1e-6), 0.0, 1.0
+            )
+        foe_radar_locked = bool(
+            foe.spec.radar_missile is not None and foe.radar_missiles > 0
+            and foe.radar_locked
+        )
+        if self.dof >= 3:
+            z_low = me.z - self.z_floor
+            z_high = self.z_ceiling - me.z
+        else:
+            # 2DOF 没有高度约束，给一个大余量让 Agent 的高度逻辑自然失效
+            z_low = z_high = 1e9
+        obs = Observation(
+            dist=dist,
+            dist_h=dist_h,
+            dz=dz,
+            los_az=los_az,
+            los_el=los_el,
+            off_az=wrap_pi(los_az - nose_az),
+            off_el=los_el - nose_el,
+            angle_off_nose=angle_off_nose,
+            aspect=aspect,
+            foe_off_nose=foe_off,
+            closure=closure,
+            in_gun_range=in_range,
+            in_gun_cone=in_cone,
+            in_gun_trigger=trigger,
+            own_speed=me.v,
+            own_speed_frac=me.v / me.spec.v_stall_at(me.z, me.mass),
+            own_alt=me.z,
+            own_psi=me.psi,
+            own_gamma=me.gamma,
+            own_n_avail=self._n_available_effective(me),
+            own_n=me.n,
+            own_n_sustain=me.spec.n_sustain(
+                me.v, me.z, throttle=me.throttle, mass=me.mass, ab=me.ab
+            ),
+            own_ps=me.spec.specific_power(
+                me.v, me.z, max(me.n, 1.0),
+                throttle=me.throttle, mass=me.mass, ab=me.ab,
+            ),
+            own_ps_level=me.spec.specific_power(
+                me.v, me.z, 1.0, throttle=me.throttle, mass=me.mass, ab=me.ab
+            ),
+            own_fuel_frac=(
+                me.fuel / me.spec.fuel_capacity
+                if me.spec.fuel_capacity > 0.0 else 1.0
+            ),
+            own_mil_endurance=military_endurance(me.spec, me.fuel),
+            own_ab=me.ab > 0.05,
+            own_thrust_frac=me.thrust / max(me.spec.thrust_max, 1.0),
+            own_cruise_throttle=_cruise_throttle(
+                me.spec, me.z, speed_of_sound(me.z) * me.spec.cruise_mach
+            ),
+            own_hp=me.hp,
+            own_hp_frac=me.hp / me.spec.hp_max,
+            own_ammo=me.ammo,
+            foe_speed=foe.v,
+            foe_alt=foe.z,
+            foe_psi=foe.psi,
+            foe_gamma=foe.gamma,
+            foe_psi_rate=foe.psi_rate,
+            foe_gamma_rate=foe.gamma_rate,
+            foe_track_psi=foe.track_psi,
+            foe_track_gamma=foe.track_gamma,
+            foe_hp=foe.hp,
+            foe_hp_frac=foe.hp / foe.spec.hp_max,
+            energy_diff=me.energy - foe.energy,
+            edge_margin=min(half - abs(me.x), half - abs(me.y)),
+            foe_edge_margin=min(half - abs(foe.x), half - abs(foe.y)),
+            z_margin_low=z_low,
+            z_margin_high=z_high,
+            center_az=math.atan2(-me.y, -me.x),
+            own_nose_az=nose_az,
+            own_nose_el=nose_el,
+            own_bank=me.bank,
+            own_beta=(
+                math.asin(clamp(me.vb / max(me.v, 1.0), -1.0, 1.0))
+                if me.rigid else 0.0
+            ),
+            dof=self.dof,
+            own_tvc=me.spec.tvc > 0.0,
+            own_missiles=me.missiles,
+            own_missiles_in_flight=in_flight,
+            own_locked=me.locked,
+            own_lock_progress=lock_progress,
+            in_missile_envelope=in_msl,
+            missile_nez=msl_nez,
+            missile_pk_est=msl_pk,
+            missile_min_range=msl_min,
+            missile_max_range=msl_max,
+            foe_missiles=foe.missiles,
+            foe_locked=foe.locked,
+            foe_lock_progress=foe_lock_progress,
+            incoming_missile_dist=incoming_dist,
+            incoming_missile_az=incoming_az,
+            incoming_missile_ttg=incoming_ttg,
+            incoming_missile_sarh=incoming_sarh,
+            incoming_missile_radar=incoming_radar,
+            incoming_missile_guided=incoming_guided,
+            own_radar_ttg=own_radar_ttg,
+            own_radar_missiles=me.radar_missiles,
+            own_radar_in_flight=radar_in_flight,
+            own_radar_support=radar_support,
+            own_radar_locked=me.radar_locked,
+            own_radar_lock_progress=radar_progress,
+            in_radar_envelope=in_radar,
+            radar_tracking=radar_tracking,
+            radar_min_range=radar_min,
+            radar_max_range=radar_max,
+            radar_active_range=radar_active,
+            radar_pk_est=radar_pk,
+            radar_nez=radar_nez,
+            foe_radar_missiles=foe.radar_missiles,
+            foe_radar_locked=foe_radar_locked,
+            contact=me.contact,
+            contact_quality=me.contact,
+            tally=me.tally,
+            rwr=me.rwr,
+            rwr_az=me.rwr_az,
+            radar_on=me.radar_on,
+            foe_radar_on=foe.radar_on,
+            gun_accuracy=1.0 if me.tally else GUN_NO_TALLY_SPREAD,
+        )
+
+        # ---- 感知层降级：没有稳定跟踪时，不给真实几何 ----
+        if me.contact < CONTACT_TRACK:
+            # 只有方位（RWR/L 波段/雷达探测）或什么都没有。搜索方位优先取
+            # 最后已知位置，其次取空域中心（开局双方都朝中心飞）。
+            if me.contact == CONTACT_DETECT and me.rwr:
+                search_az = wrap_pi(obs.own_nose_az + me.rwr_az)
+            elif me.last_known is not None:
+                search_az = math.atan2(
+                    me.last_known[1] - me.y, me.last_known[0] - me.x
+                )
+            else:
+                search_az = math.atan2(-me.y, -me.x)
+            obs.dist = 1e9
+            obs.dist_h = 1e9
+            obs.dz = 0.0
+            obs.los_az = search_az
+            obs.los_el = 0.0
+            obs.off_az = wrap_pi(search_az - nose_az)
+            obs.off_el = 0.0
+            obs.angle_off_nose = abs(obs.off_az)
+            obs.aspect = 0.0
+            obs.foe_off_nose = 0.0
+            obs.closure = 0.0
+            obs.in_gun_range = obs.in_gun_cone = obs.in_gun_trigger = False
+            obs.in_missile_envelope = False
+            obs.missile_nez = False
+            obs.missile_pk_est = 0.0
+            obs.in_radar_envelope = False
+            obs.radar_tracking = False
+            obs.radar_pk_est = 0.0
+            obs.radar_nez = False
+            obs.own_locked = False
+            obs.own_lock_progress = 0.0
+            obs.own_radar_locked = False
+            obs.own_radar_lock_progress = 0.0
+            # 对方状态未知：速度/高度/血量按中性值，避免把真值泄漏给战术层。
+            obs.foe_speed = 0.0
+            obs.foe_alt = me.z
+            obs.foe_psi = 0.0
+            obs.foe_gamma = 0.0
+            obs.foe_psi_rate = 0.0
+            obs.foe_gamma_rate = 0.0
+            obs.foe_track_psi = 0.0
+            obs.foe_track_gamma = 0.0
+            obs.foe_hp = 0.0
+            obs.foe_hp_frac = 0.0
+            obs.foe_missiles = 0
+            obs.foe_radar_missiles = 0
+            obs.foe_locked = False
+            obs.foe_lock_progress = 0.0
+            obs.foe_radar_locked = False
+            obs.energy_diff = 0.0
+
+        # 没有火控级接触（雷达没开机 / 目标在盲区外）：中距弹通道整体关闭。
+        if me.contact < CONTACT_FIRE:
+            obs.own_radar_locked = False
+            obs.own_radar_lock_progress = 0.0
+            obs.in_radar_envelope = False
+            obs.radar_tracking = False
+            # 有 track（预警机/IRST/侧阵）时保留解析式 NEZ/Pk 估计：它只
+            # 取决于已知目标几何与弹的性能，不需要开雷达照射就能算。雷达
+            # 开关决策靠它判断“现在开机就能打”，否则“不开雷达拿不到
+            # NEZ、拿不到 NEZ 又不敢开雷达”会形成死锁。
+            if me.contact < CONTACT_TRACK:
+                obs.radar_pk_est = 0.0
+                obs.radar_nez = False
+
+        # 被锁定告警需要“看得见”或“RWR 被照射”，否则静默伏击方无从得知。
+        if me.contact < CONTACT_TRACK and not me.rwr:
+            obs.foe_locked = False
+            obs.foe_lock_progress = 0.0
+            obs.foe_radar_locked = False
+        return obs
+
+    def step(self, actions: list[Action]) -> None:
+        if self.result is not None:
+            return
+        for ac, act in zip(self.acs, actions):
+            if act.radar_on is not None:
+                ac.radar_on = bool(act.radar_on)
+        self._integrate(actions)
+        self._update_sensors()
+        self._update_lock()
+        self._weapons(actions)
+        self._integrate_bullets()
+        self._update_countermeasures()
+        self._update_missiles()
+        self.t += self.dt
+        self._referee()
+
+    # ---------- 内部实现 ----------
+
+    def _integrate(self, actions: list[Action]) -> None:
+        for ac, act in zip(self.acs, actions):
+            if not ac.alive:
+                continue
+            vx0, vy0, vz0 = world_velocity(ac)
+            psi0 = math.atan2(vy0, vx0)
+            gamma0 = math.atan2(vz0, math.hypot(vx0, vy0))
+            if self.dof == 6:
+                self._integrate_rigid(ac, act)
+            else:
+                self._integrate_point(ac, act)
+
+            # 航迹角速度：对速度矢量的方向（不是机头姿态）做数值微分，
+            # 再用 0.3 s 一阶低通平滑。6DOF 下机头与速度矢量之间有迎角、
+            # 侧滑角，用 psi/gamma 预测会系统性地偏出真实航迹。
+            vx1, vy1, vz1 = world_velocity(ac)
+            track_psi = math.atan2(vy1, vx1)
+            track_gamma = math.atan2(vz1, math.hypot(vx1, vy1))
+            alpha = self.dt / (0.3 + self.dt)
+            ac.psi_rate += (
+                wrap_pi(track_psi - psi0) / self.dt - ac.psi_rate
+            ) * alpha
+            ac.gamma_rate += (
+                (track_gamma - gamma0) / self.dt - ac.gamma_rate
+            ) * alpha
+            ac.track_psi = track_psi
+            ac.track_gamma = track_gamma
+
+            self.stats["min_v"] = min(self.stats["min_v"], ac.v)
+            self.stats["max_v"] = max(self.stats["max_v"], ac.v)
+            self.stats["max_n"] = max(self.stats["max_n"], ac.n)
+            self.stats["min_z"] = min(self.stats["min_z"], ac.z)
+            self.stats["max_z"] = max(self.stats["max_z"], ac.z)
+            self.stats["max_climb"] = max(self.stats["max_climb"], abs(math.degrees(ac.gamma)))
+
+    def _apply_power(self, ac: Aircraft, act: Action, mach: float) -> float:
+        """设定油门/加力、消耗燃油，返回本步推力 (N)。
+
+        军推随油门在 [0, 军用推力] 内变化；加力是独立开度，叠加到军推之上。
+        加力燃烧室需要油，油尽后自动掉回军推；本步油不够时按比例削减推力。
+        """
+        spec = ac.spec
+        ac.throttle = clamp(act.throttle, 0.0, 1.0)
+        ab = clamp(act.afterburner, 0.0, 1.0)
+        if spec.fuel_capacity > 0.0 and ac.fuel <= 0.0:
+            ab = 0.0
+        ac.ab = ab
+        mil = spec.mil_thrust()
+        lapse = spec.lapse(ac.z, mach)
+        dry = ac.throttle * mil * lapse
+        wet = ab * (spec.thrust_max - mil) * lapse
+        thrust = dry + wet
+        if spec.fuel_capacity > 0.0:
+            burn = (dry * TSFC_MIL + wet * TSFC_AB) * self.dt
+            if burn > ac.fuel:
+                # 油量不够支撑这一物理步：按剩余燃油等比削减，避免负油量。
+                frac = ac.fuel / max(burn, 1e-9)
+                dry *= frac
+                wet *= frac
+                thrust = dry + wet
+                ac.ab = ab * frac
+                burn = ac.fuel
+            ac.fuel = max(ac.fuel - burn, 0.0)
+            # 燃油本身计入机体质量：烧掉的油让整机变轻、推重比上升。
+            ac.mass = max(ac.mass - burn, 0.35 * spec.mass)
+        ac.thrust = thrust
+        return thrust
+
+    def _integrate_point(self, ac: Aircraft, act: Action) -> None:
+        """2DOF/3DOF：点质量积分。"""
+        spec = ac.spec
+        m = ac.mass if ac.mass > 0.0 else spec.mass
+        # 当地的密度、失速速度与推力衰减，全部按高度实时计算。
+        rho = air_density(ac.z)
+        v_floor = max(35.0, 0.20 * spec.v_stall_at(ac.z, m))
+        v = max(ac.v, v_floor)
+        # 不再把 gamma 夹在 ±80°：筋斗/半滚倒转必须能越过 ±90°。
+        gamma = wrap_pi(ac.gamma)
+        cg = math.cos(gamma)
+
+        n_avail = spec.n_available(v, ac.z, m)
+        n_cmd = clamp(act.n, N_MIN, n_avail)
+        bank_cmd = clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
+
+        # 一阶惯性，近似滚转/拉杆的响应延迟。
+        alpha = self.dt / (spec.turn_tau + self.dt)
+        ac.n = clamp(ac.n + (n_cmd - ac.n) * alpha, N_MIN, n_avail)
+        ac.bank = clamp(ac.bank + (bank_cmd - ac.bank) * alpha,
+                        -BANK_CMD_MAX * MAX_BANK, BANK_CMD_MAX * MAX_BANK)
+        q = 0.5 * rho * v * v
+        mach = mach_number(v, ac.z)
+        a_thrust = self._apply_power(ac, act, mach) / m
+        brake = clamp(act.brake, 0.0, 1.0)
+        a_drag0 = (
+            q * (cd0_at(mach, spec.cd0) + BRAKE_CD * brake) * spec.wing_area / m
+        )
+        a_induced = (
+            ac.n * ac.n
+            * 2.0 * m * G * G
+            / (rho * v * v * math.pi * spec.aspect_ratio * spec.oswald * spec.wing_area)
+        )
+
+        # 3DOF 点质量方程。
+        if self.dof == 3:
+            v_dot = a_thrust - a_drag0 - a_induced - G * math.sin(gamma)
+            gamma_dot = (G / v) * (ac.n * math.cos(ac.bank) - math.cos(gamma))
+            # psi_dot 在 |cos(gamma)| -> 0 处有坐标奇点（机头垂直向上/向下）。
+            # 纯垂直面内（bank≈0 或 π）时航向本就不该变；其余情况给有界极限，
+            # 避免 0/0 把航向瞬间甩出去。
+            sb = math.sin(ac.bank)
+            if abs(cg) > 0.05:
+                psi_dot = (G / (v * cg)) * ac.n * sb
+            elif abs(sb) < 0.05:
+                psi_dot = 0.0
+            else:
+                psi_dot = PSI_DOT_LIMIT if sb > 0.0 else -PSI_DOT_LIMIT
+            psi_dot = clamp(psi_dot, -PSI_DOT_LIMIT, PSI_DOT_LIMIT)
+        else:
+            # 2DOF：垂直自由度被移除，水平响应与 3DOF 完全一致。
+            v_dot = a_thrust - a_drag0 - a_induced
+            gamma_dot = 0.0
+            psi_dot = (G / v) * ac.n * math.sin(ac.bank)
+
+        ac.v = max(v + v_dot * self.dt, v_floor)
+        ac.psi = wrap_pi(ac.psi + psi_dot * self.dt)
+        if self.dof == 3:
+            ac.gamma = wrap_pi(gamma + gamma_dot * self.dt)
+            cg_new = math.cos(ac.gamma)
+            ac.x += ac.v * cg_new * math.cos(ac.psi) * self.dt
+            ac.y += ac.v * cg_new * math.sin(ac.psi) * self.dt
+            ac.z += ac.v * math.sin(ac.gamma) * self.dt
+        else:
+            ac.gamma = 0.0
+            ac.x += ac.v * math.cos(ac.psi) * self.dt
+            ac.y += ac.v * math.sin(ac.psi) * self.dt
+
+    def _n_available_effective(self, ac: Aircraft) -> float:
+        """当前可用过载：升力上限（含超声速损失与矢量增升）与结构限制取小。"""
+        spec = ac.spec
+        n_lift = spec.n_lift(ac.v, ac.z, ac.mass)
+        boost = self._tvc_cl_boost(ac)
+        if boost > 0.0:
+            base = max(spec.cl_max_at(mach_number(ac.v, ac.z)), 1e-6)
+            n_lift *= (base + boost) / base
+        return min(spec.n_struct, n_lift)
+
+    def _tvc_cl_boost(self, ac: Aircraft) -> float:
+        """矢量喷流当前的等效增升量（CL 增量）。
+
+        喷流增升取决于发动机功率：加力全开时喷流最强，收油门则迅速减弱，
+        因此按油门/加力开度缩放，而不是按随高度衰减的绝对推力缩放——
+        否则高空大迎角（矢量喷口真正有价值的包线）反而拿不到增升。
+        """
+        spec = ac.spec
+        if not ac.rigid or spec.tvc <= 0.0 or spec.tvc_cl_bonus <= 0.0:
+            return 0.0
+        power = clamp(max(ac.throttle, ac.ab), 0.0, 1.0)
+        return spec.tvc_cl_bonus * power
+
+    def _cl_max_effective(self, ac: Aircraft) -> float:
+        """计入超声速升力损失与矢量增升后的可用升力系数上限。"""
+        spec = ac.spec
+        base = spec.cl_max_at(mach_number(ac.v, ac.z))
+        boost = self._tvc_cl_boost(ac)
+        if boost <= 0.0:
+            return base
+        return spec.cl0 + spec.cl_alpha * spec.alpha_stall + boost
+
+    def _alpha_stall_effective(self, ac: Aircraft) -> float:
+        """矢量增升把失速迎角一并右移：CL 增量摊到升力线斜率上。"""
+        spec = ac.spec
+        boost = self._tvc_cl_boost(ac)
+        if boost <= 0.0:
+            return spec.alpha_stall
+        return spec.alpha_stall + boost / spec.cl_alpha
+
+    def _stall_stab_scale(self, ac: Aircraft, alpha: float) -> float:
+        """过失速段纵向静稳定力矩的衰减系数（0~1）。
+
+        真实机体迎角越过失速后，平尾被机身与机翼尾流遮蔽，静稳定力矩迅速
+        减弱；这也是库尔比特能靠惯性和剩余舵效把机头继续往后带、而不会被
+        “自动回到小迎角”的根本原因。只在直接俯仰角速度指令（过顶段）里
+        启用，常规飞行仍用完整静稳定度。
+        """
+        over = abs(alpha) - self._alpha_stall_effective(ac)
+        if over <= 0.0:
+            return 1.0
+        return 1.0 / (1.0 + 3.0 * over)
+
+    def _surface_commands(self, ac: Aircraft, act: Action, V: float,
+                          alpha: float, qbar: float) -> tuple[float, float, float, float]:
+        """增稳内回路：把战术层的 (bank, n) 翻译成副翼/升降舵/方向舵偏度。
+
+        这是 6DOF 与 3DOF 的关键衔接——战术层仍然只关心“转多快、拉几个 g”，
+        由这里负责配平、阻尼和协调转弯，避免把飞控品质问题暴露给战术层。
+        """
+        spec = ac.spec
+        # 三层级联：姿态角误差 → 目标角速度 → 舵面，避免单环比例控制大过冲。
+        # 本层约定 bank>0 为左滚，而 phi>0 为右滚。bank 以 MAX_BANK 为单位，
+        # 最大允许指令到倒扣 ±180°（破 S / 半滚倒转需要）。
+        phi_cmd = -clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
+        if act.roll_free:
+            # 垂直机动过顶：副翼中立，机体滚转随俯仰自然演化。
+            da = 0.0
+        elif act.roll_rate != 0.0:
+            # 桶滚：直接跟踪滚转角速度，才能连续滚过 360°。
+            p_cmd = clamp(-act.roll_rate, -1.5, 1.5)
+            da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
+        else:
+            p_cmd = clamp(2.5 * wrap_pi(phi_cmd - ac.phi), -1.5, 1.5)
+            da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
+
+        # 俯仰：目标过载 → 目标升力系数 → 目标迎角 → 目标俯仰角速度 → 升降舵
+        cl_req = act.n * ac.weight / max(qbar * spec.wing_area, 1e-6)
+        cl_req = clamp(cl_req, -self._cl_max_effective(ac), self._cl_max_effective(ac))
+        # 矢量喷口能把迎角带到失速以后；无矢量机型仍限制在失速迎角内。
+        alpha_lim = spec.alpha_stall + 0.35 * spec.tvc_alpha_max
+        # 矢量增升把“线性段可用迎角”一并抬高，否则 cl_req 提高了、
+        # 迎角指令却仍被压回原失速迎角，增升拿不到。
+        alpha_lim = max(alpha_lim, self._alpha_stall_effective(ac))
+        alpha_cmd = clamp(
+            (cl_req - spec.cl0) / spec.cl_alpha, -alpha_lim, alpha_lim
+        )
+        if act.post_stall and spec.tvc_alpha_max > 0.0:
+            # 过失速指令：直接把目标迎角拉到矢量喷口能维持的极限。
+            alpha_cmd = spec.tvc_alpha_max
+        # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%，过载会偏小。
+        de_trim = -(spec.cm_alpha * alpha_cmd) / spec.cm_de
+        # 航迹旋转前馈：保持目标迎角时需要机头跟着航迹一起转（q ≈ gamma_dot），
+        # 否则纯比例环节会在 alpha_cmd - gamma_dot/3 处提前平衡，
+        # 稳态实际过载只有指令的 ~80%（高 G 机动拉不出 6 g 的根源）。
+        gamma_dot = G * (
+            ac.n * math.cos(ac.phi) - math.cos(ac.gamma)
+        ) / max(V, 1.0)
+        if act.pitch_rate != 0.0:
+            # 直接俯仰角速度指令：连续绕俯仰轴转过 360° 的动作（钟摆/库尔比特）
+            # 不能用迎角指令——迎角一到失速上限，比例项就把 q 拉回 0，机头
+            # 永远过不了顶。这里要求机体按给定角速度转，升降舵只做速率跟踪，
+            # 配平力矩按**当前**迎角抵消静稳定力矩，否则大迎角下的低头力矩
+            # 会把舵面权限吃光。
+            q_cmd = clamp(act.pitch_rate, -0.9, 0.9)
+            de_trim = -(
+                spec.cm_alpha * alpha * self._stall_stab_scale(ac, alpha)
+            ) / spec.cm_de
+        else:
+            q_cmd = clamp(8.0 * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
+        de = clamp(de_trim - 1.5 * (q_cmd - ac.q), -1.0, 1.0)
+
+        # 航向：侧滑角 → 目标偏航角速度 → 方向舵（同时抑制侧滑与偏航振荡）
+        beta = math.asin(clamp(ac.vb / V, -1.0, 1.0))
+        if act.yaw_rate != 0.0:
+            # 战术层要主动偏航（钟摆机动的舵面侧偏）：给它一个偏航角速度
+            # 基准，保留侧滑对齐项做增稳，避免把侧滑一直积到失速。
+            r_cmd = clamp(act.yaw_rate + 0.6 * beta, -0.9, 0.9)
+        else:
+            r_cmd = clamp(2.0 * beta, -0.5, 0.5)
+        dr = clamp(3.0 * (r_cmd - ac.r), -1.0, 1.0)
+        # 矢量喷口：迎角误差越大喷流偏得越多。低速时舵面几乎没有力矩，
+        # 这一路是 Su-57 能维持大迎角、过失速机动的关键。
+        tvc_p = 0.0
+        if spec.tvc > 0.0:
+            if act.pitch_rate != 0.0:
+                # 角速度指令段：喷流按指令方向偏，作为低速段的俯仰权限补充。
+                # 不能再按迎角误差算——机体转得比速度矢量快时迎角误差是负的，
+                # 会把喷流反偏，正好顶住这次旋转。
+                tvc_p = clamp(
+                    3.0 * q_cmd, -spec.tvc, spec.tvc
+                ) * ac.throttle
+            else:
+                tvc_p = clamp(
+                    2.0 * (alpha_cmd - alpha), -spec.tvc, spec.tvc
+                ) * ac.throttle
+        # 三元矢量偏航：归一化指令直接映射到喷口偏角，推力越小力矩越小。
+        tvc_y = clamp(act.tvc_yaw, -1.0, 1.0) * spec.tvc if spec.tvc > 0.0 else 0.0
+        return da, de, dr, tvc_p, tvc_y
+
+    def _integrate_rigid(self, ac: Aircraft, act: Action) -> None:
+        """6DOF：刚体六自由度积分（气动力/力矩 + 陀螺耦合 + 欧拉运动学）。"""
+        spec = ac.spec
+        dt = self.dt
+        rho = air_density(ac.z)
+
+        V = max(math.sqrt(ac.u * ac.u + ac.vb * ac.vb + ac.wb * ac.wb), 20.0)
+        qbar = 0.5 * rho * V * V
+        alpha = math.atan2(ac.wb, max(ac.u, 1.0))
+        beta = math.asin(clamp(ac.vb / V, -1.0, 1.0))
+        mach = mach_number(V, ac.z)
+        thrust = self._apply_power(ac, act, mach)
+
+        da, de, dr, tvc_p, tvc_y = self._surface_commands(ac, act, V, alpha, qbar)
+        ac.tvc_cmd = tvc_p
+
+        # 升力曲线：失速后升力快速衰减；矢量喷口机型衰减更慢，
+        # 因为喷流仍能把机头压在超大迎角上，机身也持续提供涡升力。
+        # 有矢量增升时，线性段一直延伸到新的失速迎角，之后才进入衰减，
+        # 相当于喷流把可用升力上限整体抬高。
+        a_abs = abs(alpha)
+        alpha_stall = self._alpha_stall_effective(ac)
+        if a_abs <= alpha_stall:
+            # 线性段也要服从超声速升力损失：cl_alpha 按失速迎角处刚好达到
+            # cl_max 标定，M1.6 以上再整体乘 lift_scale。
+            cl_lin = spec.cl0 + spec.cl_alpha * alpha
+            cl_lim = spec.cl_max_at(mach)
+            cl = clamp(cl_lin, -cl_lim, cl_lim)
+        else:
+            cl_stall = spec.cl0 + spec.cl_alpha * alpha_stall
+            cl_stall = min(cl_stall, spec.cl_max_at(mach))
+            decay_rate = 1.6 if spec.tvc <= 0.0 else 1.0
+            floor = 0.35 if spec.tvc <= 0.0 else 0.55
+            decay = max(floor, 1.0 - decay_rate * (a_abs - alpha_stall))
+            cl = math.copysign(cl_stall * decay, alpha)
+        k_ind = 1.0 / (math.pi * spec.aspect_ratio * spec.oswald)
+        mach = mach_number(V, ac.z)
+        cd = (
+            cd0_at(mach, spec.cd0)
+            + k_ind * cl * cl
+            + 0.8 * beta * beta
+            + BRAKE_CD * clamp(act.brake, 0.0, 1.0)
+        )
+        cy = spec.cy_beta * beta
+
+        qs = qbar * spec.wing_area
+        lift = qs * cl
+        drag = qs * cd
+        side = qs * cy
+        # 推力取 _apply_power 的结果：它已经把军推/加力分开、按燃油削减并
+        # 做了高度衰减。这里若再按 throttle×最大加力重算，加力开度会被忽略，
+        # 而且巡航油门会凭空多出约 1.5 倍推力，飞机会一路加速、盘旋也停不下来。
+
+        # 机体系合力（标准气动方程）：阻力沿速度反方向，升力垂直于速度。
+        # 注意升力在机体系 x 方向的分量是 +L sin(alpha)：迎角越大，升力越前倾。
+        fx = thrust - drag * ac.u / V + lift * math.sin(alpha)
+        fy = side - drag * ac.vb / V
+        fz = -drag * ac.wb / V - lift * math.cos(alpha) + thrust * tvc_p
+
+        # 重力在机体系的分量
+        st, ct = math.sin(ac.theta), math.cos(ac.theta)
+        sf, cf = math.sin(ac.phi), math.cos(ac.phi)
+        m = ac.mass if ac.mass > 0.0 else spec.mass
+        du = fx / m - G * st + ac.r * ac.vb - ac.q * ac.wb
+        dvb = fy / m + G * sf * ct + ac.p * ac.wb - ac.r * ac.u
+        dwb = fz / m + G * cf * ct + ac.q * ac.u - ac.p * ac.vb
+
+        # 气动力矩（无量纲系数 × 动压 × 面积 × 特征长度）
+        b, c = spec.span, spec.chord
+        p_hat = ac.p * b / (2.0 * V)
+        q_hat = ac.q * c / (2.0 * V)
+        r_hat = ac.r * b / (2.0 * V)
+        roll_m = qs * b * (
+            spec.cl_beta * beta + spec.cl_p * p_hat + spec.cl_da * da + spec.cl_dr * dr
+        )
+        stab = 1.0
+        if act.pitch_rate != 0.0:
+            # 过顶段与 _surface_commands 用同一个衰减系数，配平才前后一致。
+            stab = self._stall_stab_scale(ac, alpha)
+        pitch_m = qs * c * (
+            spec.cm_alpha * alpha * stab + spec.cm_q * q_hat + spec.cm_de * de
+        )
+        if tvc_p != 0.0:
+            # 矢量喷口的推力方向偏转在尾段产生俯仰力矩，低速时补足舵面权限。
+            pitch_m += thrust * tvc_p * 0.35 * spec.length
+        yaw_m = qs * b * (
+            spec.cn_beta * beta + spec.cn_r * r_hat
+            + spec.cn_dr * dr + spec.cn_da * da
+        )
+        if tvc_y != 0.0:
+            # 三元矢量喷口的偏航分量：近零速时舵面无效，这是唯一能给出
+            # 偏航力矩的通道（钟摆在顶点附近的侧摆靠它）。
+            yaw_m += thrust * tvc_y * 0.35 * spec.length
+        ixx, iyy, izz = spec.ixx_of(m), spec.iyy_of(m), spec.izz_of(m)
+        p_dot = (roll_m + (iyy - izz) * ac.q * ac.r) / ixx
+        q_dot = (pitch_m + (izz - ixx) * ac.p * ac.r) / iyy
+        r_dot = (yaw_m + (ixx - iyy) * ac.p * ac.q) / izz
+
+        ac.u += du * dt
+        ac.vb += dvb * dt
+        ac.wb += dwb * dt
+        ac.p = clamp(ac.p + p_dot * dt, -6.0, 6.0)
+        ac.q = clamp(ac.q + q_dot * dt, -4.0, 4.0)
+        ac.r = clamp(ac.r + r_dot * dt, -2.0, 2.0)
+
+        # 姿态用四元数积分：q̇ = 0.5·q ⊗ (0, p, q, r)，再归一化。
+        # 欧拉角只作为派生量输出，theta 越过 ±90° 时不再被夹断——
+        # 筋斗、半滚倒转、垂直剪刀都需要机体连续过顶。
+        qw, qx, qy, qz = ac.quat
+        dq = _quat_mul((qw, qx, qy, qz), (0.0, ac.p, ac.q, ac.r))
+        qn = (
+            qw + 0.5 * dq[0] * dt,
+            qx + 0.5 * dq[1] * dt,
+            qy + 0.5 * dq[2] * dt,
+            qz + 0.5 * dq[3] * dt,
+        )
+        norm = math.sqrt(sum(c * c for c in qn)) or 1.0
+        ac.quat = tuple(c / norm for c in qn)
+        ac.phi, ac.theta, ac.psi = euler_from_quat(ac.quat)
+
+        # 世界系速度与位置
+        rot = quat_to_matrix(ac.quat)
+        wx = rot[0][0] * ac.u + rot[0][1] * ac.vb + rot[0][2] * ac.wb
+        wy = rot[1][0] * ac.u + rot[1][1] * ac.vb + rot[1][2] * ac.wb
+        wz = rot[2][0] * ac.u + rot[2][1] * ac.vb + rot[2][2] * ac.wb
+        ac.x += wx * dt
+        ac.y += wy * dt
+        ac.z += wz * dt
+
+        # 派生出点质量视角的状态，供观测、武器、渲染和裁判复用
+        ac.v = max(math.sqrt(ac.u * ac.u + ac.vb * ac.vb + ac.wb * ac.wb), 1.0)
+        ac.gamma = math.asin(clamp(wz / ac.v, -1.0, 1.0))
+        ac.n = clamp(lift / ac.weight, N_MIN, 12.0)
+        ac.bank = ac.phi
+
+    def _update_lock(self) -> None:
+        """双通道锁定：红外导引头与载机雷达各自累计稳定跟踪时间。
+
+        目标离开包线立即解锁（不保留记忆）。红外弹的截获扇区取导引头
+        万向支架极限，因此机头不必对准目标也能离轴锁定；雷达制导中距弹
+        在发射后还要保持跟踪（主动弹在末段截获前），否则导弹会丢失制导。
+        """
+        for i, ac in enumerate(self.acs):
+            ac.launch_cd = max(0.0, ac.launch_cd - self.dt)
+            ac.radar_cd = max(0.0, ac.radar_cd - self.dt)
+            foe = self.acs[1 - i]
+            if not ac.alive or not foe.alive:
+                ac.locked = ac.radar_locked = False
+                ac.lock_timer = ac.radar_lock_timer = 0.0
+                continue
+
+            dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist < 1e-6:
+                ac.locked = ac.radar_locked = False
+                ac.lock_timer = ac.radar_lock_timer = 0.0
+                continue
+            nx, ny, nz = nose_direction(ac)
+            ang = math.acos(clamp(
+                (dx * nx + dy * ny + dz * nz) / dist, -1.0, 1.0
+            ))
+
+            mspec = ac.spec.missile
+            if mspec is None or ac.missiles <= 0:
+                ac.locked = False
+                ac.lock_timer = 0.0
+            elif ac.contact < CONTACT_TRACK:
+                # 红外导引头也要先“看见”目标（IRST/目视/雷达跟踪均可）。
+                ac.locked = False
+                ac.lock_timer = 0.0
+            else:
+                lo, hi = launch_envelope(ac, mspec, foe)
+                inside = lo <= dist <= hi and ang <= mspec.gimbal
+                ac.lock_timer = (
+                    min(ac.lock_timer + self.dt, mspec.lock_time) if inside else 0.0
+                )
+                ac.locked = ac.lock_timer >= mspec.lock_time
+
+            rspec = ac.spec.radar_missile
+            if rspec is None or ac.radar_missiles <= 0:
+                ac.radar_locked = False
+                ac.radar_lock_timer = 0.0
+            elif not ac.radar_on or ac.contact < CONTACT_FIRE:
+                # 静默（雷达关机）或只有 IRST/预警机/侧阵的 track，都拿不到
+                # 火控级照射，中距弹无法装订诸元。
+                ac.radar_locked = False
+                ac.radar_lock_timer = 0.0
+            else:
+                # 目标 RCS 越小，雷达截获距离越短（隐身机的核心收益）。
+                lo, hi = launch_envelope(ac, rspec, foe)
+                inside = lo <= dist <= hi and ang <= rspec.seeker_fov
+                ac.radar_lock_timer = (
+                    min(ac.radar_lock_timer + self.dt, rspec.lock_time)
+                    if inside else 0.0
+                )
+                ac.radar_locked = ac.radar_lock_timer >= rspec.lock_time
+
+    def _weapons(self, actions: list[Action]) -> None:
+        """机炮按射速生成弹丸；命中由后续的外弹道积分判定。
+
+        旧实现是“目标在炮口视锥内就按秒伤扣血”：没有飞行时间、没有提前量、
+        没有下坠与散布，6DOF 下炮线偏置也被抹平。现在每次物理步按
+        rounds_per_sec·dt 累积发数，弹丸以“载机速度 + 炮口初速”出膛，
+        之后只受二次阻力与重力，命中用线段-球判定，单发伤害 = dps/射速。
+        """
+        for i, (ac, act) in enumerate(zip(self.acs, actions)):
+            # 记录扳机状态，渲染层据此画炮口焰与炮线特效。
+            ac.firing = bool(ac.alive and act.fire and ac.ammo > 0.0)
+            if not ac.firing:
+                ac.gun_pending = 0.0
+                continue
+            spec = ac.spec
+            foe = self.acs[1 - i]
+            if not foe.alive:
+                ac.firing = False
+                ac.gun_pending = 0.0
+                continue
+            # 没有目视接触时仍允许开火（靠跟踪数据压炮），但只打 600 m 内，
+            # 且散布 ×2.5。越远越像“对着大概方向泼弹”，是真实的浪费。
+            spread = spec.gun_spread * (
+                1.0 if ac.tally else GUN_NO_TALLY_SPREAD
+            )
+            if not ac.tally:
+                dd = math.sqrt(
+                    (foe.x - ac.x) ** 2 + (foe.y - ac.y) ** 2 + (foe.z - ac.z) ** 2
+                )
+                if dd > GUN_NO_TALLY_RANGE:
+                    ac.firing = False
+                    ac.gun_pending = 0.0
+                    continue
+
+            ac.gun_pending += spec.rounds_per_sec * self.dt
+            n_new = int(ac.gun_pending)
+            ac.gun_pending -= n_new
+            n_new = min(n_new, 2, int(ac.ammo + 1e-9))
+            if n_new <= 0:
+                continue
+            ac.ammo = max(0.0, ac.ammo - n_new)
+            self.stats["rounds_fired"] += n_new
+            self.stats["bullets_fired"] += n_new
+            if self.first_fire_t[i] is None:
+                self.first_fire_t[i] = self.t
+
+            nx, ny, nz = nose_direction(ac)
+            # 与机头垂直的两个基向量，用来把高斯散布叠加到炮线上。
+            rx, ry, rz = (0.0, 0.0, 1.0) if abs(nz) < 0.9 else (1.0, 0.0, 0.0)
+            ux = ny * rz - nz * ry
+            uy = nz * rx - nx * rz
+            uz = nx * ry - ny * rx
+            un = max(math.sqrt(ux * ux + uy * uy + uz * uz), 1e-9)
+            ux, uy, uz = ux / un, uy / un, uz / un
+            wx = ny * uz - nz * uy
+            wy = nz * ux - nx * uz
+            wz = nx * uy - ny * ux
+
+            vx, vy, vz = world_velocity(ac)
+            area = math.pi * (0.5 * spec.bullet_diameter) ** 2
+            drag_k = air_density(ac.z) * 0.30 * area / (2.0 * spec.bullet_mass)
+            damage = spec.gun_dps / max(spec.rounds_per_sec, 1e-6)
+            muzzle = spec.muzzle_speed
+            for _ in range(n_new):
+                sx = self._rng.gauss(0.0, spread)
+                sy = self._rng.gauss(0.0, spread)
+                dx = nx + ux * sx + wx * sy
+                dy = ny + uy * sx + wy * sy
+                dz = nz + uz * sx + wz * sy
+                dn = max(math.sqrt(dx * dx + dy * dy + dz * dz), 1e-9)
+                dx, dy, dz = dx / dn, dy / dn, dz / dn
+                self.bullets.append(Bullet(
+                    owner=i,
+                    x=ac.x + nx * spec.length * 0.5,
+                    y=ac.y + ny * spec.length * 0.5,
+                    z=ac.z + nz * spec.length * 0.5,
+                    vx=vx + muzzle * dx,
+                    vy=vy + muzzle * dy,
+                    vz=vz + muzzle * dz,
+                    mass=spec.bullet_mass,
+                    drag_k=drag_k,
+                    damage=damage,
+                ))
+
+        self._launch_missiles(actions)
+
+    def _integrate_bullets(self) -> None:
+        """弹丸外弹道：二次阻力 + 重力，线段-球命中判定。"""
+        dt = self.dt
+        for b in self.bullets:
+            if not b.alive:
+                continue
+            b.t += dt
+            sp = math.sqrt(b.vx * b.vx + b.vy * b.vy + b.vz * b.vz)
+            ax = -b.drag_k * sp * b.vx
+            ay = -b.drag_k * sp * b.vy
+            az = -b.drag_k * sp * b.vz - G
+            x0, y0, z0 = b.x, b.y, b.z
+            b.vx += ax * dt
+            b.vy += ay * dt
+            b.vz += az * dt
+            sx, sy, sz = b.vx * dt, b.vy * dt, b.vz * dt
+            b.x = x0 + sx
+            b.y = y0 + sy
+            b.z = z0 + sz
+
+            for j, ac in enumerate(self.acs):
+                if j == b.owner or not ac.alive:
+                    continue
+                r = max(3.0, 0.35 * ac.spec.length)
+                l2 = sx * sx + sy * sy + sz * sz
+                if l2 <= 1e-12:
+                    continue
+                t = clamp(((ac.x - x0) * sx + (ac.y - y0) * sy
+                           + (ac.z - z0) * sz) / l2, 0.0, 1.0)
+                dx = x0 + sx * t - ac.x
+                dy = y0 + sy * t - ac.y
+                dz = z0 + sz * t - ac.z
+                if dx * dx + dy * dy + dz * dz <= r * r:
+                    b.alive = False
+                    damage = min(b.damage, ac.hp)
+                    ac.hp -= damage
+                    self.stats["damage_dealt"][b.owner] += damage
+                    self.stats["bullet_hits"] += 1
+                    break
+
+            if b.alive and (b.t >= b.life or b.z <= self.z_floor):
+                b.alive = False
+
+        # 高射速下弹丸列表会快速膨胀，定期清掉已失效的弹丸（渲染只关心在飞的）。
+        if len(self.bullets) > 400:
+            self.bullets = [b for b in self.bullets if b.alive]
+
+    def _launch_missiles(self, actions: list[Action]) -> None:
+        """只有完成锁定、在发射包线内、还有余弹且冷却结束才能发射。"""
+        for i, (ac, act) in enumerate(zip(self.acs, actions)):
+            if not ac.alive:
+                continue
+            self._try_launch(i, ac, ac.spec.missile, act.launch)
+            self._try_launch(i, ac, ac.spec.radar_missile, act.launch_radar)
+
+    def _self_hit_risk(self, ac: Aircraft, mspec: MissileSpec,
+                       px: float, py: float, pz: float,
+                       vx: float, vy: float, vz: float,
+                       foe: Aircraft) -> bool:
+        """离轴发射前的自伤检查：前推弹道，判断弹会不会掉头扫中载机。
+
+        弹离架时弹体轴沿挂架、速度 = 载机速度 + 45 m/s，之后才用可用过载
+        转向目标。离轴角大、载机速度低时转弯半径很小，弹可能在前方掉头
+        时切进载机航迹。这里以“最大可用过载 + 舵机滞后”的最保守弹道
+        前推 1.5 s：只有弹与载机距离在缩小且已经小于战斗部杀伤半径加余量
+        时才判不安全——刚出膛时距离很小但正在拉开，不算风险。
+        """
+        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if speed < 1e-6:
+            return True
+        hx, hy, hz = vx / speed, vy / speed, vz / speed
+        # 可用过载越大，掉头半径越小，风险越高。
+        turn_rate = 0.9 * mspec.max_g * G / speed
+        horizon = SELF_HIT_HORIZON
+        t_start = mspec.autopilot_tau
+        if mspec.ignition_timeout > 0.0:
+            # 预点火段弹体由 RCS 快速指向目标，转向角速度可能比气动掉头更快；
+            # 自伤预测必须把这段时间与更高的摆头速率一起算进去，否则
+            # “先摆姿态、后点火”会把原先安全的离轴角变成不安全。
+            turn_rate = max(turn_rate, mspec.rcs_slew)
+            horizon += mspec.ignition_timeout
+            t_start = 0.0
+        danger = mspec.lethal_radius + SELF_HIT_MARGIN
+        ownvx, ownvy, ownvz = world_velocity(ac)
+        foevx, foevy, foevz = world_velocity(foe)
+        prev_d = 0.0
+        dt = SELF_HIT_DT
+        t = 0.0
+        for k in range(1, int(horizon / dt) + 1):
+            px += vx * dt
+            py += vy * dt
+            pz += vz * dt
+            t = k * dt
+            if t >= t_start:
+                rx = foe.x + foevx * t - px
+                ry = foe.y + foevy * t - py
+                rz = foe.z + foevz * t - pz
+                d = math.sqrt(rx * rx + ry * ry + rz * rz)
+                if d > 1e-6:
+                    ux, uy, uz = rx / d, ry / d, rz / d
+                    cosang = clamp(hx * ux + hy * uy + hz * uz, -1.0, 1.0)
+                    ang = math.acos(cosang)
+                    if ang > 1e-9:
+                        step = min(ang, turn_rate * dt)
+                        # 在 h→u 的平面内把速度方向转 step，弹体仍保持速率。
+                        wx, wy, wz = ux - hx * cosang, uy - hy * cosang, uz - hz * cosang
+                        wn = math.sqrt(wx * wx + wy * wy + wz * wz)
+                        if wn > 1e-9:
+                            c, s = math.cos(step), math.sin(step)
+                            hx, hy, hz = (
+                                hx * c + wx / wn * s,
+                                hy * c + wy / wn * s,
+                                hz * c + wz / wn * s,
+                            )
+                            hn = math.sqrt(hx * hx + hy * hy + hz * hz)
+                            hx, hy, hz = hx / hn, hy / hn, hz / hn
+                            vx, vy, vz = hx * speed, hy * speed, hz * speed
+            ox = ac.x + ownvx * t
+            oy = ac.y + ownvy * t
+            oz = ac.z + ownvz * t
+            d = math.sqrt((px - ox) ** 2 + (py - oy) ** 2 + (pz - oz) ** 2)
+            # 距离在缩小且已进入杀伤范围：弹正朝载机飞回来。
+            if t >= 0.2 and d < danger and d < prev_d - 1e-6:
+                return True
+            prev_d = d
+        return False
+
+    def _try_launch(self, i: int, ac: Aircraft,
+                    mspec: MissileSpec | None, requested: bool) -> None:
+        if mspec is None or not requested:
+            return
+        radar = mspec.is_radar
+        if (ac.radar_cd if radar else ac.launch_cd) > 0.0:
+            return
+        count = ac.radar_missiles if radar else ac.missiles
+        locked = ac.radar_locked if radar else ac.locked
+        if count <= 0 or not locked:
+            return
+        # 发射门控：中距弹必须火控级接触（雷达开机且锁定）；近距弹至少要有
+        # 跟踪（IRST/目视/雷达均可）。
+        if radar and (not ac.radar_on or ac.contact < CONTACT_FIRE):
+            return
+        if not radar and ac.contact < CONTACT_TRACK:
+            return
+        foe = self.acs[1 - i]
+        if not foe.alive:
+            return
+        dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        lo, hi = launch_envelope(ac, mspec, foe)
+        if not (lo <= dist <= hi):
+            return
+
+        nx, ny, nz = nose_direction(ac)
+        # 离轴角必须落在导引头万向支架内，支架之外的“锁定”是无效的。
+        ang = math.acos(clamp(
+            (dx * nx + dy * ny + dz * nz) / dist, -1.0, 1.0
+        ))
+        if ang > mspec.gimbal:
+            return
+        vx, vy, vz = world_velocity(ac)
+        launch_speed = 45.0
+        off = ac.spec.length * 0.5
+        lx, ly, lz = ac.x + nx * off, ac.y + ny * off, ac.z + nz * off
+        lvx, lvy, lvz = (
+            vx + nx * launch_speed,
+            vy + ny * launch_speed,
+            vz + nz * launch_speed,
+        )
+        # 离轴发射自伤保护：预测弹会掉头扫过载机时，宁可少打一发。
+        if self._self_hit_risk(ac, mspec, lx, ly, lz, lvx, lvy, lvz, foe):
+            return
+        self.missiles.append(
+            Missile(
+                spec=mspec,
+                owner=i,
+                target=1 - i,
+                x=lx,
+                y=ly,
+                z=lz,
+                vx=lvx,
+                vy=lvy,
+                vz=lvz,
+                mass=mspec.mass,
+                fuel=mspec.propellant,
+                nx=nx, ny=ny, nz=nz,
+                ignited=(mspec.ignition_timeout <= 0.0),
+                roll_seed=int(round(self.t * 1000.0)) * 131 + i * 7919 + 1,
+            )
+        )
+        if radar:
+            ac.radar_missiles -= 1
+            ac.radar_cd = mspec.cooldown
+        else:
+            ac.missiles -= 1
+            ac.launch_cd = mspec.cooldown
+        ac.mass = max(1.0, ac.mass - mspec.mass)
+        self.stats["missiles_fired"] += 1
+        self.stats["missiles_launched"][i] += 1
+        if self.first_fire_t[i] is None:
+            self.first_fire_t[i] = self.t
+        self.events.append((self.t, f"{ac.spec.name} 发射 {mspec.name}"))
+
+    def _update_countermeasures(self) -> None:
+        """干扰物投放、飘落与对在飞导弹的诱骗。
+
+        自动投放：雷达弹逼近到 AUTO_CHAFF_RANGE、红外弹逼近到 AUTO_FLARE_RANGE
+        才投放，且必须已建立跟踪（红外弹还要越过导引头锁定时间）。热诱弹按
+        FLARE_SALVO 连投，弹药因此是真正会打光的。
+        诱骗判定：诱饵落在导引头视场内、足够近、且已越过 CM_ARM_TIME 的
+        点火展开延迟后，才按秒概率把导弹视线拉到诱饵上（主动弹需要已进入
+        末段自主截获，中制导段的数据链不受箔条影响）。
+        """
+        dt = self.dt
+
+        for idx, ac in enumerate(self.acs):
+            ac.chaff_cd = max(0.0, ac.chaff_cd - dt)
+            ac.flare_cd = max(0.0, ac.flare_cd - dt)
+            if not ac.alive:
+                continue
+            for m in self.missiles:
+                if not m.alive or m.target != idx or not m.guided:
+                    continue
+                dx, dy, dz = ac.x - m.x, ac.y - m.y, ac.z - m.z
+                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if m.spec.is_radar and ac.chaff > 0 and ac.chaff_cd <= 0.0:
+                    if dist <= AUTO_CHAFF_RANGE:
+                        # 箔条必须配合横转/三九投放：迎头撒出去只会被多普勒
+                        # 滤波直接滤掉，白白浪费干扰弹。
+                        q = notch_quality(ac, m.x, m.y, m.z)
+                        if q >= CHAFF_NOTCH_MIN:
+                            self._drop(idx, ac, "chaff", q)
+                            ac.chaff -= 1
+                            ac.chaff_cd = CM_DROP_CD
+                elif not m.spec.is_radar and ac.flares >= FLARE_SALVO and ac.flare_cd <= 0.0:
+                    # 热诱弹只在导引头确实锁定、且已经烧过锁定时间之后才投：
+                    # 投放器不是听到“有红外弹”就撒，而是等告警确认被跟踪。
+                    if dist <= AUTO_FLARE_RANGE and m.t >= m.spec.lock_time:
+                        self._drop(idx, ac, "flare")
+                        ac.flares -= FLARE_SALVO
+                        ac.flare_cd = CM_DROP_CD
+
+        # 干扰物飘落：强阻尼 + 重力，箔条几乎停在原地，热诱弹掉得更快。
+        for cm in self.counters:
+            if not cm.alive:
+                continue
+            cm.t += dt
+            if cm.t >= cm.life:
+                cm.alive = False
+                continue
+            decay = math.exp(-1.8 * dt)
+            cm.vx *= decay
+            cm.vy *= decay
+            cm.vz = (cm.vz - G * dt) * decay
+            cm.x += cm.vx * dt
+            cm.y += cm.vy * dt
+            cm.z += cm.vz * dt
+
+        # 诱骗：每枚导弹每个物理步按概率被最近的、在视场内的对应诱饵吸引。
+        for m in self.missiles:
+            if not m.alive or not m.guided or m.decoy_t > 0.0:
+                continue
+            # 主动弹只有末段自主截获后才吃箔条；中制导段靠数据链，骗不走。
+            if m.spec.is_radar and not m.active:
+                continue
+            kind = "chaff" if m.spec.is_radar else "flare"
+            reach = CHAFF_SEDUCE_RANGE if m.spec.is_radar else FLARE_SEDUCE_RANGE
+            rate = (
+                CHAFF_SEDUCE_RATE if m.spec.is_radar else FLARE_SEDUCE_RATE
+            ) * m.spec.cm_resist
+            best = None
+            best_d = reach
+            for cm in self.counters:
+                if not cm.alive or cm.kind != kind or cm.owner == m.owner:
+                    continue
+                dx, dy, dz = cm.x - m.x, cm.y - m.y, cm.z - m.z
+                d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d >= best_d or d < 1e-6:
+                    continue
+                # 刚投放的诱饵还没点火/展开，骗不走导引头。
+                if cm.t < CM_ARM_TIME:
+                    continue
+                # 诱饵必须落在弹体导引头视场内才有意义。
+                if (m.nx * dx + m.ny * dy + m.nz * dz) / d < math.cos(m.spec.gimbal):
+                    continue
+                best, best_d = cm, d
+            if best is None:
+                continue
+            if not m.spec.is_radar:
+                # 热诱弹诱骗率随“弹-机距离”衰减：越近，载机在导引头视场里
+                # 占的比例越大、诱饵脱离视场越快，骗走的概率越低；近界内为零。
+                tgt = self.acs[m.target]
+                dd = math.sqrt(
+                    (tgt.x - m.x) ** 2 + (tgt.y - m.y) ** 2 + (tgt.z - m.z) ** 2
+                )
+                rate *= clamp(
+                    (dd - FLARE_MIN_SEDUCE_RANGE)
+                    / (FLARE_SEDUCE_RANGE - FLARE_MIN_SEDUCE_RANGE),
+                    0.0, 1.0,
+                )
+            if self._rng.random() < rate * dt * best.quality:
+                if m.spec.is_sarh:
+                    # 半主动弹没有自主导引头，箔条直接打断载机的照射回路。
+                    m.guided = False
+                else:
+                    m.decoy = best.position
+                    m.decoy_t = CM_DECOY_KEEP
+                self.events.append((
+                    self.t,
+                    f"{m.spec.name} 被{'箔条' if kind == 'chaff' else '热诱弹'}诱骗",
+                ))
+
+    def _drop(self, idx: int, ac: Aircraft, kind: str,
+              quality: float = 1.0) -> None:
+        """从机尾投放一枚干扰物：初速取载机速度的 30%，并带一点下坠。
+
+        quality 是投放时的横转程度，箔条只有落在载机同一多普勒通道里
+        才有效，这里把它记在诱饵上，供后续诱骗概率使用。
+        """
+        vx, vy, vz = world_velocity(ac)
+        life = CHAFF_LIFE if kind == "chaff" else FLARE_LIFE
+        self.counters.append(
+            Countermeasure(
+                kind=kind,
+                owner=idx,
+                x=ac.x,
+                y=ac.y,
+                z=ac.z,
+                vx=vx * 0.30,
+                vy=vy * 0.30,
+                vz=vz * 0.30 - 6.0,
+                life=life,
+                quality=clamp(quality, 0.0, 1.0),
+            )
+        )
+
+    def _update_missiles(self) -> None:
+        """格斗弹动力学：助推 + 阻力 + 重力 + 比例导引 + 有限舵面过载。
+
+        命中完全由几何与能量决定：导引头一旦看不到目标就转成无控弹道，
+        近炸引信用线段最近距离判定，避免高速弹丸在两帧之间穿过目标。
+        """
+        dt = self.dt
+        for m in self.missiles:
+            if not m.alive:
+                continue
+            target = self.acs[m.target]
+            m.t += dt
+            if m.t >= m.spec.life:
+                m.alive = False
+                continue
+            if not target.alive:
+                m.alive = False
+                continue
+
+            # 被干扰物诱骗：视线改成追踪诱饵点（诱饵视为静止目标），
+            # 诱骗时间结束后导引头彻底丢失目标，转成无控弹道。
+            decoy = None
+            if m.decoy_t > 0.0:
+                m.decoy_t -= dt
+                if m.decoy_t <= 0.0:
+                    m.decoy = None
+                    m.guided = False
+                else:
+                    decoy = m.decoy
+
+            # 雷达制导中制导段：半主动弹全程靠载机照射；主动弹只在末段
+            # 自主截获（pitbull）前靠载机雷达提供目标信息与数据链。
+            # 载机被击落、或者机头偏出照射锥且尚未截获，导弹立即转成无控弹道。
+            if m.spec.is_radar:
+                if m.spec.is_arh and not m.active:
+                    # 主动导引头截获距离按目标 RCS 缩放：隐身目标要更近了才“开眼”。
+                    mdx, mdy, mdz = target.x - m.x, target.y - m.y, target.z - m.z
+                    mdist = math.sqrt(mdx * mdx + mdy * mdy + mdz * mdz)
+                    if (
+                        m.guided
+                        and mdist
+                        <= m.spec.active_range * rcs_scale(target.spec.rcs)
+                        and doppler_visibility(
+                            (m.x, m.y, m.z),
+                            (target.x, target.y, target.z),
+                            world_velocity(target), mdv=MDV_SEEKER,
+                        ) >= 0.5
+                    ):
+                        m.active = True
+                if not m.active:
+                    shooter = self.acs[m.owner]
+                    illum = False
+                    if shooter.alive:
+                        sdx, sdy, sdz = target.x - shooter.x, target.y - shooter.y, target.z - shooter.z
+                        sdist = max(math.sqrt(sdx * sdx + sdy * sdy + sdz * sdz), 1e-6)
+                        snx, sny, snz = nose_direction(shooter)
+                        sang = math.acos(clamp(
+                            (sdx * snx + sdy * sny + sdz * snz) / sdist, -1.0, 1.0
+                        ))
+                        # 目标横穿掉进多普勒盲区时，载机雷达同样看不见它，
+                        # 照射/数据链随之中断——这正是“三九破中制导”的物理本质。
+                        illum = (
+                            sdist <= m.spec.max_range
+                            and sang <= SARH_ILLUM_FOV
+                            and radar_visibility(shooter, target) >= 0.5
+                        )
+                    # 失照不立刻丢弹：弹上惯导/数据链可以按最后一次诸元外推，
+                    # 目标短暂横穿（notch）后恢复照射还能接上；连续失照超过
+                    # MISSILE_MIDCOAST_MAX 才真正转无控。
+                    if illum:
+                        m.mid_t = 0.0
+                    else:
+                        m.mid_t += dt
+                        if m.mid_t > MISSILE_MIDCOAST_MAX:
+                            m.guided = False
+
+            # 诱骗期间视线指向诱饵，否则指向真目标。
+            if decoy is None:
+                ax_, ay_, az_ = target.x, target.y, target.z
+            else:
+                ax_, ay_, az_ = decoy
+            rx, ry, rz = ax_ - m.x, ay_ - m.y, az_ - m.z
+            dist = max(math.sqrt(rx * rx + ry * ry + rz * rz), 1e-6)
+            losx, losy, losz = rx / dist, ry / dist, rz / dist
+
+            # 预点火段：近距弹离架后先不点主发动机，靠 RCS/燃气发生器把弹体
+            # 轴摆向目标，摆正（或超时）之后再点火加速。真实近距弹就是这么
+            # 发射的：先摆姿态、后点发动机，不必在离架瞬间以大迎角拉满过载。
+            if not m.ignited:
+                ang_body = math.acos(clamp(
+                    m.nx * losx + m.ny * losy + m.nz * losz, -1.0, 1.0
+                ))
+                if m.t >= m.spec.ignition_timeout or (
+                    m.t >= m.spec.ignition_delay
+                    and ang_body <= m.spec.ignition_align
+                ):
+                    m.ignited = True
+                    m.t_ign = m.t
+            pre_ignition = not m.ignited
+            # 发动机工作时间从点火时刻起算，保证助推段时长/总冲不因延迟缩水。
+            burn_t = max(m.t - m.t_ign, 0.0)
+
+            # 推进剂质量流失：质量流与当前推力成正比（恒定比冲），
+            # 弹重随时间下降，加速度 a=T/m 因此逐渐变大；燃料耗尽后熄火。
+            thrust = 0.0
+            if m.ignited and m.fuel > 1e-6 and m.mass > 1e-6:
+                flow = m.spec.mass_flow_at(burn_t)
+                burn = min(m.fuel, flow * dt)
+                m.fuel -= burn
+                m.mass -= burn
+                # 熄火判据用“烧完”而不是“本步没烧满”：后者会把正常步误判成熄火。
+                thrust = 0.0 if m.fuel <= 1e-6 else m.spec.thrust_at(burn_t)
+            if m.mass <= 1.0:
+                m.alive = False
+                continue
+
+            speed = max(m.speed, 1e-6)
+            ux, uy, uz = m.vx / speed, m.vy / speed, m.vz / speed
+
+            rho = air_density(m.z)
+            qbar = 0.5 * rho * speed * speed
+            qs = max(qbar * m.spec.ref_area, 1e-6)
+            # 燃气舵直接力：只要发动机还在工作、还在可用窗口内，喷流偏转就
+            # 能给出一份与动压无关的横向控制力，低速大离轴时尤其有用。
+            tvc_accel = 0.0
+            if m.spec.tvc_frac > 0.0 and burn_t < m.spec.tvc_time and thrust > 0.0:
+                tvc_accel = m.spec.tvc_frac * thrust / m.mass
+            a_axis_max = min(
+                m.spec.max_g * G,
+                qs * m.spec.cn_max / m.mass + tvc_accel,
+            )
+            m.g_avail = a_axis_max / G
+            # 动压不足时舵面压不出升力：导弹已经无法修正弹道，
+            # 继续按“制导”处理会让它一边掉速一边追着飞机爬，不符合实际。
+            # 预点火段本来就没有气动控制（姿态由 RCS 摆），跳过这两条判据，
+            # 等点火后再按可用过载判定是否还能跟得上目标。
+            if not pre_ignition:
+                if qbar < MISSILE_MIN_Q:
+                    m.guided = False
+                # 更硬的判据：可用过载连 1g 都压不出来时，弹已经跟不上目标，
+                # 不能再算“制导中”，否则会出现比飞机还慢的僵尸弹。
+                if a_axis_max < G:
+                    m.guided = False
+
+            # 导引头视场相对弹体轴；发射瞬间沿挂架，之后弹体以可用过载
+            # 对应的角速度转向目标视线。目标视线转得比弹体快时才会丢锁。
+            cos_seeker = clamp(
+                m.nx * losx + m.ny * losy + m.nz * losz, -1.0, 1.0
+            )
+            ang_seeker = math.acos(cos_seeker)
+            # 主动弹在末段截获前由数据链中制导，弹轴还没对准目标也不会丢弹；
+            # 截获之后才真正靠自己的导引头，视场越界即丢失目标。
+            midcourse = m.spec.is_arh and not m.active
+            # 截获之后弹自己的导引头一样受多普勒盲区限制：目标横穿、弹目
+            # 相对径向速度落进凹口，弹就丢了这帧目标。但横穿是暂时的，
+            # 只要目标退出盲区，导引头还能重新捕获——所以这里只累积计时，
+            # 连续盲区超过 MISSILE_BLIND_MAX 才真正转无控弹道。
+            seeker_blind = m.active and doppler_visibility(
+                (m.x, m.y, m.z), (target.x, target.y, target.z),
+                world_velocity(target), mdv=MDV_SEEKER,
+            ) <= 0.0
+            m.blind_t = m.blind_t + dt if seeker_blind else 0.0
+            fov_bad = ang_seeker > m.spec.gimbal and not midcourse
+            m.fov_t = m.fov_t + dt if fov_bad else 0.0
+            if m.blind_t > MISSILE_BLIND_MAX or m.fov_t > MISSILE_FOV_MAX:
+                m.guided = False
+            elif not seeker_blind and not fov_bad:
+                # 弹体轴转向目标视线：弹体可以转得比速度矢量快，二者之差
+                # 就是迎角（气动舵面因此建立升力）。但迎角受气动极限约束，
+                # 超出后翼面失速；这里把弹体轴投影回迎角锥内。
+                # 预点火段由 RCS/燃气发生器摆姿态，角速度更高，也不受气动
+                # 迎角限制——这正是“先摆正弹体、再点火”的意义。
+                if ang_seeker > 1e-6:
+                    if pre_ignition and m.spec.rcs_slew > 0.0:
+                        slew = m.spec.rcs_slew
+                    else:
+                        slew = MISSILE_SLEW_RATE
+                    frac = min(1.0, slew * dt / ang_seeker)
+                    px_, py_, pz_ = (
+                        losx - m.nx * cos_seeker,
+                        losy - m.ny * cos_seeker,
+                        losz - m.nz * cos_seeker,
+                    )
+                    pn_ = math.sqrt(px_ * px_ + py_ * py_ + pz_ * pz_)
+                    if pn_ > 1e-9:
+                        px_, py_, pz_ = px_ / pn_, py_ / pn_, pz_ / pn_
+                        ca = math.cos(ang_seeker * frac)
+                        sa = math.sin(ang_seeker * frac)
+                        m.nx = m.nx * ca + px_ * sa
+                        m.ny = m.ny * ca + py_ * sa
+                        m.nz = m.nz * ca + pz_ * sa
+                        nn = math.sqrt(m.nx * m.nx + m.ny * m.ny + m.nz * m.nz)
+                        m.nx, m.ny, m.nz = m.nx / nn, m.ny / nn, m.nz / nn
+                if pre_ignition:
+                    alpha_max = RCS_ALPHA_MAX
+                elif m.spec.ignition_timeout > 0.0:
+                    # 点火后把姿态角限制从 RCS 值平滑收回到气动极限。
+                    blend = clamp(burn_t / IGNITION_ALPHA_BLEND, 0.0, 1.0)
+                    alpha_max = (
+                        MISSILE_ALPHA_MAX
+                        + (RCS_ALPHA_MAX - MISSILE_ALPHA_MAX) * (1.0 - blend)
+                    )
+                else:
+                    alpha_max = MISSILE_ALPHA_MAX
+                cos_a = m.nx * ux + m.ny * uy + m.nz * uz
+                if cos_a < math.cos(alpha_max):
+                    # 把弹体轴投影到“绕速度矢量、半锥角 α_max”的锥面上。
+                    nxp, nyp, nzp = (
+                        m.nx - ux * cos_a, m.ny - uy * cos_a, m.nz - uz * cos_a,
+                    )
+                    npn = math.sqrt(nxp * nxp + nyp * nyp + nzp * nzp)
+                    if npn < 1e-9:
+                        # 退化情形（弹体轴与速度反向）：任取一个垂直方向。
+                        nxp, nyp, nzp = (-uy, ux, 0.0) if abs(ux) + abs(uy) > 1e-6 else (1.0, 0.0, 0.0)
+                        npn = math.sqrt(nxp * nxp + nyp * nyp + nzp * nzp)
+                    nxp, nyp, nzp = nxp / npn, nyp / npn, nzp / npn
+                    ca = math.cos(alpha_max)
+                    sa = math.sin(alpha_max)
+                    m.nx = ux * ca + nxp * sa
+                    m.ny = uy * ca + nyp * sa
+                    m.nz = uz * ca + nzp * sa
+
+            cmd_x = cmd_y = cmd_z = 0.0     # 本拍制导指令（横向加速度 N）
+            m.g_req = 0.0                   # 本拍没有任何视线数据时需用过载记 0
+            # 盲区/出视场/中制导失照期间导引头拿不到新的视线数据，弹按惯导
+            # 外推飞行（指令清零、由自动驾驶仪滞后衰减），恢复后再接上 PN。
+            if (
+                m.guided and dist > 1.0 and m.t >= m.spec.guidance_delay
+                and not pre_ignition
+                and not seeker_blind and not fov_bad and m.mid_t <= 0.0
+            ):
+                if decoy is not None:
+                    tvx = tvy = tvz = 0.0   # 诱饵随风飘落，按静止目标处理
+                else:
+                    tvx, tvy, tvz = target.velocity
+                rvx, rvy, rvz = tvx - m.vx, tvy - m.vy, tvz - m.vz
+                vc = -((rvx * rx + rvy * ry + rvz * rz) / dist)
+                if vc > 0.0:
+                    # LOS 角速度矢量 omega = (r × v_rel) / r²
+                    ox = (ry * rvz - rz * rvy) / (dist * dist)
+                    oy = (rz * rvx - rx * rvz) / (dist * dist)
+                    oz = (rx * rvy - ry * rvx) / (dist * dist)
+                    # 真比例导引：a = N * Vc * (omega × LOS)
+                    cx = oy * losz - oz * losy
+                    cy = oz * losx - ox * losz
+                    cz = ox * losy - oy * losx
+                    ax = m.spec.pn_gain * vc * cx
+                    ay = m.spec.pn_gain * vc * cy
+                    az = m.spec.pn_gain * vc * cz
+                    # 大离轴发射时纯 PN 在视线角速度为零的瞬间不产生指令，
+                    # 叠加一个朝向视线的追踪项，保证弹道能先转进目标方向。
+                    # 系数不能太大：2V 在迎角稍偏时就要求十几 g，
+                    # 持续最大过载带来的诱导阻力会把弹的能量瞬间抽干。
+                    # 远程雷达弹的 loft：助推段把追踪的“虚拟瞄准点”抬高，
+                    # 仰角偏置随时间衰减，末段 PN 再把弹压回目标。
+                    tlx, tly, tlz = losx, losy, losz
+                    if (
+                        m.spec.loft
+                        and m.t < MISSILE_LOFT_TIME
+                        and dist > MISSILE_LOFT_MIN_RANGE
+                    ):
+                        # 助推前段保持满偏置，后段线性收回到真实视线。
+                        # 早期弹速低、可用过载小，若一开始就衰减，弹永远抬不起来。
+                        frac = min(1.0, (1.0 - m.t / MISSILE_LOFT_TIME) / 0.4)
+                        bias = MISSILE_LOFT_ANGLE * frac
+                        hnorm = math.hypot(losx, losy)
+                        hx, hy = (losx / hnorm, losy / hnorm) if hnorm > 1e-6 else (1.0, 0.0)
+                        tlx = hx * math.cos(bias)
+                        tly = hy * math.cos(bias)
+                        tlz = math.sin(bias)
+                    cos_vlos = clamp(ux * tlx + uy * tly + uz * tlz, -1.0, 1.0)
+                    pursuit = 0.6 * speed
+                    # 末段把追踪项按距离渐隐：PN 已经接管，纯追踪分量只负责
+                    # 大离轴发射后的初始转进。近距段还保持 0.6V 会让弹一直
+                    # 指着目标的“当前位置”，和自动驾驶仪滞后叠加成小幅度
+                    # 绕飞振荡，脱靶量反而卡在 5–10 m。
+                    if dist < 1200.0:
+                        pursuit *= max(0.3, dist / 1200.0)
+                    ax += pursuit * (tlx - ux * cos_vlos)
+                    ay += pursuit * (tly - uy * cos_vlos)
+                    az += pursuit * (tlz - uz * cos_vlos)
+                    a_mag = math.sqrt(ax * ax + ay * ay + az * az)
+                    # 钳位之前先留一份原始需求：这张图要看的正是“要多少 g vs 给得起多少 g”。
+                    m.g_req = a_mag / G
+                    if a_mag > 1e-6:
+                        # 可用过载同时受结构极限和舵面升力（动压）限制
+                        scale = min(1.0, a_axis_max / a_mag)
+                        ax, ay, az = ax * scale, ay * scale, az * scale
+                        cmd_x, cmd_y, cmd_z = ax, ay, az
+
+            # 过载指令速率限制：舵机/自动驾驶仪不能把这部分过载在一拍内建立，
+            # 指令按 g_slew（g/s）斜坡爬升。缺少这一条时，短距离大离轴的射击
+            # 会在 0.1 s 内顶满可用过载，看起来比真实弹“猛”得多。
+            cmd_mag = math.sqrt(cmd_x * cmd_x + cmd_y * cmd_y + cmd_z * cmd_z)
+            if m.spec.g_slew > 0.0 and cmd_mag > 1e-6:
+                prev_lat = math.sqrt(m.gx * m.gx + m.gy * m.gy + m.gz * m.gz)
+                slew_cap = prev_lat + m.spec.g_slew * G * dt
+                if cmd_mag > slew_cap:
+                    sc = slew_cap / cmd_mag
+                    cmd_x, cmd_y, cmd_z = cmd_x * sc, cmd_y * sc, cmd_z * sc
+
+            # 自动驾驶仪/舵机一阶滞后：横向过载指令不能瞬间建立，
+            # 末段目标拉高过载时弹的响应会晚半拍，这是真实脱靶的主因。
+            alpha = 1.0 - math.exp(-dt / max(m.spec.autopilot_tau, 1e-3))
+            m.gx += (cmd_x - m.gx) * alpha
+            m.gy += (cmd_y - m.gy) * alpha
+            m.gz += (cmd_z - m.gz) * alpha
+            gx, gy, gz = m.gx, m.gy, m.gz
+
+            lat = math.sqrt(gx * gx + gy * gy + gz * gz)
+            # 诱导阻力只由“气动”那份法向力产生：燃气舵直接力来自喷流偏转，
+            # 不经过翼面，不该再折算成诱导阻力。否则 RCS/燃气舵的横向力会把
+            # cl_req 顶到远超 cn_max 的值，cd∝cl² 瞬间把弹速抽干。
+            cl_req = min(lat * m.mass / qs, m.spec.cn_max)
+            mach = m.speed / max(speed_of_sound(max(m.z, 0.0)), 1e-6)
+            wave = m.spec.cd0_wave * _smoothstep(0.85, 1.15, mach)
+            cd = m.spec.cd0 * (1.0 + wave) + m.spec.induced_k * cl_req * cl_req
+            drag = qbar * m.spec.ref_area * cd
+            a_drag = drag / m.mass
+
+            axw = (thrust / m.mass) * m.nx - a_drag * ux + gx
+            ayw = (thrust / m.mass) * m.ny - a_drag * uy + gy
+            azw = (thrust / m.mass) * m.nz - a_drag * uz + gz - G
+
+            px, py, pz = m.x, m.y, m.z
+            m.vx += axw * dt
+            m.vy += ayw * dt
+            m.vz += azw * dt
+            m.x += m.vx * dt
+            m.y += m.vy * dt
+            m.z += m.vz * dt
+
+            # 近炸引信：用运动线段的最近点判定，避免高速下穿透目标。
+            # 被诱骗的弹追的是诱饵，不会误伤真机。
+            if decoy is not None:
+                miss_dist = 1e9
+            else:
+                sx, sy, sz = m.x - px, m.y - py, m.z - pz
+                seg2 = sx * sx + sy * sy + sz * sz
+                if seg2 > 1e-9:
+                    tt = clamp(
+                        ((target.x - px) * sx + (target.y - py) * sy
+                         + (target.z - pz) * sz) / seg2,
+                        0.0, 1.0,
+                    )
+                else:
+                    tt = 1.0
+                cx_ = px + sx * tt
+                cy_ = py + sy * tt
+                cz_ = pz + sz * tt
+                miss_dist = math.sqrt(
+                    (target.x - cx_) ** 2
+                    + (target.y - cy_) ** 2
+                    + (target.z - cz_) ** 2
+                )
+            if miss_dist <= m.spec.lethal_radius:
+                # 引信触发后再掷一次杀伤概率：脱靶量越大、交会速度越高，
+                # 越可能只是近失；即使命中也可能只是打伤而不是击落。
+                ratio = miss_dist / m.spec.lethal_radius
+                pk = proximity_pk(miss_dist, m.spec.lethal_radius, m.spec.pk_decay)
+                roll = random.Random(m.roll_seed).random()
+                m.alive = False
+                if roll <= pk:
+                    damage = min(
+                        m.spec.warhead_damage * (0.45 + 0.55 * (1.0 - ratio)),
+                        target.hp,
+                    )
+                    target.hp -= damage
+                    self.stats["damage_dealt"][m.owner] += damage
+                    self.stats["missile_hits"] += 1
+                    self.stats["missiles_hit"][m.owner] += 1
+                    self.events.append((
+                        self.t,
+                        f"{m.spec.name} 近炸命中 {target.spec.name} "
+                        f"({miss_dist:.1f} m, 伤害 {damage:.0f})",
+                    ))
+                else:
+                    self.events.append((
+                        self.t,
+                        f"{m.spec.name} 近失 {target.spec.name} "
+                        f"({miss_dist:.1f} m, PK {pk:.0%})",
+                    ))
+                continue
+
+            # 无控弹减速到临界速度后按坠落处理，避免出现比飞机还慢的“僵尸弹”。
+            if not m.guided and m.speed < MISSILE_FALL_SPEED:
+                m.alive = False
+                continue
+
+            if m.z <= self.z_floor or abs(m.x) > self.arena / 2 or abs(m.y) > self.arena / 2:
+                m.alive = False
+
+    def _referee(self) -> None:
+        # 一方被击落时若仍有导弹在飞，先不结算：双方在超视距阶段几乎同时
+        # 发射，先被打掉的一方可能已经有一枚弹在飞向对手。等这些弹全部
+        # 落地/命中后再判定，避免“先被击落就直接输掉”忽略掉后到的命中。
+        if self._pending_finish is not None:
+            both_dead = self.acs[0].hp <= 0.0 and self.acs[1].hp <= 0.0
+            if both_dead:
+                for ac in self.acs:
+                    ac.hp = 0.0
+                    ac.alive = False
+                self._pending_finish = None
+                self.result = "draw"
+                self.reason = "同归于尽"
+                self.reason_code = "kill"
+                self.events.append((self.t, self.reason))
+            elif not any(m.alive for m in self.missiles):
+                winner, reason, code = self._pending_finish
+                self._pending_finish = None
+                self._finish(winner, reason, code)
+            return
+
+        if self.acs[0].hp <= 0.0 and self.acs[1].hp <= 0.0:
+            for ac in self.acs:
+                ac.hp = 0.0
+                ac.alive = False
+            self.result = "draw"
+            self.reason = "同归于尽"
+            self.reason_code = "kill"
+            self.events.append((self.t, self.reason))
+            return
+        for i, ac in enumerate(self.acs):
+            if ac.hp <= 0.0:
+                ac.hp = 0.0
+                ac.alive = False
+                reason = f"{ac.spec.name} 被击落"
+                if any(m.alive for m in self.missiles):
+                    self._pending_finish = (1 - i, reason, "kill")
+                    self.events.append((self.t, f"{reason}，等待在飞导弹落地"))
+                else:
+                    self._finish(1 - i, reason, "kill")
+                return
+        for i, ac in enumerate(self.acs):
+            if self.dof >= 3:
+                if ac.z <= self.z_floor:
+                    ac.z = self.z_floor
+                    ac.alive = False
+                    self._finish(1 - i, f"{ac.spec.name} 低于最低高度坠机", "boundary")
+                    return
+                if ac.z >= self.z_ceiling:
+                    # 不再判定“解体”：ISA 只建模到 32 km，推力悬崖已经让飞机
+                    # 在升限附近自然失去剩余功率。这里只记录一次越界事件，
+                    # 保留诊断价值而不干扰对局结果。
+                    if not ac.ceiling_warned:
+                        ac.ceiling_warned = True
+                        self.events.append((
+                            self.t,
+                            f"{ac.spec.name} 超过验证高度上限 "
+                            f"{self.z_ceiling / 1000.0:.0f} km",
+                        ))
+            if abs(ac.x) > self.arena / 2 or abs(ac.y) > self.arena / 2:
+                ac.alive = False
+                self._finish(1 - i, f"{ac.spec.name} 飞出交战空域", "boundary")
+                return
+
+        if self.t >= self.time_limit:
+            # 按血量比例比较，避免初始 HP 不同导致的重机默认占优。
+            r_ratio = self.acs[0].hp / self.acs[0].spec.hp_max
+            b_ratio = self.acs[1].hp / self.acs[1].spec.hp_max
+            if r_ratio > b_ratio:
+                self._finish(0, "超时判定：血量优势", "timeout")
+            elif b_ratio > r_ratio:
+                self._finish(1, "超时判定：血量优势", "timeout")
+            elif (
+                abs(
+                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
+                    - military_endurance(self.acs[1].spec, self.acs[1].fuel)
+                )
+                > 5.0
+            ):
+                # 血量打平就比“还能打多久”：剩余军推续航长的一方掌握主动权，
+                # 续航短的一方按 Bingo 规则本来就必须退出交战，判其失利。
+                if (
+                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
+                    > military_endurance(self.acs[1].spec, self.acs[1].fuel)
+                ):
+                    self._finish(0, "超时判定：续航优势", "timeout")
+                else:
+                    self._finish(1, "超时判定：续航优势", "timeout")
+            else:
+                self.result = "draw"
+                self.reason = "超时判定：平局"
+                self.reason_code = "draw"
+                self.events.append((self.t, self.reason))
+
+    def _finish(self, winner: int, reason: str, code: str) -> None:
+        self.result = "red" if winner == 0 else "blue"
+        self.reason = reason
+        self.reason_code = code
+        self.events.append((self.t, reason))
+
+    def summary(self) -> str:
+        r, b = self.acs
+        return (
+            f"t={self.t:6.2f}s  dof={self.dof}  result={self.result or 'running':8s}  {self.reason}\n"
+            f"  {r.spec.name:>8s}  alt={r.z:6.0f}m  v={r.v:6.1f} m/s  g={r.n:4.1f}  "
+            f"gam={math.degrees(r.gamma):+6.1f}deg  hp={r.hp:5.1f}  ammo={r.ammo:5.0f}  "
+            f"msl={r.missiles}+{r.radar_missiles}  mass={r.mass:6.0f}kg  "
+            f"ps={r.spec.specific_power(r.v, r.z, max(r.n, 1.0), mass=r.mass):+5.0f} m/s\n"
+            f"  {b.spec.name:>8s}  alt={b.z:6.0f}m  v={b.v:6.1f} m/s  g={b.n:4.1f}  "
+            f"gam={math.degrees(b.gamma):+6.1f}deg  hp={b.hp:5.1f}  ammo={b.ammo:5.0f}  "
+            f"msl={b.missiles}+{b.radar_missiles}  mass={b.mass:6.0f}kg  "
+            f"ps={b.spec.specific_power(b.v, b.z, max(b.n, 1.0), mass=b.mass):+5.0f} m/s\n"
+            f"  speed [{self.stats['min_v']:.1f}, {self.stats['max_v']:.1f}] m/s  "
+            f"alt [{self.stats['min_z']:.0f}, {self.stats['max_z']:.0f}] m  "
+            f"max g={self.stats['max_n']:.1f}  max |gam|={self.stats['max_climb']:.0f}deg  "
+            f"rounds={self.stats['rounds_fired']:.0f}  "
+            f"msl fired={self.stats['missiles_fired']:.0f}  "
+            f"hit={self.stats['missile_hits']} (R {self.stats['missiles_hit'][0]} / "
+            f"B {self.stats['missiles_hit'][1]})"
+        )

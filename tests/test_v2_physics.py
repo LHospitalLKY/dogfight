@@ -14,8 +14,10 @@ import math
 
 import pytest
 
-from main import AIM120C, AIM9X, F16V_SPEC, R73, R77_1, SU57_SPEC, build_world
-from sim import (
+from dogfight.app.main import (
+    AIM120C, AIM9X, F16V_SPEC, R73, R77_1, SU57_SPEC, build_world,
+)
+from dogfight.core.sim import (
     Action,
     G,
     MAX_BANK,
