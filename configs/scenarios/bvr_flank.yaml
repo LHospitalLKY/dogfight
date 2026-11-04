@@ -1,0 +1,39 @@
+# 侧翼绕后场景：Su-57 利用前向低 RCS 与 F-16V 后半球盲区，
+# 从侧后方静默接近，在中距弹射程内短暂开机射击。
+#
+# 几何：F-16V 沿固定航向（向北）巡航，Su-57 从西侧截击。
+# 开局航向不直接头对头，而是形成截击夹角，便于 Su-57 建立侧翼航迹。
+#
+# 触发 flank 的条件：
+#   - 仅红方（Su-57）有 AWACS 支援，可被动跟踪 F-16V 而自身雷达关机；
+#   - 蓝方（F-16V）无 AWACS，其后半球（机头 ±90° 外）是雷达/IRST 盲区；
+#   - 时限延长到 900 s，留给 Su-57 足够时间绕到侧后方（不调巡航速度）。
+id: bvr-flank
+time_limit_s: 900
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 40000          # 每架距空域中心 40 km，总间距 80 km
+  altitude_m: 9000
+  y_offset_m: 0
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    aircraft: SU-57
+    radar_policy: auto
+    opening_tactic: flank
+    heading_deg: 30          # 朝东，向 F-16V 所在的 x 方向接近
+  - name: blue
+    aircraft: F-16V
+    radar_policy: auto
+    opening_tactic: default
+    heading_deg: 90         # 向北巡航（CAP 直线航段），给 Su-57 侧翼空间
+
+# 只有红方有预警机：Su-57 靠 AWACS 被动跟踪，F-16V 无 AWACS 支援，
+# 因此其后半球盲区对 Su-57 完全敞开。
+awacs: [true, false]
+# seed 不写即每次启动随机占位；需要复现某一局时用 --seed N。

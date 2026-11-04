@@ -456,6 +456,29 @@ def _scope(world, i, agent) -> dict:
 
     threat = _missile_threat(world, i)
     incoming = sum(1 for m in world.missiles if m.alive and m.target == i)
+
+    # flank 占位航路点（相对本机的方位/距离，用于雷达图显示）。
+    flank_wps = []
+    if agent is not None and getattr(agent, "opening_tactic", "") == "flank" \
+            and not getattr(agent, "_opening_done", True):
+        wps = getattr(agent, "_flank_wps", [])
+        owx = getattr(agent, "_flank_own_x", 0.0)
+        owy = getattr(agent, "_flank_own_y", 0.0)
+        cur = getattr(agent, "_flank_wp_idx", 0)
+        for j, wp in enumerate(wps):
+            dx = wp.x - owx
+            dy = wp.y - owy
+            wd = math.hypot(dx, dy)
+            if wd < 1.0:
+                continue
+            flank_wps.append({
+                "az": wrap_pi(math.atan2(dy, dx) - ac.psi),
+                "rr": clamp(wd / rng, 0.0, 0.96),
+                "d": wd,
+                "method": getattr(wp, "turn_method", "coord"),
+                "current": j == cur,
+            })
+
     return {
         "rng": rng,
         "rings": [0.25, 0.5, 0.75, 1.0],
@@ -472,6 +495,7 @@ def _scope(world, i, agent) -> dict:
         "threat": None if threat is None else {"az": threat[0], "d": threat[1]},
         "incoming": incoming,
         "situation": getattr(agent, "situation", "") if agent else "",
+        "flank_wps": flank_wps,
     }
 
 

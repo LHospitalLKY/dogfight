@@ -31,6 +31,12 @@ class AgentPersona:
     lure: bool = False
     # auto 沿用 energy_pref 的旧启发式；energy/angle 显式指定开局风格。
     style: str = "auto"
+    # 开局占位策略：
+    #   auto / default —— 按 style 走能量/角度占位（默认行为）。
+    #   stealth_compress —— 隐身压缩：以接近迎头的姿态静默接近，
+    #       雷达保持 auto 静默、不开加力，把对方发现/锁定距离压到最小，
+    #       适合前向 RCS 远低于对手且带中距弹的隐身机。
+    opening_tactic: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -86,6 +92,10 @@ def parse_weapon(raw: dict, source: str) -> MissileSpec:
         raise ConfigError(f"{source}: guidance 只支持 IR / SARH / ARH")
     if spec.boost_time > 0.0 and spec.boost_thrust <= 0.0:
         raise ConfigError(f"{source}: 配置 boost_time_s 时必须给 boost_thrust_kn")
+    if spec.has_second_pulse and spec.boost_time <= 0.0:
+        raise ConfigError(f"{source}: 配置第二脉冲时必须给 boost_time_s（第一脉冲时长）")
+    if spec.pulse2_gap < 0.0:
+        raise ConfigError(f"{source}: pulse2_gap_s 不能为负")
     return spec
 
 
@@ -193,7 +203,7 @@ def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> A
         agent_raw = {}
     if not isinstance(agent_raw, dict):
         raise ConfigError(f"{source}: agent 必须是键值表")
-    extra = set(agent_raw) - {"aggression", "energy_pref", "lure", "style"}
+    extra = set(agent_raw) - {"aggression", "energy_pref", "lure", "style", "opening_tactic"}
     if extra:
         raise ConfigError(f"{source}: agent 未知字段 {', '.join(sorted(extra))}")
     try:
@@ -202,11 +212,17 @@ def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> A
             energy_pref=float(agent_raw.get("energy_pref", 0.5)),
             lure=bool(agent_raw.get("lure", False)),
             style=str(agent_raw.get("style", "auto")),
+            opening_tactic=str(agent_raw.get("opening_tactic", "auto")),
         )
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{source}: agent 参数非法（{exc}）") from exc
     if agent.style not in ("auto", "energy", "angle"):
         raise ConfigError(f"{source}: agent.style 只支持 auto / energy / angle")
+    if agent.opening_tactic not in ("auto", "default", "stealth_compress", "flank"):
+        raise ConfigError(
+            f"{source}: agent.opening_tactic 只支持 "
+            f"auto / default / stealth_compress / flank"
+        )
     if not 0.0 <= agent.aggression <= 1.0 or not 0.0 <= agent.energy_pref <= 1.0:
         raise ConfigError(f"{source}: agent.aggression / energy_pref 必须在 [0, 1]")
     return AircraftEntry(id=entry_id, spec=spec, agent=agent)

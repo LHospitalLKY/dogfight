@@ -98,6 +98,14 @@ class AircraftSpec:
     # 无矢量机型为 0；有矢量时失速迎角随功率右移，盘旋可用升力上限提高。
     tvc_cl_bonus: float = 0.0
 
+    # ---- 全动鸭翼增升（J-20） ----
+    # 鸭翼在大迎角下产生脱体涡，延迟主翼失速并提高 CLmax；增升按迎角平滑函数驱动，
+    # 与 TVC 按油门驱动的喷流增升互补。两者可叠加。
+    canard: bool = False                       # 是否启用鸭翼增升
+    canard_cl_bonus: float = 0.0              # 鸭翼最大增升系数 ΔCLmax
+    canard_alpha_max: float = 0.0             # 鸭翼有效迎角上限（增升饱和点）rad
+    canard_stall_shift: float = 0.0           # 失速迎角额外右移量 rad
+
     # ---- 挂载：近距弹 / 中距弹 / 干扰物 ----
     loadout: Loadout = Loadout()
 

@@ -28,6 +28,11 @@ class TeamSpec:
     name: str
     aircraft: AircraftEntry
     radar_policy: str = "always"
+    # 覆盖机体默认的开局占位策略；None 表示沿用 aircraft.agent.opening_tactic。
+    opening_tactic: str | None = None
+    # 开局航向（度，正北为 0°，顺时针）。None 表示默认对头几何
+    # （红方朝东 0°、蓝方朝西 180°）。
+    heading_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -39,7 +44,8 @@ class Scenario:
     physics_dt: float = 1.0 / 120.0
     decision_hz: float = 10.0
     seed: int | None = None
-    awacs: bool = True
+    # True 表示双方都有预警机支援；(bool, bool) 分别指定红/蓝双方。
+    awacs: bool | tuple[bool, bool] = True
     source: str = ""
 
 
@@ -82,7 +88,7 @@ def load_scenario(
         where = f"teams[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{path}: {where} 必须是键值表")
-        extra = set(item) - {"name", "aircraft", "radar_policy"}
+        extra = set(item) - {"name", "aircraft", "radar_policy", "opening_tactic", "heading_deg"}
         if extra:
             raise ConfigError(f"{path}: {where} 未知字段 {', '.join(sorted(extra))}")
         aircraft_id = item.get("aircraft")
@@ -97,11 +103,27 @@ def load_scenario(
             raise ConfigError(
                 f"{path}: {where}.radar_policy 只支持 always / silent / auto"
             )
+        opening_tactic = item.get("opening_tactic")
+        if opening_tactic is not None:
+            if opening_tactic not in ("auto", "default", "stealth_compress", "flank"):
+                raise ConfigError(
+                    f"{path}: {where}.opening_tactic 只支持 "
+                    f"auto / default / stealth_compress / flank"
+                )
         name = item.get("name", f"team{index}")
         if not isinstance(name, str) or not name:
             raise ConfigError(f"{path}: {where}.name 必须是非空字符串")
-        teams.append(TeamSpec(name=name, aircraft=aircraft[aircraft_id],
-                              radar_policy=policy))
+        heading_deg = item.get("heading_deg")
+        if heading_deg is not None:
+            try:
+                heading_deg = float(heading_deg)
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"{path}: {where}.heading_deg 必须是数字") from exc
+        teams.append(TeamSpec(
+            name=name, aircraft=aircraft[aircraft_id],
+            radar_policy=policy, opening_tactic=opening_tactic,
+            heading_deg=heading_deg,
+        ))
 
     initial_raw = raw.get("initial", {})
     if not isinstance(initial_raw, dict):
@@ -126,9 +148,13 @@ def load_scenario(
 
     seed_raw = raw.get("seed")
     seed = None if seed_raw is None else int(seed_raw)
-    awacs = raw.get("awacs", True)
-    if not isinstance(awacs, bool):
-        raise ConfigError(f"{path}: awacs 必须是 true/false")
+    awacs_raw = raw.get("awacs", True)
+    if isinstance(awacs_raw, bool):
+        awacs: bool | tuple[bool, bool] = awacs_raw
+    elif isinstance(awacs_raw, (list, tuple)) and len(awacs_raw) == 2:
+        awacs = (bool(awacs_raw[0]), bool(awacs_raw[1]))
+    else:
+        raise ConfigError(f"{path}: awacs 必须是 true/false 或长度为 2 的布尔列表")
 
     return Scenario(
         id=scenario_id,

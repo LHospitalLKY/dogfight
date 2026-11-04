@@ -27,6 +27,51 @@ aircraft:
       file: f16.obj
       converter: f16
 
+  J-20A:
+    length_m: 21.2
+    voxel_m: 0.32
+    web:
+      # 需搜寻：含全动鸭翼、全动双垂尾、DSI 进气道的 J-20 模型。
+      source: assets/aircraft/J20.obj
+      file: j20.obj
+      converter: j20
+
+  J-20S:
+    length_m: 21.2
+    voxel_m: 0.32
+    web:
+      # 与 J-20A 共用模型，仅座舱盖外形差异（双座），可由同一 OBJ 渲染。
+      source: assets/aircraft/J20.obj
+      file: j20s.obj
+      converter: j20
+
+  F-15C:
+    length_m: 19.43
+    voxel_m: 0.30
+    web:
+      # 需搜寻：单座、无保形油箱的 F-15C 模型。
+      source: assets/aircraft/F15C.obj
+      file: f15c.obj
+      converter: f15
+
+  F-15E:
+    length_m: 19.43
+    voxel_m: 0.30
+    web:
+      # 需搜寻：双座、带保形油箱（CFT）的 F-15E 模型。
+      source: assets/aircraft/F15E.obj
+      file: f15e.obj
+      converter: f15
+
+  F-15EX:
+    length_m: 19.43
+    voxel_m: 0.30
+    web:
+      # 可基于 F-15E 模型修改（EPAWSS 尾椎差异）。
+      source: assets/aircraft/F15EX.obj
+      file: f15ex.obj
+      converter: f15
+
 missiles:
   R-73:
     source: assets/missiles/R73.obj
@@ -44,3 +89,15 @@ missiles:
     source: assets/missiles/AIM120.obj
     length_m: 3.66
     file: aim120.obj
+  PL-10:
+    source: assets/missiles/PL10.obj
+    length_m: 3.00
+    file: pl10.obj
+  PL-15:
+    source: assets/missiles/PL15.obj
+    length_m: 3.85
+    file: pl15.obj
+  PL-21:
+    source: assets/missiles/PL21.obj
+    length_m: 6.00
+    file: pl21.obj

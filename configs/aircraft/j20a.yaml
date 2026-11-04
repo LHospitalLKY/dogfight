@@ -1,0 +1,77 @@
+# J-20A：双发重型隐身，升力体+边条+全动鸭翼；偏角度与瞬盘。
+id: J-20A
+name: J-20A
+
+airframe:
+  # 空机 + 半油（17,000 + 5,950 ≈ 22,950，取整 24,000 含飞行员与设备）。
+  base_mass_kg: 24000
+  wing_area_m2: 73.0
+  cl_max: 1.6
+  n_struct_g: 9
+  thrust_max_kn: 360        # WS-15 双发加力（180 kN × 2）
+  thrust_mil_kn: 220        # 双发军用推力
+  cd0: 0.035
+  aspect_ratio: 2.32        # 翼展 13.01 m / 面积 73.0 m²
+  oswald: 0.78
+  cl_alpha: 3.80
+  cruise_mach: 1.30         # WS-15 不开加力超巡
+  fuel_capacity_kg: 11900
+  lapse_exp: 0.65
+  ram_r0: 0.15
+  ram_r1: 0.20
+  derate_z_m: 18000
+  derate_H_m: 6000
+  eta_install: 0.95
+  hp_max: 115
+  # 有公开消息称 J-20 已装 GSh-30-1 型 30 mm 机炮（内埋于机身/翼下炮舱），
+  # 与 Su-57 同型；公开资料未给出确切备弹量，按同型炮常见的 150 发计。
+  gun_range_m: 1000
+  gun_dps: 30
+  ammo_max: 150
+  rounds_per_sec: 25
+  length_m: 21.2
+  muzzle_speed: 900
+  bullet_mass_kg: 0.390
+  bullet_diameter_m: 0.030
+  gun_spread: 0.003
+  # 无推力矢量喷口（WS-15 后期批次或配二元矢量，当前按无 TVC）。
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  # 全动鸭翼增升：迎角驱动的涡流增升，CLmax 从 1.60 抬到约 1.95，
+  # 失速迎角从 22° 抬到约 30°+。
+  canard: true
+  canard_cl_bonus: 0.35
+  canard_alpha_max_deg: 30
+  canard_stall_shift_deg: 8
+
+sensors:
+  # 正面 RCS 与 F-22 归一到同一数量级（F-22 取 0.001 m² = −30 dBsm，
+  # J-20 取 0.002 m² = −27 dBsm，仅高 3 dB）。公开资料的原始区间差异很大
+  # （F-22 0.0001–0.001 m²，J-20 0.01–0.05 m²），此处按“同级、J-20 略高”
+  # 的仿真口径统一标定，仅用于相对比较；单位换算见文档 §1.3.1。
+  rcs: 0.002
+  rcs_front: 0.002
+  rcs_side: 0.5
+  rcs_back: 1.0
+  radar_range_km: 200        # 1475/KLJ-5 AESA
+  side_array: true
+  lband: false
+  irst_range_km: 60          # 内置 EOTS
+
+loadout:
+  ir:
+    weapon: PL-10
+    count: 2                # 侧弹舱各 1 枚
+  radar:
+    weapon: PL-15
+    count: 4                # 主弹舱 4 枚
+  countermeasures:
+    chaff: 30
+    flare: 24
+
+agent:
+  aggression: 0.82
+  energy_pref: 0.55
+  lure: true
+  style: angle

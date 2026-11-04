@@ -1,0 +1,71 @@
+# J-20S：双座型，第二乘员负责武器/无人机指挥；重量略增，其余与 J-20A 一致。
+id: J-20S
+name: J-20S
+
+airframe:
+  # 空机比 J-20A 增加约 1,000 kg（第二乘员、弹射座椅、航电）。
+  base_mass_kg: 25000
+  wing_area_m2: 73.0
+  cl_max: 1.6
+  n_struct_g: 9
+  thrust_max_kn: 360        # WS-15 双发加力
+  thrust_mil_kn: 220
+  cd0: 0.036                # 双座座舱略增阻力
+  aspect_ratio: 2.32
+  oswald: 0.78
+  cl_alpha: 3.80
+  cruise_mach: 1.20         # 双座增重后超巡马赫略降
+  fuel_capacity_kg: 11900
+  lapse_exp: 0.65
+  ram_r0: 0.15
+  ram_r1: 0.20
+  derate_z_m: 18000
+  derate_H_m: 6000
+  eta_install: 0.95
+  hp_max: 115
+  # 同 J-20A：GSh-30-1 型 30 mm 机炮，备弹按同型炮常见的 150 发计。
+  gun_range_m: 1000
+  gun_dps: 30
+  ammo_max: 150
+  rounds_per_sec: 25
+  length_m: 21.2
+  muzzle_speed: 900
+  bullet_mass_kg: 0.390
+  bullet_diameter_m: 0.030
+  gun_spread: 0.003
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  canard: true
+  canard_cl_bonus: 0.35
+  canard_alpha_max_deg: 30
+  canard_stall_shift_deg: 8
+
+sensors:
+  # 与 J-20A 同口径：双座座舱盖加长，正面取 0.003 m²（约 −25 dBsm），
+  # 仍与 F-22（0.001 m²）处于同一数量级。
+  rcs: 0.003
+  rcs_front: 0.003
+  rcs_side: 0.6
+  rcs_back: 1.2
+  radar_range_km: 200
+  side_array: true
+  lband: false
+  irst_range_km: 60
+
+loadout:
+  ir:
+    weapon: PL-10
+    count: 2
+  radar:
+    weapon: PL-15
+    count: 4
+  countermeasures:
+    chaff: 30
+    flare: 24
+
+agent:
+  aggression: 0.80
+  energy_pref: 0.55
+  lure: true
+  style: angle

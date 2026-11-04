@@ -450,6 +450,7 @@ class Observation:
     own_beta: float = 0.0
     dof: int = 3                     # 当前内核自由度，过失速只在 6DOF 生效
     own_tvc: bool = False            # 本机是否带推力矢量喷口
+    own_canard: bool = False         # 本机是否带全动鸭翼（过失速迎角上限由鸭翼给出）
     own_fuel_frac: float = 1.0       # 剩余燃油比例
     # 剩余燃油按军推折算的续航秒数（见 military_endurance）：Bingo 判据与
     # 超时裁决的统一口径，不同机型的油箱/耗油率因此可以直接比较。
@@ -509,6 +510,8 @@ class Observation:
     tally: bool = False            # 目视接触（决定机炮精度）
     rwr: bool = False              # 对方雷达正在照射本机（只有方位）
     rwr_az: float = 0.0            # RWR 告警相对机头的方位
+    rwr_search: bool = False       # 全向 RWR：对方雷达正在发射（搜索/跟踪）
+    rwr_search_az: float = 0.0     # 全向 RWR 截获的辐射方位
     radar_on: bool = True          # 本机雷达当前是否开机
     foe_radar_on: bool = False     # 对方雷达是否开机（RWR 可推断）
     gun_accuracy: float = 1.0      # 机炮散布倍率；无目视接触时 >1
@@ -588,6 +591,8 @@ class Aircraft:
     tally: bool = False            # 是否目视接触
     rwr: bool = False              # 是否收到对方雷达照射告警
     rwr_az: float = 0.0            # 告警方位（相对本机机头）
+    rwr_search: bool = False       # 全向 RWR：对方雷达正在发射（含搜索模式）
+    rwr_search_az: float = 0.0     # 全向 RWR 截获的辐射方位（相对本机机头）
     last_known: tuple[float, float, float] | None = None   # 最后已知目标位置
     last_known_t: float = -1e9     # 最后接触时刻
 
@@ -950,7 +955,8 @@ class World:
         dof: int = 6,
         y_offset: float = 100.0,
         x_offset: float = 1500.0,
-        awacs: bool = True,
+        awacs: bool | tuple[bool, bool] = True,
+        headings: tuple[float | None, float | None] = (None, None),
     ) -> None:
         if dof not in (2, 3, 6):
             raise ValueError("dof 只支持 2、3 或 6")
@@ -958,7 +964,11 @@ class World:
         self.dt = dt
         self.arena = arena
         self.time_limit = time_limit
-        self.awacs = awacs
+        # awacs 按阵营：True 表示双方都有，(bool, bool) 分别指定红蓝双方。
+        if isinstance(awacs, bool):
+            self.awacs: tuple[bool, bool] = (awacs, awacs)
+        else:
+            self.awacs = (bool(awacs[0]), bool(awacs[1]))
         self.z0 = z0
         self.z_floor = z_floor
         self.z_ceiling = z_ceiling
@@ -1010,8 +1020,12 @@ class World:
             _trim_rigid(spec, start_z, v0s[i], spec.mass) if rigid else (v0s[i], 0.0)
             for i, spec in enumerate(specs)
         ]
+        # 开局航向：每队可单独指定（弧度），None 时走默认对头几何
+        # （红方朝东 0、蓝方朝西 π）。
+        psi0 = math.radians(headings[0]) if headings[0] is not None else 0.0
+        psi1 = math.radians(headings[1]) if headings[1] is not None else math.pi
         self.acs = [
-            Aircraft(specs[0], x=-x_offset, y=0.0, z=start_z, psi=0.0, v=v0s[0],
+            Aircraft(specs[0], x=-x_offset, y=0.0, z=start_z, psi=psi0, v=v0s[0],
                      hp=specs[0].hp_max, ammo=specs[0].ammo_max,
                      mass=specs[0].mass, missiles=specs[0].missile_count,
                      radar_missiles=specs[0].radar_missile_count,
@@ -1020,7 +1034,7 @@ class World:
                      throttle=_cruise_throttle(specs[0], start_z, v0s[0]),
                      rigid=rigid, u=specs_trim[0][0], wb=specs_trim[0][1],
                      theta=math.atan2(specs_trim[0][1], specs_trim[0][0])),
-            Aircraft(specs[1], x=x_offset, y=y_offset, z=start_z, psi=math.pi, v=v0s[1],
+            Aircraft(specs[1], x=x_offset, y=y_offset, z=start_z, psi=psi1, v=v0s[1],
                      hp=specs[1].hp_max, ammo=specs[1].ammo_max,
                      mass=specs[1].mass, missiles=specs[1].missile_count,
                      radar_missiles=specs[1].radar_missile_count,
@@ -1063,6 +1077,8 @@ class World:
             ac.tally = False
             ac.rwr = False
             ac.rwr_az = 0.0
+            ac.rwr_search = False
+            ac.rwr_search_az = 0.0
             if not ac.alive or not foe.alive:
                 continue
 
@@ -1076,10 +1092,15 @@ class World:
             nose_az = math.atan2(ny, nx)
             los_az = math.atan2(dy, dx)
 
-            # ---- RWR：对方机头雷达对着本机开机 ----
+            # ---- RWR：对方雷达辐射告警 ----
             if foe.radar_on and foe.spec.radar_range > 0.0:
+                # 全向 RWR：只要对方雷达在发射，本机就能截获到辐射方位，
+                # 不论对方机头是否指向本机（搜索/跟踪模式都算）。
+                ac.rwr_search = True
+                ac.rwr_search_az = wrap_pi(los_az - nose_az)
+                # 火控级照射：对方机头雷达正对着本机（落在火控照射锥内），
+                # 意味着可能已经锁定，告警级别更高。
                 fnx, fny, fnz = nose_direction(foe)
-                # 从对方看本机的方位，判断本机是否落在对方火控照射锥内。
                 bx, by, bz = -ux, -uy, -uz
                 foe_ang = math.acos(clamp(bx * fnx + by * fny + bz * fnz, -1.0, 1.0))
                 if foe_ang <= RADAR_FIRE_FOV:
@@ -1138,7 +1159,9 @@ class World:
                 ac.tally = True
                 quality = max(quality, CONTACT_TRACK)
             # ---- 预警机（track，不能火控）----
-            if self.awacs:
+            # awacs 是按阵营的：只有本方有预警机支援时，本机才能拿到
+            # 预警机提供的目标跟踪数据。
+            if self.awacs[i]:
                 # 预警机大多从侧上方看目标，取侧向/尾向里较大的值。
                 rcs = max(
                     directional_rcs(foe, (ac.x, ac.y, ac.z)),
@@ -1462,6 +1485,7 @@ class World:
             ),
             dof=self.dof,
             own_tvc=me.spec.tvc > 0.0,
+            own_canard=me.spec.canard,
             own_missiles=me.missiles,
             own_missiles_in_flight=in_flight,
             own_locked=me.locked,
@@ -1500,6 +1524,8 @@ class World:
             tally=me.tally,
             rwr=me.rwr,
             rwr_az=me.rwr_az,
+            rwr_search=me.rwr_search,
+            rwr_search_az=me.rwr_search_az,
             radar_on=me.radar_on,
             foe_radar_on=foe.radar_on,
             gun_accuracy=1.0 if me.tally else GUN_NO_TALLY_SPREAD,
@@ -1508,15 +1534,21 @@ class World:
         # ---- 感知层降级：没有稳定跟踪时，不给真实几何 ----
         if me.contact < CONTACT_TRACK:
             # 只有方位（RWR/L 波段/雷达探测）或什么都没有。搜索方位优先取
-            # 最后已知位置，其次取空域中心（开局双方都朝中心飞）。
-            if me.contact == CONTACT_DETECT and me.rwr:
+            # 最后已知位置，其次取 RWR 告警方位，最后取空域中心。
+            if me.rwr:
                 search_az = wrap_pi(obs.own_nose_az + me.rwr_az)
+            elif me.rwr_search:
+                search_az = wrap_pi(obs.own_nose_az + me.rwr_search_az)
             elif me.last_known is not None:
                 search_az = math.atan2(
                     me.last_known[1] - me.y, me.last_known[0] - me.x
                 )
             else:
-                search_az = math.atan2(-me.y, -me.x)
+                # 完全没有任何传感器信息（无接触、无 RWR、无最后已知位置）：
+                # 不知道威胁在哪，保持当前航向直飞（CAP/巡航），而不是凭空
+                # 朝空域中心转向——后者会让盲目直飞的对手始终保持对头几何，
+                # 使侧翼绕后战术无法建立盲区。
+                search_az = nose_az
             obs.dist = 1e9
             obs.dist_h = 1e9
             obs.dz = 0.0
@@ -1734,10 +1766,12 @@ class World:
             ac.y += ac.v * math.sin(ac.psi) * self.dt
 
     def _n_available_effective(self, ac: Aircraft) -> float:
-        """当前可用过载：升力上限（含超声速损失与矢量增升）与结构限制取小。"""
+        """当前可用过载：升力上限（含超声速损失、矢量增升与鸭翼增升）与结构限制取小。"""
         spec = ac.spec
         n_lift = spec.n_lift(ac.v, ac.z, ac.mass)
-        boost = self._tvc_cl_boost(ac)
+        # 可用过载是“拉满时的上限”，此时迎角达到失速迎角，鸭翼增升取满值；
+        # TVC 增升仍按当前油门缩放（油门不够时喷流增升拿不到）。
+        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac, full=True)
         if boost > 0.0:
             base = max(spec.cl_max_at(mach_number(ac.v, ac.z)), 1e-6)
             n_lift *= (base + boost) / base
@@ -1756,22 +1790,47 @@ class World:
         power = clamp(max(ac.throttle, ac.ab), 0.0, 1.0)
         return spec.tvc_cl_bonus * power
 
+    def _canard_cl_boost(self, ac: Aircraft, *, full: bool = False) -> float:
+        """全动鸭翼的等效增升量（CL 增量）。
+
+        鸭翼增升由迎角驱动而非油门：迎角越大，鸭翼脱体涡对主翼的增升越强，
+        超过鸭翼自身失速迎角后增升饱和。full=True 时取满值（用于可用过载上限，
+        因为拉满过载时迎角达到失速迎角）；否则按当前迎角做 smoothstep 缩放。
+        """
+        spec = ac.spec
+        if not spec.canard or spec.canard_cl_bonus <= 0.0:
+            return 0.0
+        if full:
+            return spec.canard_cl_bonus
+        # 6DOF 下用真实迎角；点质量没有迎角状态，按当前过载折算等效迎角。
+        if ac.rigid:
+            alpha = abs(math.atan2(ac.wb, max(ac.u, 1.0)))
+        else:
+            qbar = 0.5 * air_density(ac.z) * ac.v * ac.v
+            cl = ac.n * ac.weight / max(qbar * spec.wing_area, 1e-6)
+            alpha = abs((cl - spec.cl0) / spec.cl_alpha)
+        if spec.canard_alpha_max <= 0.0:
+            return spec.canard_cl_bonus
+        x = clamp(alpha / spec.canard_alpha_max, 0.0, 1.0)
+        return spec.canard_cl_bonus * _smoothstep(0.2, 1.0, x)
+
     def _cl_max_effective(self, ac: Aircraft) -> float:
-        """计入超声速升力损失与矢量增升后的可用升力系数上限。"""
+        """计入超声速升力损失、矢量增升与鸭翼增升后的可用升力系数上限。"""
         spec = ac.spec
         base = spec.cl_max_at(mach_number(ac.v, ac.z))
-        boost = self._tvc_cl_boost(ac)
+        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac)
         if boost <= 0.0:
             return base
         return spec.cl0 + spec.cl_alpha * spec.alpha_stall + boost
 
     def _alpha_stall_effective(self, ac: Aircraft) -> float:
-        """矢量增升把失速迎角一并右移：CL 增量摊到升力线斜率上。"""
+        """矢量/鸭翼增升把失速迎角一并右移：CL 增量摊到升力线斜率上。"""
         spec = ac.spec
-        boost = self._tvc_cl_boost(ac)
-        if boost <= 0.0:
+        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac)
+        shift = spec.canard_stall_shift if spec.canard else 0.0
+        if boost <= 0.0 and shift <= 0.0:
             return spec.alpha_stall
-        return spec.alpha_stall + boost / spec.cl_alpha
+        return spec.alpha_stall + boost / spec.cl_alpha + shift
 
     def _stall_stab_scale(self, ac: Aircraft, alpha: float) -> float:
         """过失速段纵向静稳定力矩的衰减系数（0~1）。
@@ -1823,6 +1882,10 @@ class World:
         if act.post_stall and spec.tvc_alpha_max > 0.0:
             # 过失速指令：直接把目标迎角拉到矢量喷口能维持的极限。
             alpha_cmd = spec.tvc_alpha_max
+        elif act.post_stall and spec.canard and spec.canard_alpha_max > 0.0:
+            # 鸭翼没有喷流，但全动鸭翼能在失速后维持俯仰力矩，
+            # 目标迎角取鸭翼有效迎角上限（J-20 约 30°）。
+            alpha_cmd = spec.canard_alpha_max
         # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%，过载会偏小。
         de_trim = -(spec.cm_alpha * alpha_cmd) / spec.cm_de
         # 航迹旋转前馈：保持目标迎角时需要机头跟着航迹一起转（q ≈ gamma_dot），

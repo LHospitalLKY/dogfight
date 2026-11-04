@@ -3339,6 +3339,51 @@ ${shader.fragmentShader}`;
       text(ctx, lab, cx - ctx.measureText(lab).width / 2, cy + radius - 4, C.hudDim, FS_SMALL);
     }
 
+    // flank 占位航路点：从本机（雷达中心）出发，依次连接各航路点。
+    // 航路点方位是机鼻相对系，因此整条路径会随机头指向旋转，与目标点一致。
+    const fw = sc.flank_wps || [];
+    if (fw.length >= 1) {
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      for (let k = 0; k < fw.length; k += 1) {
+        const wp = fw[k];
+        const rr = clamp(wp.rr, 0, 0.96) * radius;
+        const wx = cx + rr * Math.sin(wp.az);
+        const wy = cy - rr * Math.cos(wp.az);
+        ctx.lineTo(wx, wy);
+      }
+      ctx.strokeStyle = "rgba(120,200,255,0.55)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    for (const wp of fw) {
+      const rr = clamp(wp.rr, 0, 0.96) * radius;
+      const wx = cx + rr * Math.sin(wp.az);
+      const wy = cy - rr * Math.cos(wp.az);
+      const hard = wp.method === "hard";
+      const col = wp.current ? "rgb(120,220,255)" : "rgba(120,200,255,0.7)";
+      ctx.lineWidth = wp.current ? 1.6 : 1;
+      ctx.strokeStyle = col;
+      ctx.beginPath();
+      if (hard) {
+        // 菱形：硬转弯点
+        ctx.moveTo(wx, wy - 5); ctx.lineTo(wx + 5, wy);
+        ctx.lineTo(wx, wy + 5); ctx.lineTo(wx - 5, wy);
+        ctx.closePath();
+      } else {
+        ctx.arc(wx, wy, 3.5, 0, TAU);
+      }
+      ctx.stroke();
+      if (wp.current) {
+        ctx.beginPath();
+        ctx.arc(wx, wy, 7, 0, TAU);
+        ctx.strokeStyle = "rgba(120,220,255,0.4)";
+        ctx.stroke();
+      }
+    }
+
     let incomingSeen = false;
     for (const b of sc.blips || []) {
       const rr = clamp(b.rr, 0, 0.96) * radius;

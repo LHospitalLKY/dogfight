@@ -1,0 +1,34 @@
+# PL-21（霹雳-21）：远距冲压动力空空导弹，双模导引（主动雷达 + 红外）。
+# 仍处研发阶段，参数为工程估计；尺寸可能无法内置，默认不挂载。
+id: PL-21
+name: PL-21
+mass_kg: 300.0
+length_m: 6.00
+diameter_m: 0.30
+max_g: 30
+seeker_fov_deg: 60
+gimbal_fov_deg: 60
+seeker_range_km: 40
+lock_time_s: 2.0
+min_range_m: 5000
+max_range_km: 400
+# 固体助推 2 s / 50 kN，冲压续航 20 s / 18 kN
+thrust_kn: 18.0
+burn_time_s: 22.0
+boost_thrust_kn: 50
+boost_time_s: 2.0
+burnout_mass_kg: 150
+cd0: 0.40
+cd0_wave: 0.60
+cn_max: 8
+warhead_damage: 150
+lethal_radius_m: 12
+life_s: 120
+cooldown_s: 4.0
+pn_gain: 4.2
+autopilot_tau_s: 0.20
+guidance: ARH
+loft: true
+active_range_km: 30
+guidance_delay_s: 0.10
+g_slew: 350

@@ -92,13 +92,51 @@ class MissileSpec:
     # 因此射程量级不变，但初期加速更快、末段存速分配更接近真实弹道。
     boost_thrust: float = 0.0    # N，助推段推力
     boost_time: float = 0.0      # s，助推段时长
+    # 双脉冲固体发动机（PL-15 这类）：两段独立装药，中间隔着一段无推力滑翔。
+    # 第一脉冲把弹送到巡航速度，滑翔段靠惯性接近目标，末段再点第二脉冲补能，
+    # 从而在相同总冲下明显提高末段存速（近距不可逃逸区变大）。
+    # pulse2_time<=0 或 pulse2_thrust<=0 时退化为单脉冲（沿用 boost/sustain）。
+    pulse2_thrust: float = 0.0   # N，第二脉冲推力
+    pulse2_time: float = 0.0     # s，第二脉冲时长
+    pulse2_gap: float = 0.0      # s，第一脉冲结束到第二脉冲点火之间的滑翔段
     # 对会机动的目标的有效射程 m（近距弹专用）。导引头/射程包线是“打不动靶”
     # 的上限，末段弹速掉到 2–5 g 时转弯半径 3–5 km，追不上一个 9 g 急转的战斗机。
     # 发射决策只认这个距离内的目标，0 表示不启用（雷达弹按原包线处理）。
     dogfight_reach: float = 0.0
 
+    @property
+    def has_second_pulse(self) -> bool:
+        return self.pulse2_time > 0.0 and self.pulse2_thrust > 0.0
+
+    @property
+    def burn_end(self) -> float:
+        """推进剂全部烧完的时刻（双脉冲时含中间滑翔段）。"""
+        if self.has_second_pulse:
+            return self.boost_time + self.pulse2_gap + self.pulse2_time
+        return max(self.burn_time, self.boost_time)
+
+    @property
+    def total_impulse(self) -> float:
+        """∫Tdt，N·s。双脉冲只算两段有推力的时间，滑翔段为 0。"""
+        if self.has_second_pulse:
+            first = self.boost_thrust if 0.0 < self.boost_time else self.thrust
+            return first * self.boost_time + self.pulse2_thrust * self.pulse2_time
+        return (
+            self.boost_thrust * self.boost_time
+            + self.thrust * max(self.burn_time - self.boost_time, 0.0)
+        )
+
     def thrust_at(self, t: float) -> float:
         """t 时刻的发动机推力（0 表示已经熄火，由燃料量另行判断）。"""
+        if self.has_second_pulse:
+            t2 = self.boost_time + self.pulse2_gap
+            if t < self.boost_time:
+                return self.boost_thrust if 0.0 < self.boost_time else self.thrust
+            if t < t2:
+                return 0.0                       # 滑翔段
+            if t < t2 + self.pulse2_time:
+                return self.pulse2_thrust        # 第二脉冲
+            return 0.0
         if 0.0 < self.boost_time and t < self.boost_time:
             return self.boost_thrust
         return self.thrust
@@ -106,13 +144,10 @@ class MissileSpec:
     def mass_flow_at(self, t: float) -> float:
         """t 时刻推进剂质量流 kg/s：按恒定比冲折算，与推力成正比。
 
-        两段推力的总冲由 ∫Tdt 给出，质量流取 propellant·T(t)/∫Tdt，
-        保证全部推进剂恰好在 burn_time 内烧完，弹重随时间连续下降。
+        总冲由 ∫Tdt 给出，质量流取 propellant·T(t)/∫Tdt，保证全部推进剂
+        恰好在两段推力时间内烧完（双脉冲的滑翔段流率为 0），弹重连续下降。
         """
-        impulse = (
-            self.boost_thrust * self.boost_time
-            + self.thrust * max(self.burn_time - self.boost_time, 0.0)
-        )
+        impulse = self.total_impulse
         if impulse <= 0.0:
             return 0.0
         return self.propellant * self.thrust_at(t) / impulse

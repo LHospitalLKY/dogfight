@@ -94,6 +94,9 @@ WEAPON_FIELDS: dict[str, tuple[str, Converter]] = {
     "cd0_wave": ("cd0_wave", _float),
     "boost_thrust_kn": ("boost_thrust", _kn),
     "boost_time_s": ("boost_time", _float),
+    "pulse2_thrust_kn": ("pulse2_thrust", _kn),
+    "pulse2_time_s": ("pulse2_time", _float),
+    "pulse2_gap_s": ("pulse2_gap", _float),
     "dogfight_reach_m": ("dogfight_reach", _float),
 }
 
@@ -146,6 +149,11 @@ AIRCRAFT_FRAME_FIELDS: dict[str, tuple[str, Converter]] = {
     "tvc_deg": ("tvc", _deg),
     "tvc_alpha_max_deg": ("tvc_alpha_max", _deg),
     "tvc_cl_bonus": ("tvc_cl_bonus", _float),
+    # 全动鸭翼增升（J-20）：按迎角驱动的涡流增升，与 TVC 油门驱动的喷流增升互补。
+    "canard": ("canard", _bool),
+    "canard_cl_bonus": ("canard_cl_bonus", _float),
+    "canard_alpha_max_deg": ("canard_alpha_max", _deg),
+    "canard_stall_shift_deg": ("canard_stall_shift", _deg),
 }
 
 # 机体的传感器/隐身参数

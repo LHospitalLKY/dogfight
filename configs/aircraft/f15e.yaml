@@ -1,0 +1,66 @@
+# F-15E Strike Eagle：双座双用途，保形油箱（CFT），偏对地但保留强对空能力。
+id: F-15E
+name: F-15E
+
+airframe:
+  # 空机 14,380 + 半油（含 CFT）5,100 ≈ 19,480 kg。
+  base_mass_kg: 19480
+  wing_area_m2: 56.5
+  cl_max: 1.55
+  n_struct_g: 9
+  thrust_max_kn: 258.8      # F100-PW-229 双发加力（129.4 × 2）
+  thrust_mil_kn: 158.2      # 双发军用推力（79.1 × 2）
+  cd0: 0.045                # CFT 与吊舱增加零升阻力
+  aspect_ratio: 3.01
+  oswald: 0.80
+  cl_alpha: 3.70
+  cruise_mach: 0.95
+  fuel_capacity_kg: 10200   # 内油 + CFT 燃油
+  lapse_exp: 0.70
+  ram_r0: 0.20
+  ram_r1: 0.10
+  derate_z_m: 16000
+  derate_H_m: 5000
+  eta_install: 0.96
+  hp_max: 105
+  gun_range_m: 1000
+  gun_dps: 40
+  ammo_max: 500             # 对地任务减重
+  rounds_per_sec: 110
+  length_m: 19.43
+  muzzle_speed: 1030
+  bullet_mass_kg: 0.102
+  bullet_diameter_m: 0.020
+  gun_spread: 0.003
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  canard: false
+
+sensors:
+  rcs: 6.0
+  rcs_front: 6.0
+  rcs_side: 18.0
+  rcs_back: 12.0
+  radar_range_km: 160        # APG-82(V)1 AESA
+  side_array: false
+  lband: false
+  irst_range_km: 0           # 狙击手/Litening 吊舱由外挂提供，此处不计
+  pod_irst_range_km: 45      # 对地瞄准吊舱兼具 IRST 能力
+
+loadout:
+  ir:
+    weapon: AIM-9X
+    count: 4
+  radar:
+    weapon: AIM-120C
+    count: 4
+  countermeasures:
+    chaff: 30
+    flare: 60
+
+agent:
+  aggression: 0.72
+  energy_pref: 0.55
+  lure: false
+  style: energy

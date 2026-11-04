@@ -57,6 +57,9 @@ def build_world(
     if swap:
         specs.reverse()
     init = sc.initial
+    headings = tuple(team.heading_deg for team in sc.teams)
+    if swap:
+        headings = (headings[1], headings[0])
     return World(
         specs,
         dt=sc.physics_dt,
@@ -69,6 +72,7 @@ def build_world(
         z_floor=init.floor_m,
         z_ceiling=init.ceiling_m,
         awacs=sc.awacs if awacs is None else awacs,
+        headings=headings,
     )
 
 
@@ -87,6 +91,11 @@ def build_agents(
         return [PurePursuit(), PurePursuit()]
     sc = scenario or resolve_scenario()
     overrides = radar_policy or {}
+
+    def _front_rcs(spec: AircraftSpec) -> float:
+        """有效前向 RCS：分向值为 0 时回退到全向 rcs。"""
+        return spec.rcs_front if spec.rcs_front > 0.0 else spec.rcs
+
     agents = []
     for index, team in enumerate(sc.teams):
         policy = (
@@ -96,9 +105,29 @@ def build_agents(
             or (su57_radar if team.aircraft.id == "SU-57" else None)
             or team.radar_policy
         )
+        persona = dataclasses.asdict(team.aircraft.agent)
+        # 场景里显式指定的 opening_tactic 优先级最高；否则按机体 persona 的
+        # 值走（auto 时由对阵自动选择 stealth_compress 或 default）。
+        if team.opening_tactic is not None:
+            persona["opening_tactic"] = team.opening_tactic
+        if persona.get("opening_tactic", "auto") == "auto":
+            own_spec = team.aircraft.spec
+            opp_index = 1 - index if len(sc.teams) == 2 else index
+            opp_spec = sc.teams[opp_index].aircraft.spec
+            own_front = _front_rcs(own_spec)
+            opp_front = _front_rcs(opp_spec)
+            has_radar_missile = own_spec.radar_missile_count > 0
+            if (
+                opp_front > 0.0
+                and own_front < opp_front * 0.5
+                and has_radar_missile
+            ):
+                persona["opening_tactic"] = "stealth_compress"
+            else:
+                persona["opening_tactic"] = "default"
         team_seed = None if seed is None else seed + index
         agents.append(TacticalAgent(
-            **dataclasses.asdict(team.aircraft.agent),
+            **persona,
             seed=team_seed,
             radar_policy=policy,
         ))
@@ -218,6 +247,10 @@ def _simulate(
         f16_radar=f16_radar, su57_radar=su57_radar,
         scenario=sc, radar_policy=radar_policy,
     )
+    # 记录每架飞机选择的开局战术，便于事后复盘隐身压缩是否生效。
+    for ac, ag in zip(world.acs, agents):
+        tactic = getattr(ag, "opening_tactic", "default")
+        world.events.append((world.t, f"{ac.spec.name} 开局战术: {tactic}"))
     steps_per_decision = round(1.0 / (sc.decision_hz * sc.physics_dt))
     steps_per_second = max(1, round(1.0 / sc.physics_dt))
     usage = [Counter() for _ in range(len(sc.teams))]

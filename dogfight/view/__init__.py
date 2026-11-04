@@ -170,10 +170,38 @@ def _convert_f16(verts, faces, length: float) -> dict:
     return {"pts": pts, "faces": faces, "engines": engines, "canopy": canopy}
 
 
+def _convert_default(verts, faces, length: float, forward: str = "+x") -> dict:
+    """新增机型的默认换算：把指定轴当作纵轴，输出机体系（x 前、y 右、z 下）。
+
+    喷口与座舱暂留空，待对应 OBJ 到位后在专属 converter 里按材质名与几何
+    特征补全。forward 可选 "+x" / "-x" / "+z" / "-z"。
+    """
+    (x0, x1), (y0, y1), (z0, z1) = bbox(verts)
+    cx, cy, cz = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0
+    if forward in ("+x", "-x"):
+        span = x1 - x0
+        s = length / span
+        sign = 1.0 if forward == "+x" else -1.0
+        def conv(v):
+            return (sign * (v[0] - cx) * s, -(v[2] - cz) * s, -(v[1] - cy) * s)
+    else:
+        span = z1 - z0
+        s = length / span
+        sign = 1.0 if forward == "+z" else -1.0
+        def conv(v):
+            return (sign * (v[2] - cz) * s, -(v[0] - cx) * s, -(v[1] - cy) * s)
+    pts = [conv(v) for v in verts]
+    return {"pts": pts, "faces": faces, "engines": [], "canopy": set()}
+
+
 # 原始 OBJ 的轴向约定不统一，按注册表里的 converter 名分派（新增机型在此登记）。
 CONVERTERS = {
     "su57": _convert_su57,
     "f16": _convert_f16,
+    # J-20 / F-15 的 converter 待对应 OBJ 到位后按其轴向校准；
+    # 当前按"纵轴 X、机头 +X"的常见约定给出默认换算，喷口/座舱暂留空。
+    "j20": lambda v, f, l: _convert_default(v, f, l, forward="+x"),
+    "f15": lambda v, f, l: _convert_default(v, f, l, forward="+x"),
 }
 
 
@@ -212,6 +240,10 @@ def load_model(path: str | Path, converter: str, length: float, voxel: float,
 def _build_models() -> dict[str, dict]:
     models: dict[str, dict] = {}
     for name, asset in _CATALOG.aircraft.items():
+        # 新增机型的 OBJ 尚未就位时跳过，前端会退回通用兜底模型；
+        # 避免因单个缺失文件导致整个观战端导入失败。
+        if not asset.web.source.exists():
+            continue
         models[name] = load_model(
             asset.web.source, asset.web.converter, asset.length_m,
             asset.voxel_m, asset.keep_materials,

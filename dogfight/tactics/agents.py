@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import math
 import random
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dogfight.core.sim import (
     G, MAX_BANK, Action, Observation, clamp, predict_path, wrap_pi,
@@ -66,6 +67,10 @@ HIGH_G_MIN_AVAIL = 6.5
 # 筋斗/殷麦曼的过载上限：全程 7–8 g 会把动能抽干，末段只能挂在高迎角上
 # 慢慢掉头。按 6.5 g 左右做完，速度还能留在可用区间，动作也更像标准机动。
 VERTICAL_N = 6.5
+# 垂直机动的能量裕度：拉起段的高度增量 2R 只能占用“多余动能”的这一比例。
+# 剩下的三成要留给阻力损失、推力不足和拉起段的过载延迟。14 km、2.3 倍失速
+# 时 2R 已经吃掉 89% 的多余动能，动作必然在过顶前失速。
+VERTICAL_CLIMB_MARGIN = 0.65
 # 防御转向反转的时间门槛：威胁持续位于反侧超过该时长才换向。
 # 否则每次重新进入防御原语都会按瞬时方位翻一次，形成“无收益的反向机动”。
 DEF_REVERSE_TIME = 1.5
@@ -104,6 +109,7 @@ class Maneuver:
     low_alt_need: float = 0.0     # 需要的离地余量 m
     high_alt_need: float = 0.0    # 需要的高度余量 m
     ps_positive: bool = False     # 要求 Ps > 0（否则做不完垂直机动）
+    min_n_avail: float = 0.0      # 完成动作所需的可用过载下限
     max_dist: float = 0.0         # 需要贴脸才能做的动作
 
 
@@ -171,11 +177,11 @@ MANEUVERS: dict[str, Maneuver] = {
     ),
     "IMMELMANN": Maneuver(
         "IMMELMANN", "DEFENSIVE", min_speed_frac=1.70,
-        high_alt_need=2500.0, ps_positive=True,
+        high_alt_need=2500.0, ps_positive=True, min_n_avail=6.0,
     ),
     "LOOP": Maneuver(
         "LOOP", "DEFENSIVE", min_speed_frac=1.85,
-        high_alt_need=3000.0, ps_positive=True,
+        high_alt_need=3000.0, ps_positive=True, min_n_avail=6.5,
     ),
     "GUN_LEAD": Maneuver("GUN_LEAD", "GUNS"),
     "GUN_PRESS": Maneuver("GUN_PRESS", "GUNS"),
@@ -558,6 +564,21 @@ class _Situation:
     far: bool
 
 
+@dataclass
+class FlankWaypoint:
+    """flank 占位航路点：在本机死推算世界系中的绝对坐标与期望航向。
+
+    x/y 是从开局起点积分本机速度得到的相对世界坐标（只用于航路显示与
+    重规划，不参与飞控——飞控仍用 Observation 的相对几何）。
+    turn_method: "coord" 协调转弯（bank+n），"hard" 减速+满滚+拉杆快速转向。
+    """
+    x: float
+    y: float
+    target_psi: float
+    turn_method: str = "coord"
+    reached: bool = False
+
+
 class TacticalAgent:
     """几何判定 + 机动原语。
 
@@ -617,6 +638,12 @@ class TacticalAgent:
     # 冷却取同一量级，避免同一场缠斗里连做。
     BELL_COOLDOWN = 30.0
     LOCK_BREAK_DIST = 8000.0     # 被对方锁定且进入该距离后评估是否防御
+    # 超视距雷达锁定防御：被对方火控雷达稳定锁定、且距离在典型中距弹射程
+    # 内（R-77-1 / AIM-120 级约 60 km）时，即使对方还没射弹也要主动横转/偏置，
+    # 把对方雷达视线压到机侧（90° 左右），利用 PD 雷达多普勒凹口断锁，
+    # 同时降低接近率、把自己拉出对方发射包线。旧实现只在 8 km 内才防御，
+    # 导致 40 km 被锁定时一直直飞，等弹离架再躲已经来不及。
+    BVR_LOCK_DEFEND_DIST = 60000.0
     OPENING_DIST = 20000.0       # 开局占位阶段：距离大于该值时不直冲对头
     MERGE_START = 5000.0     # 进入该距离开始领先转弯，抢交汇角度
     # 交汇方案在贴身盘旋阶段的保持距离。取 2200 而不是 1800，
@@ -755,6 +782,7 @@ class TacticalAgent:
         lure: bool = False,
         radar_policy: str = "always",
         style: str = "auto",
+        opening_tactic: str = "auto",
     ) -> None:
         self.aggression = aggression
         self.energy_pref = energy_pref
@@ -769,6 +797,21 @@ class TacticalAgent:
         # 弹药的一方该打开：它放弃了继续压上，换对方把两发中距弹在自包线
         # 最外沿打掉。
         self.lure = lure
+        # 开局占位策略：auto/default 沿用 style 的能量/角度占位；
+        # stealth_compress 用接近迎头的姿态静默接近（见 _position）；
+        # flank 绕到对方后半球盲区（侧后方）接敌。
+        if opening_tactic == "auto":
+            opening_tactic = "default"
+        self.opening_tactic = opening_tactic
+        # 隐身压缩与侧翼绕后都要求静默接敌：若配了 always 常开，
+        # 降级为 auto 并记一次告警。
+        if opening_tactic in ("stealth_compress", "flank") and radar_policy == "always":
+            print(
+                f"[TacticalAgent] opening_tactic={opening_tactic} 需静默接敌，"
+                f"将 radar_policy 从 always 降级为 auto。"
+            )
+            self.radar_policy = "auto"
+            self._radar_on = False
         # 开局占位不再固定成一个模板：每次启动在机型允许的范围内随机取样。
         # seed 只用于实验复现，正常观战/无头运行时不传，即为真随机。
         self._rng = random.Random(seed)
@@ -791,6 +834,41 @@ class TacticalAgent:
             self._open_throttle = self._rng.uniform(0.85, 1.0)
             # 48 km 的接近段最多只换取 0.5–1.2 km 高度。
             self._open_climb_gain = self._rng.uniform(500.0, 1200.0)
+
+        if self.opening_tactic == "stealth_compress":
+            # 隐身压缩：把横向偏置压到 ≤3°，使 angle_off_nose 尽量小，
+            # 始终向前方（最低 RCS）暴露给对方雷达。油门限制在军推以下、
+            # 不开加力（见 _position），压低 IRST 发现距离。只做轻微爬升
+            # 存少量能量，幅度小于常规能量型占位。
+            self._open_offset = math.radians(self._rng.uniform(0.5, 3.0))
+            self._open_climb = math.radians(self._rng.uniform(1.0, 5.0))
+            self._open_throttle = self._rng.uniform(0.82, 0.93)
+            self._open_climb_gain = self._rng.uniform(200.0, 600.0)
+
+        if self.opening_tactic == "flank":
+            # 侧翼绕后：占位参数本身不重要，真正的机动在 _position 里按
+            # 对方航向动态计算（飞向对方后半球的侧翼航路点）。这里给一组
+            # 温和的基线值，确保万一 _position 没接管时也不会满油门直冲。
+            self._open_offset = math.radians(self._rng.uniform(2.0, 5.0))
+            self._open_climb = math.radians(self._rng.uniform(0.0, 4.0))
+            self._open_throttle = self._rng.uniform(0.85, 0.95)
+            self._open_climb_gain = self._rng.uniform(300.0, 800.0)
+
+        # ---- flank 航路规划状态 ----
+        # 敌航迹历史：最近若干秒的 (t, dist, los_az, foe_psi, foe_speed, foe_track_psi)
+        self._flank_history: deque = deque(maxlen=60)
+        # 当前航路点列表（5 个），本机死推算世界系坐标
+        self._flank_wps: list[FlankWaypoint] = []
+        self._flank_wp_idx: int = 0
+        # 重规划计时与周期（3 s）
+        self._flank_replan_t: float = 0.0
+        self._flank_replan_interval: float = 3.0
+        # 上一帧敌机航向，用于检测突变（>15° 立即重规划）
+        self._flank_foe_psi_prev: float | None = None
+        # 本机死推算位置（从开局起点积分，仅用于航路显示与规划）
+        self._flank_own_x: float = 0.0
+        self._flank_own_y: float = 0.0
+        self._flank_own_init: bool = False
 
         self.primitive = "PURE"     # 当前机动（第 2 层，保留给日志/渲染）
         self.tactic = "OFFENSIVE"   # 当前战术族（第 1 层）
@@ -917,6 +995,21 @@ class TacticalAgent:
             self._foe_psi_prev = obs.foe_psi
         else:
             self._foe_psi_prev = None
+        # ---- flank 航路规划：死推算本机位置 + 记录敌航迹 ----
+        if self.opening_tactic == "flank" and not self._opening_done:
+            # 用本机速度与航向积分位置（仅用于航路显示与规划，不参与飞控）。
+            if not self._flank_own_init:
+                self._flank_own_x = 0.0
+                self._flank_own_y = 0.0
+                self._flank_own_init = True
+            else:
+                self._flank_own_x += obs.own_speed * math.cos(obs.own_psi) * self.dt
+                self._flank_own_y += obs.own_speed * math.sin(obs.own_psi) * self.dt
+            # 记录敌航迹采样（用于交叉验证速度/航向，剔除野值）。
+            self._flank_history.append((
+                self._flank_replan_t, obs.dist, obs.los_az,
+                obs.foe_psi, obs.foe_speed, obs.foe_track_psi,
+            ))
         self._post_launch_t = max(0.0, self._post_launch_t - self.dt)
         self._counter_cd = max(0.0, self._counter_cd - self.dt)
         if self._counter_commit > 0.0:
@@ -981,6 +1074,26 @@ class TacticalAgent:
             self._circle_t = max(0.0, self._circle_t - 2.0 * self.dt)
         if obs.dist < self.OPENING_DIST:
             self._opening_done = True
+        # 隐身压缩的次级终止条件：一旦对方已经火控锁定本机，说明静默接敌
+        # 的几何红利已经吃完（对方靠 IRST / 预警机 / 前向 RCS 还是逮到了），
+        # 继续压小偏置只会白白放弃交战机动，立刻转入正常交战/防御。
+        if (
+            not self._opening_done
+            and self.opening_tactic == "stealth_compress"
+            and obs.foe_radar_locked
+        ):
+            self._opening_done = True
+        # 侧翼绕后的次级终止条件：已经进入对方后半球盲区（foe_off_nose>90°，
+        # 对方前向雷达/IRST 都看不到），且距离已收进中距弹射程，就可以结束
+        # 占位、转入交战（雷达 auto 会在 NEZ 内短暂开机射击）。
+        if (
+            not self._opening_done
+            and self.opening_tactic == "flank"
+            and obs.foe_off_nose > math.radians(95.0)
+            and 0.0 < obs.radar_max_range
+            and obs.dist <= obs.radar_max_range
+        ):
+            self._opening_done = True
 
         # 交汇抢位方案在接近到 MERGE_START 内时锁定，随后按方案执行。
         # 只在仍是迎头接近时重算，避免进入盘旋格斗后方案来回翻转。
@@ -1015,7 +1128,7 @@ class TacticalAgent:
             if (
                 not self._maneuver_done
                 and not gun_now
-                and want not in ("RECOVER", "UNLOAD")
+                and want not in ("RECOVER", "UNLOAD", "COBRA")
             ):
                 want = self.primitive
         # 只有安全类（回场/卸载）与“转入防御”可以立即抢占。
@@ -1285,7 +1398,9 @@ class TacticalAgent:
     ) -> tuple[str, str] | None:
         """恢复：贴着边界或高度上下限时先回场。"""
         # 转弯半径随速度平方增长，所以边界余量按速度缩放，避免高速时来不及转回。
-        edge_need = max(900.0, 8.0 * obs.own_speed)
+        # 转弯直径 ≈ 2v²/(g√(n²−1))；9 km 高度 F-16V 可持续过载仅 ~2.4g，
+        # 直径可达 9–10 km，余量必须盖住整个掉头空间，否则贴边才拉起会出界。
+        edge_need = max(3000.0, 45.0 * obs.own_speed)
         low_need = max(1200.0, 3.5 * obs.own_speed)
         if obs.own_gamma < math.radians(-10.0):
             # 已经在下俯：余量必须盖住“把航迹拉平”要占用的竖直空间，
@@ -1323,10 +1438,19 @@ class TacticalAgent:
         """
         # 眼镜蛇是瞬态机动：机头拉到极限迎角后必须立刻改出，否则会变成
         # 挂在高迎角上持续爬升，速度被抽干、反而成了靶子。
-        if self.primitive == "COBRA" and self._phase_t > 1.5:
-            return "SURVIVE", (
-                "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
-            )
+        if self.primitive == "COBRA":
+            if self._phase_t > 1.5:
+                # 破 S 的准入速度是 1.35 倍失速；低于这个速度再滚转倒扣，
+                # 只会挂在高航迹角上继续掉速。此时直接卸载推杆更安全。
+                if obs.own_speed_frac < 1.35:
+                    return "SURVIVE", "UNLOAD"
+                return "SURVIVE", (
+                    "SPLIT_S" if obs.z_margin_low > self._split_s_room(obs) else "BREAK"
+                )
+            # 1.5 s 的过失速窗口内保持在眼镜蛇：让迎角真正建立起来，
+            # 而不是每 0.7 s 被下一条“低速→卸载”判据抢走。
+            if obs.incoming_missile_dist > self.MISSILE_EVADE_DIST:
+                return "SURVIVE", "COBRA"
         # 规避过程中仍要守住能量：机头已经高高抬起、速度又不够时，
         # 继续压坡度拉过载只会变成爬升耗能，先俯冲把航迹角压下来。
         # 这条不限防御原语：压炮/追逐在低速大航迹角时同样会把飞机顶到
@@ -1340,8 +1464,25 @@ class TacticalAgent:
             return "SURVIVE", "UNLOAD"
         if (
             self.primitive in self.DEFENSE_SET
+            # 垂直类原语（殷麦曼/筋斗/破 S/钟摆/桶滚）不能在这里被“改成破 S”：
+            # 破 S 不在垂直机动的可打断集合里，这条判断会在每个决策周期返回
+            # 破 S 却切不进去，机体只能继续把殷麦曼做完——等真正切换时速度
+            # 已经被抽到失速以下。垂直机动的低速改出交给后面的能量纪律统一
+            # 处理（有能力则眼镜蛇，否则卸载俯冲）。
+            and (
+                self.primitive not in VERTICAL
+                # 破 S 自己就在这个集合里：返回同名原语是“保持”，不是抢占，
+                # 没必要一起排除；排除的只是那些切不进去的垂直机动。
+                or self.primitive in ("SPLIT_S", "HIGH_G_SPLIT_S")
+            )
+            # 眼镜蛇是 1.5 s 瞬态动作，有自己的改出时序（顶部判据）；
+            # 这里若把它当成普通防御原语换成破 S，0.7 s 就被打断，
+            # 过失速姿态还没建立就被推杆，等于白做。
+            and self.primitive != "COBRA"
             and obs.own_gamma > math.radians(25.0)
-            and obs.own_speed_frac < 1.70
+            # 破 S 的速度准入是 1.35：低于它再“改成破 S”本身就做不出来，
+            # 只会在高航迹角上滚转、继续掉速。低于 1.35 交给能量纪律。
+            and 1.35 <= obs.own_speed_frac < 1.70
         ):
             # 破 S 会掉 2R 高度（R 随速度平方增长），低空时再做就是直接扎地。
             return "SURVIVE", (
@@ -1440,7 +1581,10 @@ class TacticalAgent:
             return "DISENGAGE", "EXTEND"
         # 打空或重伤就不再纠缠。只有自己明显伤得更重才脱离：双方都被打残时
         # 继续缠斗，否则两架重伤机各自逃跑会把对局拖成“飞出空域”。
-        if obs.own_ammo <= 1.0 or (
+        # 注意：J-20 无内置机炮，`own_ammo` 恒为 0；必须把导弹余量一并计入，
+        # 否则无炮机型会在接敌前就误判“打空”而持续脱离。
+        if (obs.own_ammo <= 1.0 and obs.own_missiles <= 0
+                and obs.own_radar_missiles <= 0) or (
             obs.own_hp_frac < 0.18
             and obs.foe_hp_frac > max(0.25, obs.own_hp_frac + 0.08)
         ):
@@ -1450,10 +1594,40 @@ class TacticalAgent:
             # 必须同时满足“速度回来了”和“机头已经压下来”，避免反复抬头
             if obs.own_speed_frac < 1.40 or obs.own_gamma > math.radians(15.0):
                 return "SURVIVE", "UNLOAD"
-        elif obs.own_speed_frac < 1.20 and self.primitive not in BELL_PRIMS:
+        elif (
+            obs.own_speed_frac
+            < (
+                1.65 if self.primitive in ("IMMELMANN", "LOOP")
+                else 1.35 if self.primitive in ("SPLIT_S", "HIGH_G_SPLIT_S")
+                else 1.20
+            )
+            and self.primitive not in BELL_PRIMS
+            # 眼镜蛇本身就是在失速边缘执行的动作，不能一进来就被“低速→卸载”
+            # 立刻换掉；它的 1.5 s 改出窗口由 _tactic_survive 顶部判据负责。
+            and self.primitive != "COBRA"
+        ):
             # 钟摆例外：它就是靠“把速度打到失速附近 → 零速尾滑 → 翻落”来
             # 诱使尾追机冲过头的，低速是动作的一部分而不是失控。恢复段由
             # 它自己的分段拉平，边界/升限/过载疲劳这些生存判据照旧生效。
+            #
+            # 殷麦曼/筋斗的拉起段若把速度抽到失速边缘，继续沿轨迹过顶只会
+            # 挂在高迎角上空转下坠（表现为“不断盘旋 + 滑落”）。6DOF 且有
+            # 超机动能力的机型（矢量喷口或全动鸭翼）改为眼镜蛇：先把机头
+            # 拉到过失速迎角，用阻力换取机头指向和改出窗口；没有超机动
+            # 能力、或速度已低于 1.05 倍失速时，老实卸载俯冲。
+            #
+            # 航迹角已经压到 60° 以上时不能转眼镜蛇：此时升力矢量基本朝
+            # 上，再拉大迎角只会把航迹继续推陡（实测 73°→79°），速度反而
+            # 掉得更快。这种“机头已经指天”的姿态只能靠推杆卸载。
+            if (
+                self.primitive in ("IMMELMANN", "LOOP")
+                and obs.dof >= 6
+                and (obs.own_tvc or obs.own_canard)
+                and obs.own_speed_frac > 1.05
+                and obs.own_gamma < math.radians(60.0)
+                and obs.incoming_missile_dist > self.MISSILE_EVADE_DIST
+            ):
+                return "SURVIVE", "COBRA"
             return "SURVIVE", "UNLOAD"
         return None
 
@@ -1691,9 +1865,24 @@ class TacticalAgent:
 
         这一档排在反击之后：同样是“被咬尾”，能反咬就先反咬，反咬不成立
         （距离、速度、能量或冷却不允许）才退回横转/破 S 消耗对手的射击机会。
+        超视距雷达锁定单独处理：在典型中距弹射程内被火控雷达稳定照射时，
+        即使对方还没射弹也要主动横转/偏置断锁，不能等进了 8 km 才反应。
         """
         if not (obs.foe_locked or obs.foe_radar_locked):
             return None
+        # 超视距雷达锁定防御：被火控雷达锁定、距离在中距弹射程内，
+        # 优先用横转（BEAM）把对方雷达视线压到机侧钻进多普勒凹口；
+        # 距离较远（> 30 km）时用 CRANK（45° 偏置）兼顾态势感知，
+        # 较近时直接 BEAM 彻底断锁。只有 _should_defend 放行才规避
+        # （自己占进攻位/有弹要先射时不躲）。
+        if (
+            obs.foe_radar_locked
+            and obs.dist < self.BVR_LOCK_DEFEND_DIST
+            and obs.own_speed_frac > 1.30
+            and self._should_defend(obs, sit)
+        ):
+            maneuver = "CRANK" if obs.dist > 30000.0 else "BEAM"
+            return "LOCK_DEFENSE", maneuver
         if obs.dist >= self.LOCK_BREAK_DIST or obs.own_speed_frac <= 1.30:
             return None
         if not self._should_defend(obs, sit):
@@ -2044,8 +2233,11 @@ class TacticalAgent:
         """
         if obs.foe_missiles <= 0 and obs.foe_radar_missiles <= 0:
             return False            # 对方没弹了，锁定没有威胁
-        if obs.foe_lock_progress < 0.85:
-            return False            # 还没形成稳定发射条件
+        # 锁定进度只约束红外锁定：foe_lock_progress 是红外锁定进度，
+        # 雷达锁定（foe_radar_locked）是布尔量、为真即已稳定锁定，
+        # 不应再要求红外进度 >= 0.85，否则被雷达锁定时永远不防御。
+        if not obs.foe_radar_locked and obs.foe_lock_progress < 0.85:
+            return False            # 红外还没形成稳定发射条件
         if obs.own_speed_frac < 1.35:
             return False            # 能量不够，规避也甩不掉
         # 自己的中距弹正在飞、目标还在照射锥内：先保持照射把它打完。
@@ -2089,6 +2281,24 @@ class TacticalAgent:
             return "BREAK" if (vs_missile or ir) else "BEAM"
         return self._pick_maneuver(cands, None, obs, vs_missile)
 
+    def _vertical_climb_ok(self, obs: Observation) -> bool:
+        """垂直机动的高度增量能否只用“多余动能”付清。
+
+        殷麦曼/筋斗的拉起段在竖直面里画一个半径
+        `R = v²/(g√(n²−1))` 的半圆，高度净增约 `2R`，全部来自动能：
+        `Δh = (v² − v_stall²)/(2g)`。若 2R 占掉了可用多余动能的 65% 以上，
+        过顶前速度就会被抽到失速附近，剩下的只是高航迹角上的盘旋滑落
+        （14 km、2.3 倍失速时拉 5 g：2R ≈ 5.0 km，可用动能只有 5.4 km，
+        占 93%，必然做不完）。过载够不够只是必要条件，这一条是能量上的充分性。
+        """
+        v = obs.own_speed
+        v_stall = v / max(obs.own_speed_frac, 1e-3)
+        n = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK)
+        r = v * v / (G * math.sqrt(max(n * n - 1.0, 1.0)))
+        climb = 2.0 * r
+        avail = max((v * v - v_stall * v_stall), 0.0) / (2.0 * G)
+        return climb <= VERTICAL_CLIMB_MARGIN * avail
+
     def _defense_ok(self, primitive: str, obs: Observation) -> bool:
         """防御机动的准入条件，全部取自机动层的能力声明。"""
         m = MANEUVERS.get(primitive)
@@ -2117,6 +2327,16 @@ class TacticalAgent:
         if m.high_alt_need and obs.z_margin_high <= m.high_alt_need:
             return False
         if m.ps_positive and obs.own_ps_level <= 0.0:
+            return False
+        # 垂直机动要连续数秒拉 6 g 以上才能过顶。可用过载不足时拉不起
+        # 半圈，动作会退化成“大坡度缓爬 + 持续掉速”，最后挂在高航迹角
+        # 上滑落（高空低动压时的典型表现）。宁可改做水平/下降类规避。
+        if m.min_n_avail and obs.own_n_avail < m.min_n_avail:
+            return False
+        # 过载够只是必要条件：还要有多余动能把 2R 的爬升付清。
+        if m.ps_positive and primitive in ("IMMELMANN", "LOOP") and not (
+            self._vertical_climb_ok(obs)
+        ):
             return False
         if m.max_dist and obs.dist >= m.max_dist:
             return False
@@ -2485,7 +2705,7 @@ class TacticalAgent:
         sign = 0.0
         if self._rec_turning:
             sign = 1.0 if heading > 0.0 else -1.0
-        if obs.edge_margin < max(900.0, 8.0 * speed):
+        if obs.edge_margin < max(2000.0, 20.0 * speed):
             # 离边界太近：转回空域中心。用 6 g 的协调盘旋——6 g 正好是
             # 持续耐受上限，长时间拉也不会累积疲劳；高度余量同时不足时
             # 顺带 5° 浅爬升。
@@ -2509,6 +2729,112 @@ class TacticalAgent:
             obs, obs.off_az, obs.off_el, gain=1.2, throttle=self.LURE_THROTTLE,
         )
 
+    def _flank_hard_turn(self, obs: Observation, off: float) -> Action:
+        """大角度快速转向：减速板 + 满滚 + 拉杆。
+
+        转弯半径 r = v² / (g·√(n²-1))，减速让 v 下降（r 二次方减小），
+        满滚 80° 把升力矢量转到水平面，拉杆拉高 n。组合下来转向率约为
+        协调 3g 转弯的 4–5 倍，代价是掉能量——只在航路点要求大角度改向时用。
+        """
+        sign = 1.0 if off >= 0.0 else -1.0
+        n_target = min(obs.own_n_avail, 6.5)
+        # 先用 aim_action 反解协调转弯指令作为基础，再叠减速与满滚。
+        act = aim_action(
+            obs, off, self._open_climb_cur - obs.own_gamma,
+            gain=1.6, throttle=0.6,
+        )
+        act.bank = sign * 1.0                          # 满滚 80°
+        act.n = clamp(n_target, 2.5, 7.0)
+        act.brake = 1.0                                 # 放减速板
+        act.afterburner = 0.0
+        # TVC 机型可叠加偏航喷口加速改向；非矢量机型 tvc_yaw 无效。
+        act.tvc_yaw = sign * 0.6
+        return act
+
+    def _flank_replan(self, obs: Observation) -> None:
+        """根据敌机航迹预测重新规划 5 个航路点。
+
+        坐标系：以本机开局起点为原点的死推算世界系。
+        思路：用二次贝塞尔曲线把“当前位置 → 前出锚点 → 尾后切入点”连成
+        一条先接近、再从侧后切入的平滑曲线，在曲线上均匀取 5 个点。
+        锚点放在本机→敌机连线上（约 40% 距离）并向“尾后侧”小幅偏移，
+        让曲线自然弯向敌机后半球，而不是拉出大横切弧。
+        """
+        ox, oy = self._flank_own_x, self._flank_own_y
+        # 敌机在死推算系中的当前位置。
+        fx = ox + obs.dist * math.cos(obs.los_az)
+        fy = oy + obs.dist * math.sin(obs.los_az)
+        fps = obs.foe_track_psi if obs.foe_track_psi else obs.foe_psi
+        fspd = max(obs.foe_speed, 1.0)
+
+        # 预测敌机 T 秒后的位置（T ≈ 飞到尾后点的时间）。
+        t_pred = clamp(obs.dist / max(obs.own_speed, 1.0), 5.0, 40.0)
+        fpx, fpy, _ = predict_path(
+            (fx, fy, obs.foe_alt), fspd, fps, obs.foe_gamma,
+            obs.foe_psi_rate, getattr(obs, "foe_gamma_rate", 0.0), t_pred,
+        )
+
+        # 尾后切入点：敌机预测位置后方沿航迹 standoff 处，加小幅侧向偏移
+        # 从侧后进入（而非正后方）。standoff 取典型中距弹射程量级，不随
+        # 距离线性放大，避免路径过长。
+        standoff = min(25000.0, max(obs.dist * 0.35, 8000.0))
+        lateral = min(8000.0, standoff * 0.3)
+        tx_dir = math.cos(fps)
+        ty_dir = math.sin(fps)
+        # 侧向单位矢量（航迹左法线）。
+        px_dir = -ty_dir
+        py_dir = tx_dir
+        # 选离本机当前位置更近的一侧，减少横切距离。
+        foe_to_own_x = ox - fx
+        foe_to_own_y = oy - fy
+        side = 1.0 if (foe_to_own_x * px_dir + foe_to_own_y * py_dir) >= 0.0 else -1.0
+        target_x = fpx - standoff * tx_dir + side * lateral * px_dir
+        target_y = fpy - standoff * ty_dir + side * lateral * py_dir
+
+        # 前出锚点：在本机→敌机连线上约 40% 处，向尾后侧小幅偏移，
+        # 作为贝塞尔控制点让路径弯向侧后，而不是大角度横切。
+        along_x = ox + (fx - ox) * 0.4
+        along_y = oy + (fy - oy) * 0.4
+        anchor_off = min(obs.dist * 0.15, 12000.0)
+        anchor_x = along_x + side * px_dir * anchor_off
+        anchor_y = along_y + side * py_dir * anchor_off
+
+        # 二次贝塞尔曲线 B(t) = (1-t)²P0 + 2(1-t)t·P1 + t²·P2。
+        N = 5
+        wps: list[FlankWaypoint] = []
+        prev_psi = obs.own_psi
+        for i in range(1, N + 1):
+            t = i / N
+            bx = (1 - t) ** 2 * ox + 2 * (1 - t) * t * anchor_x + t ** 2 * target_x
+            by = (1 - t) ** 2 * oy + 2 * (1 - t) * t * anchor_y + t ** 2 * target_y
+            # 该点期望航向：指向下一个点（最后一个点指向预测敌机位置）。
+            if i < N:
+                t_next = (i + 1) / N
+                nx = (1 - t_next) ** 2 * ox + 2 * (1 - t_next) * t_next * anchor_x + t_next ** 2 * target_x
+                ny = (1 - t_next) ** 2 * oy + 2 * (1 - t_next) * t_next * anchor_y + t_next ** 2 * target_y
+            else:
+                nx, ny = fpx, fpy
+            target_psi = math.atan2(ny - by, nx - bx)
+            # 转弯方式：期望航向相对上一点航向变化 > 45° 用硬转弯。
+            delta = abs(wrap_pi(target_psi - prev_psi))
+            turn_method = "hard" if delta > math.radians(45.0) else "coord"
+            wps.append(FlankWaypoint(
+                x=bx, y=by, target_psi=target_psi, turn_method=turn_method,
+            ))
+            prev_psi = target_psi
+
+        # 重规划后从离当前位置最近的航路点继续，而不是总从第 0 点开始，
+        # 避免每 3 s 重置导致在前段来回振荡。
+        best_idx = 0
+        best_d = float("inf")
+        for j, wp in enumerate(wps):
+            d = math.hypot(wp.x - ox, wp.y - oy)
+            if d < best_d:
+                best_d = d
+                best_idx = j
+        self._flank_wps = wps
+        self._flank_wp_idx = best_idx
+
     def _position(self, obs: Observation) -> Action:
         """开局占位：按“能量战 / 角度战”的机型倾向选择接近方式。
 
@@ -2520,6 +2846,86 @@ class TacticalAgent:
         偏置方向、幅度、爬升角与油门都在机型允许的范围内随机取样（见
         __init__），因此每次启动的开局几何都不相同，不会固定成一个模板。
         """
+        # ---- 侧翼绕后：基于敌航迹预测的航路点规划 ----
+        if self.opening_tactic == "flank":
+            # 目标：让自己落在对方机头 90° 以外（后半球盲区）。
+            # 不再用固定偏置角，而是：
+            #   1. 跟踪敌机最近一段航迹，预测其未来位置/航向；
+            #   2. 规划 5 个航路点，先横切建立交叉、再切入后半球；
+            #   3. 每 3 s（或敌机航向突变）重规划一次，适应对方机动。
+            if self._open_alt0 is None:
+                self._open_alt0 = obs.own_alt
+            el_target = self._open_climb
+            gain_left = self._open_climb_gain - (obs.own_alt - self._open_alt0)
+            if gain_left <= 0.0 or obs.own_alt > 13500.0:
+                el_target = min(el_target, 0.0)
+            else:
+                dist_left = max(obs.dist - self.MERGE_START, 500.0)
+                el_target = min(el_target, math.atan2(gain_left, dist_left))
+            step = math.radians(3.0) * self.dt
+            self._open_climb_cur += clamp(
+                el_target - self._open_climb_cur, -step, step
+            )
+
+            # 重规划触发：到达周期，或敌机航向突变（>15°）。
+            foe_psi_delta = 0.0
+            if self._flank_foe_psi_prev is not None:
+                foe_psi_delta = abs(wrap_pi(obs.foe_psi - self._flank_foe_psi_prev))
+            self._flank_replan_t += self.dt
+            need_replan = (
+                not self._flank_wps
+                or self._flank_replan_t >= self._flank_replan_interval
+                or foe_psi_delta > math.radians(15.0)
+            )
+            if need_replan:
+                self._flank_replan(obs)
+                self._flank_replan_t = 0.0
+            self._flank_foe_psi_prev = obs.foe_psi
+
+            # 取当前航路点，计算指向它的航向偏差。
+            if self._flank_wp_idx >= len(self._flank_wps):
+                self._flank_wp_idx = len(self._flank_wps) - 1
+            wp = self._flank_wps[self._flank_wp_idx]
+            brg = math.atan2(wp.y - self._flank_own_y, wp.x - self._flank_own_x)
+            off = wrap_pi(brg - obs.own_psi)
+
+            # 到达判定：只按距离（不按航向）推进航路点，避免"机头一对准就
+            # 跳下一个点"导致的航向来回摆动。
+            wp_dist = math.hypot(wp.x - self._flank_own_x, wp.y - self._flank_own_y)
+            reach_thr = 2500.0
+            if wp_dist < reach_thr and self._flank_wp_idx < len(self._flank_wps) - 1:
+                self._flank_wp_idx += 1
+                wp = self._flank_wps[self._flank_wp_idx]
+                brg = math.atan2(wp.y - self._flank_own_y, wp.x - self._flank_own_x)
+                off = wrap_pi(brg - obs.own_psi)
+
+            # 前视平滑：若离当前航路点较近，把期望航向向下一个点混合，
+            # 避免冲过航点后才猛打方向（string-pulling / carrot）。
+            if self._flank_wp_idx < len(self._flank_wps) - 1:
+                next_wp = self._flank_wps[self._flank_wp_idx + 1]
+                next_brg = math.atan2(
+                    next_wp.y - self._flank_own_y, next_wp.x - self._flank_own_x,
+                )
+                blend = clamp(1.0 - wp_dist / 6000.0, 0.0, 0.6)
+                brg = wrap_pi(brg + blend * wrap_pi(next_brg - brg))
+                off = wrap_pi(brg - obs.own_psi)
+
+            if wp.turn_method == "hard":
+                act = self._flank_hard_turn(obs, off)
+            else:
+                act = aim_action(
+                    obs, off, self._open_climb_cur - obs.own_gamma,
+                    gain=1.0, throttle=1.0,
+                )
+                act.bank = clamp(act.bank, -0.75, 0.75)
+                phi_act = abs(act.bank) * MAX_BANK
+                n_hold = math.cos(self._open_climb_cur) / max(math.cos(phi_act), 0.2)
+                act.n = clamp(min(act.n, n_hold + 0.10), 0.6, 4.0)
+            # 开加力提速，尽快接近敌机（占位阶段不需要省能量）。
+            act.afterburner = 1.0
+            act.throttle = 1.0
+            return act
+
         el_target = self._open_climb
         # 占位爬升要有“天花板”：48 km 的接近段若一直按 12° 爬升，会一路爬到
         # 能量升限，之后只能被强制 UNLOAD。这里按剩余距离与剩余爬升预算
@@ -2557,6 +2963,11 @@ class TacticalAgent:
         phi_act = abs(act.bank) * MAX_BANK
         n_hold = math.cos(self._open_climb_cur) / max(math.cos(phi_act), 0.2)
         act.n = clamp(min(act.n, n_hold + 0.10), 0.6, 2.2)
+        # 隐身压缩全程不开加力：加力尾焰的 IR 特征会让对方 IRST 在更远距离
+        # 截获，抵消前向低 RCS 带来的探测距离压缩。aim_action 默认不加力，
+        # 这里显式置零以固定该约束。
+        if self.opening_tactic == "stealth_compress":
+            act.afterburner = 0.0
         return act
 
     # ---------- 对头抢位与高 G 机动（任务1/2） ----------
@@ -3066,29 +3477,37 @@ class TacticalAgent:
     def _immelmann(self, obs: Observation) -> Action:
         """殷麦曼：拉起半筋斗到倒扣平飞，再半滚改平，航向反转。
 
-        旧实现只爬到 γ≈45° 就平转 150°，既没有过顶也没有真正的半滚，
-        在能量上等价于一次大坡度盘旋。标准殷麦曼是“半个筋斗 + 半个滚转”：
-        拉起（副翼中立）到机头越过顶点、重新回到平飞但机腹朝上，
-        再滚转 180° 翻正，最后小幅度拉平。
-        γ 用 asin 表示（±90°），过顶后会从 +90° 侧回到 0 附近。
+        标准殷麦曼是“半个筋斗 + 半个滚转”：先把机翼滚平，再拉起（副翼中立）
+        到机头越过顶点、重新回到平飞但机腹朝上，然后滚转 180° 翻正，最后
+        小幅度拉平。γ 用 asin 表示（±90°），过顶后会从 +90° 侧回到 0 附近。
+
+        拉起前必须先滚平：6DOF 下 `roll_free` 只是把副翼回中，并不会把机体
+        从原来的坡度里滚出来。若从 60° 坡度直接进入拉起，升力只有一半在
+        竖直方向，这个“半筋斗”会退化成带坡度的盘旋爬升——既过不了顶，又
+        一直拉高迎角耗能，表现为“原地盘旋 + 慢慢滑落”，最后才失速。
         """
         n = min(obs.own_n_avail * 0.9, self.n_pos_tol, G_PEAK, VERTICAL_N)
         if self._phase == 0:
+            # 翼平段：把坡度滚到 0（3 s 兜底，避免舵面权限不足时卡死）。
+            if abs(obs.own_bank) > math.radians(12.0) and self._phase_t < 3.0:
+                return Action(bank=0.0, n=1.0, throttle=1.0, fire=False)
+            self._phase, self._phase_t = 1, 0.0
+        if self._phase == 1:
             # 拉起：副翼中立，避免内回路在过顶时把滚转角拽回地平线。
             if obs.own_gamma >= math.radians(70.0):
-                self._phase, self._phase_t = 1, 0.0
+                self._phase, self._phase_t = 2, 0.0
                 self._dived = True
             return Action(bank=0.0, n=n, throttle=1.0, fire=False, roll_free=True)
-        if self._phase == 1:
+        if self._phase == 2:
             # 越过顶点后继续拉，直到机头重新回到水平（此时为倒扣平飞）。
             if abs(obs.own_gamma) < math.radians(15.0):
-                self._phase, self._phase_t = 2, 0.0
+                self._phase, self._phase_t = 3, 0.0
             return Action(bank=0.0, n=n, throttle=1.0, fire=False, roll_free=True)
-        if self._phase == 2:
+        if self._phase == 3:
             # 半滚翻正：此时机体仍是倒扣（φ≈±180°），要指令回翼平，
             # 不能再指令到倒扣——那样“已经倒扣”会立刻被判完成，等于没翻。
             if abs(obs.own_bank) < math.radians(25.0) or self._phase_t >= 4.5:
-                self._phase, self._phase_t = 3, 0.0
+                self._phase, self._phase_t = 4, 0.0
             return Action(bank=0.0, n=1.0, throttle=1.0, fire=False)
         if abs(obs.own_gamma) < math.radians(8.0):
             self._maneuver_done = True
@@ -3098,20 +3517,26 @@ class TacticalAgent:
         """内筋斗：翼平持续拉杆，在垂直平面内完成 360° 回转。
 
         机身过顶时必须让滚转自由演化（roll_free），否则内回路会一直把
-        机体往“地平线翼平”方向拧，筋斗会被拉成螺旋。
+        机体往“地平线翼平”方向拧，筋斗会被拉成螺旋。但进入筋斗前必须先
+        把机翼滚平：从带坡度状态直接 roll_free 拉起，同样会退化成盘旋爬升。
         γ（asin 表示）的完整顺序是 +90° → 0（倒扣平飞）→ −90° → 0，
-        据此分四段，最后一段拉平。
+        据此分段，最后一段拉平。
         """
         if self._phase == 0:
+            # 翼平段（同殷麦曼）：坡度大于 12° 时先滚平，3 s 兜底。
+            if abs(obs.own_bank) > math.radians(12.0) and self._phase_t < 3.0:
+                return Action(bank=0.0, n=1.0, throttle=1.0, fire=False)
+            self._phase, self._phase_t = 1, 0.0
+        if self._phase == 1:
             if obs.own_gamma >= math.radians(75.0) or self._phase_t >= 3.0:
-                self._phase, self._phase_t = 1, 0.0
-        elif self._phase == 1:
-            if abs(obs.own_gamma) <= math.radians(15.0):
                 self._phase, self._phase_t = 2, 0.0
         elif self._phase == 2:
-            if obs.own_gamma <= math.radians(-70.0):
+            if abs(obs.own_gamma) <= math.radians(15.0):
                 self._phase, self._phase_t = 3, 0.0
-        if self._phase >= 3:
+        elif self._phase == 3:
+            if obs.own_gamma <= math.radians(-70.0):
+                self._phase, self._phase_t = 4, 0.0
+        if self._phase >= 4:
             if abs(obs.own_gamma) < math.radians(8.0):
                 self._maneuver_done = True
             return aim_action(obs, 0.0, -obs.own_gamma, gain=1.6)

@@ -1,0 +1,66 @@
+# F-15EX Eagle II：最新双座改型，F110-GE-129，EPAWSS，兼容 AMRAAM-ER。
+id: F-15EX
+name: F-15EX
+
+airframe:
+  # 空机 ~14,600 + 半油（含 CFT）5,100 ≈ 19,700 kg。
+  base_mass_kg: 19700
+  wing_area_m2: 56.5
+  cl_max: 1.55
+  n_struct_g: 9
+  thrust_max_kn: 258.8      # F110-GE-129 双发加力（129.4 × 2）
+  thrust_mil_kn: 152.6      # 双发军用推力（76.3 × 2）
+  cd0: 0.045
+  aspect_ratio: 3.01
+  oswald: 0.80
+  cl_alpha: 3.70
+  cruise_mach: 0.95
+  fuel_capacity_kg: 10200
+  lapse_exp: 0.70
+  ram_r0: 0.20
+  ram_r1: 0.10
+  derate_z_m: 16000
+  derate_H_m: 5000
+  eta_install: 0.96
+  hp_max: 105
+  gun_range_m: 1000
+  gun_dps: 40
+  ammo_max: 500
+  rounds_per_sec: 110
+  length_m: 19.43
+  muzzle_speed: 1030
+  bullet_mass_kg: 0.102
+  bullet_diameter_m: 0.020
+  gun_spread: 0.003
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  canard: false
+
+sensors:
+  rcs: 5.0
+  rcs_front: 5.0
+  rcs_side: 15.0
+  rcs_back: 10.0
+  radar_range_km: 160        # APG-82(V)1 AESA
+  side_array: false
+  lband: false
+  irst_range_km: 0
+  pod_irst_range_km: 45
+
+loadout:
+  ir:
+    weapon: AIM-9X
+    count: 4
+  radar:
+    weapon: AIM-120C
+    count: 4
+  countermeasures:
+    chaff: 30
+    flare: 60
+
+agent:
+  aggression: 0.78
+  energy_pref: 0.58
+  lure: false
+  style: energy
