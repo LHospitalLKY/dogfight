@@ -1,0 +1,25 @@
+# 1v1 对照实验：J-20A vs F-15EX，120 km 对头，600 s 时限，双方雷达常开。
+# 用于无渲染批量实验：seed 决定 Agent 决策随机性，y_offset 决定开局横向偏移。
+id: j20a-f15ex
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 60000          # 每架距空域中心 60 km，总间距 120 km
+  altitude_m: 9000
+  y_offset_m: 100
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    aircraft: J-20A
+    radar_policy: auto
+  - name: blue
+    aircraft: F-15EX
+    radar_policy: auto
+
+awacs: false
+# seed 由实验脚本逐局传入；不在场景里固定，避免覆盖随机化。
