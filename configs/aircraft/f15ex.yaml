@@ -51,10 +51,10 @@ sensors:
 loadout:
   ir:
     weapon: AIM-9X
-    count: 4
+    count: 0                # 全中距挂载：不挂近距弹
   radar:
     weapon: AIM-120C
-    count: 2                # 与 J-20A 统一为 4 近 2 中
+    count: 6                # 全中距挂载（与 J-20A 同为 6 枚）
   countermeasures:
     chaff: 30
     flare: 60
