@@ -89,10 +89,10 @@ sensors:
 loadout:
   ir:
     weapon: PL-10
-    count: 2                # 侧弹舱各 1 枚
+    count: 4                # 侧弹舱各 2 枚（与 F-15EX 统一为 4 近 2 中）
   radar:
     weapon: PL-15
-    count: 4                # 主弹舱 4 枚
+    count: 2                # 主弹舱 2 枚
   countermeasures:
     chaff: 30
     flare: 24

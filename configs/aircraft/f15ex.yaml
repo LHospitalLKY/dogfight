@@ -54,7 +54,7 @@ loadout:
     count: 4
   radar:
     weapon: AIM-120C
-    count: 4
+    count: 2                # 与 J-20A 统一为 4 近 2 中
   countermeasures:
     chaff: 30
     flare: 60
