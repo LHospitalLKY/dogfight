@@ -115,7 +115,8 @@
   const canvas = document.getElementById("scene");
   const renderer = new THREE.WebGLRenderer({
     canvas,
-    antialias: true,
+    // 采集模式用软件光栅（无 GPU 环境），关掉 MSAA 可显著降低填充开销。
+    antialias: !CAPTURE,
     alpha: false,
     powerPreference: "high-performance",
   });
@@ -126,7 +127,16 @@
   // 仅对内建材质（机体/导弹）生效；地面为 ShaderMaterial，不受色调映射影响。
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
-  if (CAPTURE) canvas.classList.add("capture-mode");
+  if (CAPTURE) {
+    canvas.classList.add("capture-mode");
+    // 采集只导出 WebGL 画面，DOM 覆盖层（HUD/标签/条纹/暗角）不参与合成，
+    // 隐藏它们可以省掉软件合成与逐帧重绘的开销。
+    document.getElementById("hud")?.classList.add("hidden");
+    for (const id of ["labels", "stripes", "vignette"]) {
+      const el = document.getElementById(id);
+      if (el) el.style.display = "none";
+    }
+  }
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(rgbHex(RGB.SCENE_BG));
@@ -1144,12 +1154,97 @@
     return cv;
   }
 
+  // 通用灰系迷彩：底色 + 不规则深色软边斑块 + 少量亮色补块
+  function grayCamoTexture(palette) {
+    return function draw(seed) {
+      const rnd = camoRng(seed);
+      const cv = camoCanvas();
+      const g = cv.getContext("2d");
+      const S = CAMO_TEX_SIZE;
+      g.fillStyle = palette.base;
+      g.fillRect(0, 0, S, S);
+      for (let i = 0; i < 4200; i += 1) {
+        const a = 0.04 + rnd() * 0.07;
+        g.fillStyle = rnd() < 0.5 ? `rgba(255,255,255,${a})` : `rgba(0,0,0,${a * 0.8})`;
+        const w = 1 + rnd() * 5;
+        g.fillRect(rnd() * S, rnd() * S, w, w);
+      }
+      for (let i = 0; i < 22; i += 1) {
+        const cx = rnd() * S;
+        const cy = rnd() * S;
+        const scale = 90 + rnd() * 165;
+        const col = rnd() < 0.35 ? palette.dark2 : palette.dark;
+        const lobes = 5 + Math.floor(rnd() * 5);
+        for (let k = 0; k < lobes; k += 1) {
+          const ox = (rnd() - 0.5) * scale * 1.5;
+          const oy = (rnd() - 0.5) * scale * 1.5;
+          const r = scale * (0.36 + rnd() * 0.34);
+          wrapDraw(g, cx, cy, (x, y) => {
+            const grd = g.createRadialGradient(x + ox, y + oy, r * 0.55, x + ox, y + oy, r);
+            grd.addColorStop(0, col);
+            grd.addColorStop(0.72, col);
+            grd.addColorStop(1, "rgba(0,0,0,0)");
+            g.fillStyle = grd;
+            g.beginPath();
+            g.arc(x + ox, y + oy, r, 0, TAU);
+            g.fill();
+          });
+        }
+      }
+      g.globalAlpha = 0.45;
+      g.fillStyle = palette.light;
+      for (let i = 0; i < 4; i += 1) {
+        const cx = rnd() * S;
+        const cy = rnd() * S;
+        const r = 40 + rnd() * 90;
+        wrapDraw(g, cx, cy, (x, y) => {
+          g.beginPath();
+          g.arc(x, y, r, 0, TAU);
+          g.fill();
+        });
+      }
+      g.globalAlpha = 1;
+      // 极淡蒙皮分块线
+      g.strokeStyle = "rgba(30, 36, 44, 0.14)";
+      g.lineWidth = 1;
+      for (let i = 0; i < 26; i += 1) {
+        const x = rnd() * S;
+        const y = rnd() * S;
+        const len = 30 + rnd() * 90;
+        g.beginPath();
+        g.moveTo(x, y);
+        g.lineTo(x + (rnd() < 0.5 ? len : 0), y + (rnd() < 0.5 ? len : 0));
+        g.stroke();
+      }
+      return cv;
+    };
+  }
+
   const CAMO_SPECS = {
     "F-16V": { draw: f16CamoTexture, tile: 4.0, len: 15.06, seed: 3,
       nose: [64, 70, 78], noseAmt: 1.0, tint: 0.0, base: [148, 130, 98],
       rim: 0.42, glow: 0.75 },
     "SU-57": { draw: su57CamoTexture, tile: 9.2, len: 20.1, seed: 17,
       nose: [148, 156, 165], noseAmt: 0.85, tint: 0.26, rim: 0.85, glow: 0.5 },
+    // J-20：银灰机身 + 深蓝灰大斑块（参考图一）
+    "J-20A": { draw: grayCamoTexture({ base: "#c3cbd3", dark: "#7b8794",
+        dark2: "#67727f", light: "#e4e9ee" }), tile: 9.0, len: 21.2, seed: 41,
+      nose: [116, 124, 134], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
+    "J-20S": { draw: grayCamoTexture({ base: "#c3cbd3", dark: "#7b8794",
+        dark2: "#67727f", light: "#e4e9ee" }), tile: 9.0, len: 21.2, seed: 41,
+      nose: [116, 124, 134], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
+    // F-15C：浅灰空优双色（参考图二上）
+    "F-15C": { draw: grayCamoTexture({ base: "#aab4bc", dark: "#87939e",
+        dark2: "#7a8792", light: "#cdd5da" }), tile: 7.6, len: 19.43, seed: 52,
+      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
+    // F-15E：深蓝灰打击型（参考图二中）
+    "F-15E": { draw: grayCamoTexture({ base: "#77828d", dark: "#5b6671",
+        dark2: "#4f5a65", light: "#98a3ac" }), tile: 7.6, len: 19.43, seed: 63,
+      nose: [42, 46, 52], noseAmt: 1.0, tint: 0.0, rim: 0.6, glow: 0.7 },
+    // F-15EX：蓝灰 + 深色斑块（参考图二下）
+    "F-15EX": { draw: grayCamoTexture({ base: "#8b96a2", dark: "#68737f",
+        dark2: "#5c6773", light: "#aeb8c1" }), tile: 7.6, len: 19.43, seed: 74,
+      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
   };
   const camoTextures = {};
   const camoMaterials = {};
@@ -4428,7 +4523,7 @@ ${shader.fragmentShader}`;
     updateFloor(performance.now() / 1000.0);
     renderFloorReflection();
     renderer.render(scene, camera);
-    drawLabels();
+    if (!CAPTURE) drawLabels();
     if (CAPTURE) captureTick();
   }
 
