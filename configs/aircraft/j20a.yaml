@@ -38,12 +38,39 @@ airframe:
   tvc_deg: 0
   tvc_alpha_max_deg: 0
   tvc_cl_bonus: 0.0
-  # 全动鸭翼增升：迎角驱动的涡流增升，CLmax 从 1.60 抬到约 1.95，
-  # 失速迎角从 22° 抬到约 30°+。
+  # 全动鸭翼：按公开外形近似取两片总面积约 10.2 m²（0.14 S），
+  # 气动中心在重心前约 1.25 倍平均气动弦。
   canard: true
-  canard_cl_bonus: 0.35
+  canard_area_ratio: 0.14
+  canard_arm_ratio: 1.25
+  canard_chord_m: 1.45
+  canard_deflect_max_deg: 25
+  canard_rate_max_deg_s: 40
+  canard_tau_s: 0.12
+  canard_cl_alpha: 3.6
+  canard_cl_max: 1.5
+  canard_alpha_stall_deg: 20
+  canard_downwash: 0.10
+  # 全动鸭翼绕转轴的铰链力矩系数远小于襟翼式舵面（约 0.05 量级），
+  # 35 kN·m 的作动器在常规动压/迎角下仍能保持全偏度，只在极高动压
+  # 或过失速大迎角时进入力矩饱和。
+  canard_hinge_coeff: 0.06
+  canard_actuator_torque_knm: 35
+  canard_post_stall_alpha_deg: 35
+  # 涡增升只作用于主翼（+0.15 CLmax）；鸭翼自身升力由面积/CL 单独计入，
+  # 避免与“鸭翼升力”重复。失速角右移 8°，与涡饱和角 30° 分开定义，
+  # 不再叠加 ΔCL/CLα，消除此前的三重定义不一致。
+  canard_cl_bonus: 0.15
   canard_alpha_max_deg: 30
   canard_stall_shift_deg: 8
+  #   dCm/dα = cm_alpha + (S_c/S)·(l_c/c)·CLα_c
+  #           = -0.65 + 0.14×1.25×3.6 = -0.02 ≈ 中立稳定
+  # 鸭翼翼面 AR≈4.9，三维升力斜率取 3.6/rad（含机身干扰），失速 20°。
+  # 过于稳定（-1.0）会让鸭翼在 α≈6° 就到达力矩上限；取 -0.40 则净导数
+  # 为正（静不稳定），配平会振荡。中立稳定 + FBW 是鸭翼战斗机的典型布局。
+  # 无平尾，俯仰完全由全动鸭翼提供，因此 cm_de = 0。
+  cm_alpha: -0.65
+  cm_de: 0.0
 
 sensors:
   # 正面 RCS 与 F-22 归一到同一数量级（F-22 取 0.001 m² = −30 dBsm，

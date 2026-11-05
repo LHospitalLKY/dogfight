@@ -1155,6 +1155,29 @@ class TacticalAgent:
         act = self._execute(self.primitive, obs)
         self._set_power(act, obs)
         act.radar_on = self._radar_decision(obs)
+        act = self._apply_canard(act, obs)
+        return act
+
+    def _apply_canard(self, act: Action, obs: Observation) -> Action:
+        """全动鸭翼的战术层调度：配平交给内回路，这里只给显式干预。
+
+        - 高过载大坡度：给一点对称抬头偏度（涡调度），配合主翼升力；
+        - 滚转：坡度误差较大时用差动鸭翼辅助，减轻副翼在大迎角下的权限不足。
+        """
+        if not obs.own_canard:
+            return act
+        # 高过载大坡度：给一点对称抬头偏度（涡调度），配合主翼升力。
+        # 常规配平与过失速段的力矩求解都交给内回路，避免战术层与飞控打架。
+        if act.canard is None and act.n > 4.0 and abs(act.bank) >= 0.75:
+            act.canard = 0.25
+        if not act.roll_free:
+            phi_cmd = (
+                -clamp(act.bank, -math.pi / MAX_BANK, math.pi / MAX_BANK)
+                * MAX_BANK
+            )
+            err = wrap_pi(phi_cmd - obs.own_bank)
+            if abs(err) > math.radians(12.0):
+                act.canard_diff = clamp(err / math.radians(60.0), -0.6, 0.6)
         return act
 
     def _radar_decision(self, obs: Observation) -> bool:

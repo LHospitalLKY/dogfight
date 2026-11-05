@@ -149,11 +149,24 @@ AIRCRAFT_FRAME_FIELDS: dict[str, tuple[str, Converter]] = {
     "tvc_deg": ("tvc", _deg),
     "tvc_alpha_max_deg": ("tvc_alpha_max", _deg),
     "tvc_cl_bonus": ("tvc_cl_bonus", _float),
-    # 全动鸭翼增升（J-20）：按迎角驱动的涡流增升，与 TVC 油门驱动的喷流增升互补。
+    # 全动鸭翼（J-20）：几何、作动器与涡增升。
     "canard": ("canard", _bool),
     "canard_cl_bonus": ("canard_cl_bonus", _float),
     "canard_alpha_max_deg": ("canard_alpha_max", _deg),
     "canard_stall_shift_deg": ("canard_stall_shift", _deg),
+    "canard_area_ratio": ("canard_area_ratio", _float),
+    "canard_arm_ratio": ("canard_arm_ratio", _float),
+    "canard_chord_m": ("canard_chord", _float),
+    "canard_deflect_max_deg": ("canard_deflect_max", _deg),
+    "canard_rate_max_deg_s": ("canard_rate_max", _deg_per_s),
+    "canard_tau_s": ("canard_tau", _float),
+    "canard_cl_alpha": ("canard_cl_alpha", _float),
+    "canard_cl_max": ("canard_cl_max", _float),
+    "canard_alpha_stall_deg": ("canard_alpha_stall", _deg),
+    "canard_downwash": ("canard_downwash", _float),
+    "canard_hinge_coeff": ("canard_hinge_coeff", _float),
+    "canard_actuator_torque_knm": ("canard_actuator_torque", _kn),
+    "canard_post_stall_alpha_deg": ("canard_post_stall_alpha", _deg),
 }
 
 # 机体的传感器/隐身参数

@@ -98,13 +98,44 @@ class AircraftSpec:
     # 无矢量机型为 0；有矢量时失速迎角随功率右移，盘旋可用升力上限提高。
     tvc_cl_bonus: float = 0.0
 
-    # ---- 全动鸭翼增升（J-20） ----
-    # 鸭翼在大迎角下产生脱体涡，延迟主翼失速并提高 CLmax；增升按迎角平滑函数驱动，
-    # 与 TVC 按油门驱动的喷流增升互补。两者可叠加。
-    canard: bool = False                       # 是否启用鸭翼增升
-    canard_cl_bonus: float = 0.0              # 鸭翼最大增升系数 ΔCLmax
-    canard_alpha_max: float = 0.0             # 鸭翼有效迎角上限（增升饱和点）rad
-    canard_stall_shift: float = 0.0           # 失速迎角额外右移量 rad
+    # ---- 全动鸭翼（J-20） ----
+    # 鸭翼是一个可偏转的独立气动面：既提供俯仰操纵/配平，又通过脱体涡
+    # 延迟主翼失速。下面的几何/操纵参数缺省为 0，只有 canard=True 且
+    # 配置了面积/力臂时才会真正产生力和力矩。
+    canard: bool = False
+    # 鸭翼总面积与主翼面积之比 S_c/S；两片鸭翼合并计算。
+    canard_area_ratio: float = 0.0
+    # 鸭翼气动中心到重心的距离，按主翼平均气动弦长归一化（正=在重心之前）。
+    canard_arm_ratio: float = 0.0
+    canard_chord: float = 1.0                  # 鸭翼平均气动弦长 m
+    canard_deflect_max: float = math.radians(25.0)   # 最大偏度 rad
+    canard_rate_max: float = math.radians(40.0)      # 最大偏转速率 rad/s
+    canard_tau: float = 0.12                   # 作动器一阶时间常数 s
+    canard_cl_alpha: float = 3.0               # 鸭翼升力线斜率 1/rad
+    canard_cl0: float = 0.0                    # 鸭翼零迎角升力系数
+    canard_cl_max: float = 1.5                 # 鸭翼自身 CLmax
+    canard_alpha_stall: float = math.radians(18.0)   # 鸭翼自身失速迎角
+    # 鸭翼对主翼的下洗：ε = canard_downwash × CL_c（rad）。只取有利的涡增升
+    # 而不减下洗，会把鸭翼的收益系统性高估，这里显式扣掉主翼有效迎角。
+    canard_downwash: float = 0.10
+    # 铰链力矩：H = q·S_c·c_c·coeff·(0.6·α_c + δc)，作动器扭矩不足时偏度被限幅。
+    canard_hinge_coeff: float = 0.25
+    canard_actuator_torque: float = 35.0e3     # N·m
+    # 鸭翼自身型阻/诱导阻力/偏转阻力（均以主翼面积为参考）。
+    canard_cd0: float = 0.010
+    canard_induced_k: float = 0.08
+    canard_deflect_drag: float = 0.05          # 每 rad²
+    # 脱体涡的建立/破裂时间常数与破裂速率。
+    canard_vortex_tau: float = 0.08            # s
+    canard_breakdown: float = 0.6              # 1/rad，超过饱和迎角后涡强衰减
+    # 全动鸭翼能维持的过失速目标迎角（与涡饱和角 canard_alpha_max 区分开）。
+    canard_post_stall_alpha: float = math.radians(38.0)
+
+    # 保留旧的“涡增升”标定量：现在只表示鸭翼涡对**主翼**的 CLmax 增量，
+    # 鸭翼自身的升力由 canard_area_ratio/cl_c 单独计入，避免重复计数。
+    canard_cl_bonus: float = 0.0
+    canard_alpha_max: float = 0.0             # 涡强饱和的鸭翼当地迎角 rad
+    canard_stall_shift: float = 0.0           # 满涡时主翼失速角右移量 rad
 
     # ---- 挂载：近距弹 / 中距弹 / 干扰物 ----
     loadout: Loadout = Loadout()
@@ -196,6 +227,60 @@ class AircraftSpec:
 
     def cl_max_at(self, mach: float) -> float:
         return self.cl_max * self.lift_scale(mach)
+
+    # ---- 全动鸭翼几何与气动 ----
+    @property
+    def canard_area(self) -> float:
+        """两片鸭翼的总面积 m²。"""
+        return max(0.0, self.canard_area_ratio) * self.wing_area
+
+    @property
+    def canard_arm(self) -> float:
+        """鸭翼气动中心到重心的力臂 m（正=在重心之前）。"""
+        return max(0.0, self.canard_arm_ratio) * self.chord
+
+    @property
+    def canard_span(self) -> float:
+        if self.canard_chord <= 1e-6:
+            return 0.0
+        return self.canard_area / self.canard_chord
+
+    def canard_cl_at(self, alpha_c: float, mach: float) -> float:
+        """鸭翼自身升力系数（附着流线性段 + 失速后衰减）。
+
+        alpha_c 是鸭翼当地迎角，等于全机迎角加上鸭翼偏度。
+        """
+        if not self.canard or self.canard_area <= 0.0:
+            return 0.0
+        cl_alpha = self.canard_cl_alpha * self.lift_scale(mach)
+        a_abs = abs(alpha_c)
+        if a_abs <= self.canard_alpha_stall:
+            cl = self.canard_cl0 + cl_alpha * alpha_c
+            return clamp(cl, -self.canard_cl_max, self.canard_cl_max)
+        cl_stall = self.canard_cl0 + cl_alpha * self.canard_alpha_stall
+        cl_stall = clamp(cl_stall, -self.canard_cl_max, self.canard_cl_max)
+        decay = max(0.35, 1.0 - 1.6 * (a_abs - self.canard_alpha_stall))
+        return math.copysign(cl_stall * decay, alpha_c)
+
+    def wing_cl_at(self, alpha: float, mach: float, *,
+                   boost: float = 0.0, stall_shift: float = 0.0,
+                   decay_rate: float = 1.6, floor: float = 0.35) -> float:
+        """主翼升力系数——全模型唯一的升力曲线入口。
+
+        boost 把 CLmax 整体抬高（矢量喷流增升 / 鸭翼涡增升），stall_shift
+        把失速迎角右移。两者只在这里各加一次，力模型与控制律都调用本函数，
+        避免“控制律按 1.93 算、积分却截到 1.60”的历史不一致。
+        """
+        alpha_stall = self.alpha_stall + max(0.0, stall_shift)
+        cl_lim = self.cl_max_at(mach) + max(0.0, boost)
+        a_abs = abs(alpha)
+        if a_abs <= alpha_stall:
+            cl = self.cl0 + self.cl_alpha * alpha
+            return clamp(cl, -cl_lim, cl_lim)
+        cl_stall = self.cl0 + self.cl_alpha * alpha_stall
+        cl_stall = clamp(cl_stall, -cl_lim, cl_lim)
+        decay = max(floor, 1.0 - decay_rate * (a_abs - alpha_stall))
+        return math.copysign(cl_stall * decay, alpha)
 
     def n_lift(self, v: float, z: float = 0.0, mass: float | None = None) -> float:
         """升力能提供的过载。低翼载 + 高 CLmax + 高密度在这里体现优势。"""

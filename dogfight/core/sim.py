@@ -370,6 +370,11 @@ class Action:
     # 方向舵没有动压、给不出偏航力矩，只有 TVC 能直接施加偏航力矩；
     # 非矢量机型保持 0（退回方向舵）。
     tvc_yaw: float = 0.0
+    # 全动鸭翼：归一化对称偏度 -1..1（正=抬头）。None 表示由内回路按配平/涡
+    # 调度自动求解；显式给值可让战术层直接干预（例如大迎角时把鸭翼拉满）。
+    canard: float | None = None
+    # 差动鸭翼：归一化 -1..1（左+右-），用于滚转辅助。
+    canard_diff: float = 0.0
     # 主动减速：0..1 的减速板/扰流板开度，直接叠加额外零升阻力。
     brake: float = 0.0
     # 机载雷达开关请求：None=保持现状。静默伏击时关掉发射源，
@@ -451,6 +456,14 @@ class Observation:
     dof: int = 3                     # 当前内核自由度，过失速只在 6DOF 生效
     own_tvc: bool = False            # 本机是否带推力矢量喷口
     own_canard: bool = False         # 本机是否带全动鸭翼（过失速迎角上限由鸭翼给出）
+    # 全动鸭翼的可观测状态：偏度/指令/差动（rad）、涡强 0..1、铰链力矩占比
+    # 0..1、剩余操纵权限 0..1。战术层可据此避免在铰链饱和时继续要过大迎角。
+    own_canard_rad: float = 0.0
+    own_canard_cmd_rad: float = 0.0
+    own_canard_diff_rad: float = 0.0
+    own_canard_vortex: float = 0.0
+    own_canard_hinge: float = 0.0
+    own_canard_authority: float = 1.0
     own_fuel_frac: float = 1.0       # 剩余燃油比例
     # 剩余燃油按军推折算的续航秒数（见 military_endurance）：Bingo 判据与
     # 超时裁决的统一口径，不同机型的油箱/耗油率因此可以直接比较。
@@ -580,6 +593,12 @@ class Aircraft:
     quat: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 0.0)
     # 本物理步矢量喷口的实际偏转指令（rad，正=抬头方向），供观战与诊断使用。
     tvc_cmd: float = 0.0
+    # ---- 全动鸭翼状态 ----
+    canard_deg: float = 0.0        # 实际对称偏度 rad（正=抬头）
+    canard_cmd: float = 0.0        # 作动器指令 rad
+    canard_diff_deg: float = 0.0   # 差动偏度 rad（左 +，右 -）
+    canard_vortex: float = 0.0     # 脱体涡强度 0..1（带一阶滞后）
+    canard_hinge: float = 0.0      # 铰链力矩占可用扭矩的比例 0..1
     # 机炮待发弹丸的累计余量：射速高于物理步频时，按帧补发而不是每帧固定一发。
     gun_pending: float = 0.0
     # 越过验证高度上限只记录一次事件，不再判定“解体”。
@@ -1486,6 +1505,12 @@ class World:
             dof=self.dof,
             own_tvc=me.spec.tvc > 0.0,
             own_canard=me.spec.canard,
+            own_canard_rad=me.canard_deg,
+            own_canard_cmd_rad=me.canard_cmd,
+            own_canard_diff_rad=me.canard_diff_deg,
+            own_canard_vortex=me.canard_vortex,
+            own_canard_hinge=me.canard_hinge,
+            own_canard_authority=max(0.0, 1.0 - me.canard_hinge),
             own_missiles=me.missiles,
             own_missiles_in_flight=in_flight,
             own_locked=me.locked,
@@ -1709,7 +1734,7 @@ class World:
         gamma = wrap_pi(ac.gamma)
         cg = math.cos(gamma)
 
-        n_avail = spec.n_available(v, ac.z, m)
+        n_avail = self._n_available_effective(ac)
         n_cmd = clamp(act.n, N_MIN, n_avail)
         bank_cmd = clamp(act.bank, -BANK_CMD_MAX, BANK_CMD_MAX) * MAX_BANK
 
@@ -1766,16 +1791,21 @@ class World:
             ac.y += ac.v * math.sin(ac.psi) * self.dt
 
     def _n_available_effective(self, ac: Aircraft) -> float:
-        """当前可用过载：升力上限（含超声速损失、矢量增升与鸭翼增升）与结构限制取小。"""
+        """当前可用过载：统一升力曲线给出的 CLmax 与结构限制取小。
+
+        点质量没有鸭翼偏度/涡状态，按涡已建立的满升力估算可用上限；
+        6DOF 直接用当前偏度与涡强度，因此过失速段过载会随涡破裂下降。
+        """
         spec = ac.spec
-        n_lift = spec.n_lift(ac.v, ac.z, ac.mass)
-        # 可用过载是“拉满时的上限”，此时迎角达到失速迎角，鸭翼增升取满值；
-        # TVC 增升仍按当前油门缩放（油门不够时喷流增升拿不到）。
-        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac, full=True)
-        if boost > 0.0:
-            base = max(spec.cl_max_at(mach_number(ac.v, ac.z)), 1e-6)
-            n_lift *= (base + boost) / base
-        return min(spec.n_struct, n_lift)
+        m = ac.mass if ac.mass > 0.0 else spec.mass
+        v = max(ac.v, 1.0)
+        mach = mach_number(v, ac.z)
+        cl_max = self._max_total_cl(
+            ac, mach, vortex=1.0 if not ac.rigid else None,
+        )
+        q = 0.5 * air_density(ac.z) * v * v
+        n_lift = q * spec.wing_area * cl_max / (m * G)
+        return max(0.0, min(spec.n_struct, n_lift))
 
     def _tvc_cl_boost(self, ac: Aircraft) -> float:
         """矢量喷流当前的等效增升量（CL 增量）。
@@ -1790,47 +1820,251 @@ class World:
         power = clamp(max(ac.throttle, ac.ab), 0.0, 1.0)
         return spec.tvc_cl_bonus * power
 
-    def _canard_cl_boost(self, ac: Aircraft, *, full: bool = False) -> float:
-        """全动鸭翼的等效增升量（CL 增量）。
+    def _lift_components(
+        self, ac: Aircraft, alpha: float, mach: float,
+        *, vortex: float | None = None, delta: float | None = None,
+    ) -> tuple[float, float, float]:
+        """返回 (主翼 CL, 鸭翼 CL, 以主翼面积为基准的总 CL)。
 
-        鸭翼增升由迎角驱动而非油门：迎角越大，鸭翼脱体涡对主翼的增升越强，
-        超过鸭翼自身失速迎角后增升饱和。full=True 时取满值（用于可用过载上限，
-        因为拉满过载时迎角达到失速迎角）；否则按当前迎角做 smoothstep 缩放。
+        alpha 是机体迎角；鸭翼当地迎角为 alpha + 偏度。鸭翼对主翼的下洗按
+        ε = canard_downwash × CL_c 扣减主翼有效迎角，鸭翼升力再按面积比
+        单独加回总升力——增升与下洗都只在这一处记账，力模型与控制律共用。
+        """
+        spec = ac.spec
+        vtx = clamp(ac.canard_vortex if vortex is None else vortex, 0.0, 1.0)
+        delta_c = ac.canard_deg if delta is None else delta
+        boost = self._tvc_cl_boost(ac)
+        shift = 0.0
+        cl_c = 0.0
+        if spec.canard and spec.canard_area > 0.0:
+            cl_c = spec.canard_cl_at(alpha + delta_c, mach)
+            boost += spec.canard_cl_bonus * vtx
+            shift = spec.canard_stall_shift * vtx
+            alpha_wing = alpha - spec.canard_downwash * cl_c
+        else:
+            alpha_wing = alpha
+        decay_rate = 1.6 if spec.tvc <= 0.0 else 1.0
+        floor = 0.35 if spec.tvc <= 0.0 else 0.55
+        cl_w = spec.wing_cl_at(
+            alpha_wing, mach, boost=boost, stall_shift=shift,
+            decay_rate=decay_rate, floor=floor,
+        )
+        if spec.canard:
+            return cl_w, cl_c, cl_w + spec.canard_area_ratio * cl_c
+        return cl_w, cl_c, cl_w
+
+    def _total_cl_at(
+        self, ac: Aircraft, alpha: float, mach: float,
+        *, vortex: float | None = None, delta: float | None = None,
+    ) -> float:
+        return self._lift_components(
+            ac, alpha, mach, vortex=vortex, delta=delta,
+        )[2]
+
+    def _cl_peak_alpha(
+        self, ac: Aircraft, mach: float,
+        *, vortex: float | None = None, delta: float | None = None,
+    ) -> tuple[float, float]:
+        """在统一升力曲线上采样，返回 (峰值迎角, 峰值 CL)。"""
+        spec = ac.spec
+        a_hi = max(
+            spec.alpha_stall + (spec.canard_stall_shift if spec.canard else 0.0),
+            spec.alpha_stall, math.radians(1.0),
+        )
+        n = 24
+        best_a, best_cl = a_hi / n, -1e9
+        for i in range(1, n + 1):
+            a = a_hi * i / n
+            cl = self._total_cl_at(
+                ac, a, mach, vortex=vortex, delta=delta,
+            )
+            if cl > best_cl:
+                best_cl, best_a = cl, a
+        return best_a, max(best_cl, 0.0)
+
+    def _max_total_cl(
+        self, ac: Aircraft, mach: float,
+        *, vortex: float | None = None, delta: float | None = None,
+    ) -> float:
+        """可用总 CLmax：统一升力曲线的峰值。"""
+        return self._cl_peak_alpha(
+            ac, mach, vortex=vortex, delta=delta,
+        )[1]
+
+    def _alpha_for_cl(
+        self, ac: Aircraft, cl_target: float, mach: float,
+        *, peak: tuple[float, float] | None = None,
+    ) -> float:
+        """总 CL → 机体迎角（统一升力曲线的反解）。
+
+        注意 CL(α=0)=cl0≠0，所以必须在正负迎角上同时括住目标值——只在
+        [0, α_stall] 上二分时，小于 cl0 的正过载会被错误地解成 α≈0。
+        peak 可传入已算好的峰值，避免每步重复扫描。
+        """
+        peak_a, peak_cl = (
+            self._cl_peak_alpha(ac, mach) if peak is None else peak
+        )
+        lo, hi = -peak_a, peak_a
+        cl_lo = self._total_cl_at(ac, lo, mach)
+        if cl_target <= cl_lo:
+            return lo
+        if cl_target >= peak_cl:
+            # 目标超过当前可用 CLmax：直接给峰值迎角，过载由升力上限截断。
+            return peak_a
+        for _ in range(20):
+            mid = 0.5 * (lo + hi)
+            if self._total_cl_at(ac, mid, mach) < cl_target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
+
+    def _cl_max_effective(self, ac: Aircraft) -> float:
+        """控制律使用的可用 CLmax——与力模型同一入口，不再各自计算。"""
+        return self._max_total_cl(ac, mach_number(ac.v, ac.z))
+
+    def _alpha_stall_effective(self, ac: Aircraft) -> float:
+        """失速迎角：涡增升右移量只按涡强度计入，不再叠加 ΔCL/CLα。"""
+        spec = ac.spec
+        shift = 0.0
+        if spec.canard:
+            shift = spec.canard_stall_shift * clamp(ac.canard_vortex, 0.0, 1.0)
+        if spec.tvc > 0.0 and spec.tvc_alpha_max > 0.0:
+            shift = max(shift, 0.35 * spec.tvc_alpha_max)
+        return spec.alpha_stall + shift
+
+    def _canard_vortex_target(self, ac: Aircraft, alpha_c: float) -> float:
+        """鸭翼脱体涡对主翼的增升强度 0..1，由鸭翼当地迎角驱动。
+
+        鸭翼先于主翼失速：当地迎角超过 canard_alpha_max 后涡开始破裂，
+        强度按 canard_breakdown 线性衰减，而不是一直保持满值。
         """
         spec = ac.spec
         if not spec.canard or spec.canard_cl_bonus <= 0.0:
             return 0.0
-        if full:
-            return spec.canard_cl_bonus
-        # 6DOF 下用真实迎角；点质量没有迎角状态，按当前过载折算等效迎角。
-        if ac.rigid:
-            alpha = abs(math.atan2(ac.wb, max(ac.u, 1.0)))
-        else:
-            qbar = 0.5 * air_density(ac.z) * ac.v * ac.v
-            cl = ac.n * ac.weight / max(qbar * spec.wing_area, 1e-6)
-            alpha = abs((cl - spec.cl0) / spec.cl_alpha)
         if spec.canard_alpha_max <= 0.0:
-            return spec.canard_cl_bonus
-        x = clamp(alpha / spec.canard_alpha_max, 0.0, 1.0)
-        return spec.canard_cl_bonus * _smoothstep(0.2, 1.0, x)
+            return 1.0
+        if alpha_c <= 0.0:
+            return 0.0
+        x = clamp(alpha_c / spec.canard_alpha_max, 0.0, 1.0)
+        v = _smoothstep(0.2, 1.0, x)
+        if alpha_c > spec.canard_alpha_max:
+            v *= max(0.0, 1.0 - spec.canard_breakdown
+                     * (alpha_c - spec.canard_alpha_max))
+        return clamp(v, 0.0, 1.0)
 
-    def _cl_max_effective(self, ac: Aircraft) -> float:
-        """计入超声速升力损失、矢量增升与鸭翼增升后的可用升力系数上限。"""
+    def _canard_alpha_for_cl(
+        self, ac: Aircraft, cl_des: float, mach: float,
+    ) -> float:
+        """鸭翼 CL → 鸭翼当地迎角（只在附着流线性段内反解）。"""
         spec = ac.spec
-        base = spec.cl_max_at(mach_number(ac.v, ac.z))
-        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac)
-        if boost <= 0.0:
-            return base
-        return spec.cl0 + spec.cl_alpha * spec.alpha_stall + boost
+        if not spec.canard or spec.canard_area <= 0.0:
+            return 0.0
+        sign = 1.0 if cl_des >= 0.0 else -1.0
+        target = abs(cl_des)
+        if target <= 0.0:
+            return 0.0
+        hi = spec.canard_alpha_stall
+        if spec.canard_cl_at(sign * hi, mach) * sign < target:
+            return sign * hi
+        lo, a = 0.0, hi
+        for _ in range(14):
+            mid = 0.5 * (lo + a)
+            if spec.canard_cl_at(sign * mid, mach) * sign < target:
+                lo = mid
+            else:
+                a = mid
+        return sign * 0.5 * (lo + a)
 
-    def _alpha_stall_effective(self, ac: Aircraft) -> float:
-        """矢量/鸭翼增升把失速迎角一并右移：CL 增量摊到升力线斜率上。"""
+    def _update_canard_state(
+        self, ac: Aircraft, dc_cmd: float, act: Action,
+        alpha: float, qbar: float,
+    ) -> None:
+        """全动鸭翼作动器：位置/速率限幅、一阶延迟、铰链力矩饱和与涡状态。
+
+        显式 Action.canard（配平/涡调度）优先；否则使用内回路按俯仰力矩
+        反解出的 dc_cmd。差动偏度只用于滚转辅助，不进入对称铰链限幅。
+        """
         spec = ac.spec
-        boost = self._tvc_cl_boost(ac) + self._canard_cl_boost(ac)
-        shift = spec.canard_stall_shift if spec.canard else 0.0
-        if boost <= 0.0 and shift <= 0.0:
-            return spec.alpha_stall
-        return spec.alpha_stall + boost / spec.cl_alpha + shift
+        dt = self.dt
+        if not spec.canard or spec.canard_area <= 0.0:
+            ac.canard_deg = ac.canard_cmd = 0.0
+            ac.canard_diff_deg = ac.canard_vortex = ac.canard_hinge = 0.0
+            return
+        dmax = max(spec.canard_deflect_max, 0.0)
+        if act.canard is not None:
+            dc_cmd = clamp(act.canard, -1.0, 1.0) * dmax
+        cmd = clamp(dc_cmd, -dmax, dmax)
+        ac.canard_diff_deg = clamp(act.canard_diff, -1.0, 1.0) * 0.5 * dmax
+
+        # 铰链力矩：H = q·S_c·c_c·coeff·(0.6·α_c + δc)，扭矩不足时偏度被限制。
+        hinge_k = (
+            qbar * spec.canard_area * spec.canard_chord * spec.canard_hinge_coeff
+        )
+        torque = max(spec.canard_actuator_torque, 1e-9)
+        delta_lim = cmd
+        if hinge_k > 1e-9:
+            lim = torque / hinge_k
+            delta_lim = clamp(
+                cmd, -lim - 0.6 * alpha, lim - 0.6 * alpha,
+            )
+        delta_lim = clamp(delta_lim, -dmax, dmax)
+
+        # 一阶作动器 + 速率限幅（先限速率，再限位置）。
+        tau = max(spec.canard_tau, 0.0)
+        lag = 1.0 if tau <= 0.0 else dt / (tau + dt)
+        step = max(spec.canard_rate_max, 0.0) * dt
+        nxt = ac.canard_deg + (delta_lim - ac.canard_deg) * lag
+        nxt = clamp(nxt, ac.canard_deg - step, ac.canard_deg + step)
+        ac.canard_deg = clamp(nxt, -dmax, dmax)
+        ac.canard_cmd = cmd
+
+        hinge = hinge_k * (0.6 * alpha + ac.canard_deg)
+        ac.canard_hinge = clamp(abs(hinge) / torque, 0.0, 1.0)
+
+        # 涡建立快、破裂慢：用不同时间常数近似迟滞，避免涡强瞬间跳变。
+        target = self._canard_vortex_target(ac, alpha + ac.canard_deg)
+        vtau = max(spec.canard_vortex_tau, 0.0)
+        if vtau <= 0.0:
+            ac.canard_vortex = target
+        else:
+            tau_eff = vtau if target >= ac.canard_vortex else 2.0 * vtau
+            ac.canard_vortex += (target - ac.canard_vortex) * dt / (tau_eff + dt)
+        ac.canard_vortex = clamp(ac.canard_vortex, 0.0, 1.0)
+
+    def _canard_pitch_command(
+        self, ac: Aircraft, alpha: float, q_cmd: float,
+        qbar: float, V: float, mach: float,
+    ) -> float:
+        """由俯仰力矩需求反解鸭翼对称偏度（正=抬头）。
+
+        无平尾机型没有 cm_de：俯仰完全由鸭翼升力绕重心的力矩提供。先抵消
+        当前翼身静稳定力矩，再叠加角速度误差项，最后把所需鸭翼 CL 反解成
+        当地迎角，偏度按物理定义 δc = α_c - α。
+        """
+        spec = ac.spec
+        if spec.canard_area <= 0.0 or spec.canard_arm <= 0.0:
+            return 0.0
+        qs = qbar * spec.wing_area
+        c = spec.chord
+        q_hat = ac.q * c / (2.0 * max(V, 1.0))
+        stab = 1.0
+        if abs(alpha) > self._alpha_stall_effective(ac):
+            stab = self._stall_stab_scale(ac, alpha)
+        m_wb = qs * c * (spec.cm_alpha * alpha * stab + spec.cm_q * q_hat)
+        mass = ac.mass if ac.mass > 0.0 else spec.mass
+        iyy = spec.iyy_of(mass)
+        # 角速度误差项：全动鸭翼的带宽受 40°/s 左右的作动器速率限制，
+        # 增益不能用平尾机型的 1.5×(q_cmd-q) 量级——那样会把速率环推到
+        # 饱和区并诱发持续振荡。这里按等效俯仰时间常数 ~0.3 s 取 1.5/s。
+        m_des = -m_wb + iyy * 1.5 * (q_cmd - ac.q)
+        denom = qbar * spec.canard_area * spec.canard_arm
+        if denom <= 1e-9:
+            return 0.0
+        cl_c_des = m_des / denom
+        alpha_c = self._canard_alpha_for_cl(ac, cl_c_des, mach)
+        dc = alpha_c - alpha
+        return clamp(dc, -spec.canard_deflect_max, spec.canard_deflect_max)
 
     def _stall_stab_scale(self, ac: Aircraft, alpha: float) -> float:
         """过失速段纵向静稳定力矩的衰减系数（0~1）。
@@ -1845,14 +2079,18 @@ class World:
             return 1.0
         return 1.0 / (1.0 + 3.0 * over)
 
-    def _surface_commands(self, ac: Aircraft, act: Action, V: float,
-                          alpha: float, qbar: float) -> tuple[float, float, float, float]:
-        """增稳内回路：把战术层的 (bank, n) 翻译成副翼/升降舵/方向舵偏度。
+    def _surface_commands(
+        self, ac: Aircraft, act: Action, V: float, alpha: float, qbar: float,
+    ) -> tuple[float, float, float, float, float, float]:
+        """增稳内回路：把战术层的 (bank, n) 翻译成舵面/鸭翼偏度。
 
         这是 6DOF 与 3DOF 的关键衔接——战术层仍然只关心“转多快、拉几个 g”，
         由这里负责配平、阻尼和协调转弯，避免把飞控品质问题暴露给战术层。
+        有全动鸭翼时俯仰由鸭翼升力力矩提供（de=0），返回的最后一个量是
+        鸭翼对称偏度指令。
         """
         spec = ac.spec
+        mach = mach_number(V, ac.z)
         # 三层级联：姿态角误差 → 目标角速度 → 舵面，避免单环比例控制大过冲。
         # 本层约定 bank>0 为左滚，而 phi>0 为右滚。bank 以 MAX_BANK 为单位，
         # 最大允许指令到倒扣 ±180°（破 S / 半滚倒转需要）。
@@ -1868,26 +2106,29 @@ class World:
             p_cmd = clamp(2.5 * wrap_pi(phi_cmd - ac.phi), -1.5, 1.5)
             da = clamp(0.9 * (p_cmd - ac.p), -1.0, 1.0)
 
-        # 俯仰：目标过载 → 目标升力系数 → 目标迎角 → 目标俯仰角速度 → 升降舵
+        # 俯仰：目标过载 → 目标升力系数 → 目标迎角 → 目标俯仰角速度 → 舵面
+        # cl_req 与升力积分共用同一条统一升力曲线，CLmax 不再各自计算。
+        cl_peak = self._cl_peak_alpha(ac, mach)
+        cl_lim = max(cl_peak[1], 1e-3)
         cl_req = act.n * ac.weight / max(qbar * spec.wing_area, 1e-6)
-        cl_req = clamp(cl_req, -self._cl_max_effective(ac), self._cl_max_effective(ac))
+        cl_req = clamp(cl_req, -cl_lim, cl_lim)
         # 矢量喷口能把迎角带到失速以后；无矢量机型仍限制在失速迎角内。
-        alpha_lim = spec.alpha_stall + 0.35 * spec.tvc_alpha_max
-        # 矢量增升把“线性段可用迎角”一并抬高，否则 cl_req 提高了、
-        # 迎角指令却仍被压回原失速迎角，增升拿不到。
-        alpha_lim = max(alpha_lim, self._alpha_stall_effective(ac))
+        alpha_lim = max(
+            spec.alpha_stall + 0.35 * spec.tvc_alpha_max,
+            self._alpha_stall_effective(ac),
+        )
         alpha_cmd = clamp(
-            (cl_req - spec.cl0) / spec.cl_alpha, -alpha_lim, alpha_lim
+            self._alpha_for_cl(ac, cl_req, mach, peak=cl_peak),
+            -alpha_lim, alpha_lim,
         )
         if act.post_stall and spec.tvc_alpha_max > 0.0:
             # 过失速指令：直接把目标迎角拉到矢量喷口能维持的极限。
             alpha_cmd = spec.tvc_alpha_max
-        elif act.post_stall and spec.canard and spec.canard_alpha_max > 0.0:
-            # 鸭翼没有喷流，但全动鸭翼能在失速后维持俯仰力矩，
-            # 目标迎角取鸭翼有效迎角上限（J-20 约 30°）。
-            alpha_cmd = spec.canard_alpha_max
-        # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%，过载会偏小。
-        de_trim = -(spec.cm_alpha * alpha_cmd) / spec.cm_de
+        elif act.post_stall and spec.canard and spec.canard_post_stall_alpha > 0.0:
+            # 无平尾/无喷流的鸭翼机型：过失速段由全动鸭翼维持俯仰力矩，
+            # 目标迎角取鸭翼过失速上限（配置值 canard_post_stall_alpha），
+            # 而不是涡饱和角（canard_alpha_max）。
+            alpha_cmd = spec.canard_post_stall_alpha
         # 航迹旋转前馈：保持目标迎角时需要机头跟着航迹一起转（q ≈ gamma_dot），
         # 否则纯比例环节会在 alpha_cmd - gamma_dot/3 处提前平衡，
         # 稳态实际过载只有指令的 ~80%（高 G 机动拉不出 6 g 的根源）。
@@ -1897,16 +2138,27 @@ class World:
         if act.pitch_rate != 0.0:
             # 直接俯仰角速度指令：连续绕俯仰轴转过 360° 的动作（钟摆/库尔比特）
             # 不能用迎角指令——迎角一到失速上限，比例项就把 q 拉回 0，机头
-            # 永远过不了顶。这里要求机体按给定角速度转，升降舵只做速率跟踪，
-            # 配平力矩按**当前**迎角抵消静稳定力矩，否则大迎角下的低头力矩
-            # 会把舵面权限吃光。
+            # 永远过不了顶。这里要求机体按给定角速度转，舵面只做速率跟踪。
             q_cmd = clamp(act.pitch_rate, -0.9, 0.9)
-            de_trim = -(
-                spec.cm_alpha * alpha * self._stall_stab_scale(ac, alpha)
-            ) / spec.cm_de
+            alpha_trim = alpha
         else:
-            q_cmd = clamp(8.0 * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
-        de = clamp(de_trim - 1.5 * (q_cmd - ac.q), -1.0, 1.0)
+            # 全动鸭翼的作动器速率有限，迎角环增益取低带宽版本；
+            # 平尾舵机响应快，沿用原来的 8/s。
+            k_alpha = 3.0 if spec.canard else 8.0
+            q_cmd = clamp(k_alpha * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
+            alpha_trim = alpha_cmd
+
+        dc = 0.0
+        de = 0.0
+        if spec.canard and spec.canard_area > 0.0 and spec.canard_arm > 0.0:
+            # 全动鸭翼：无平尾，俯仰完全由鸭翼升力绕重心的力矩提供。
+            dc = self._canard_pitch_command(
+                ac, alpha, q_cmd, qbar, V, mach,
+            )
+        elif abs(spec.cm_de) > 1e-9:
+            # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%。
+            de_trim = -(spec.cm_alpha * alpha_trim) / spec.cm_de
+            de = clamp(de_trim - 1.5 * (q_cmd - ac.q), -1.0, 1.0)
 
         # 航向：侧滑角 → 目标偏航角速度 → 方向舵（同时抑制侧滑与偏航振荡）
         beta = math.asin(clamp(ac.vb / V, -1.0, 1.0))
@@ -1934,7 +2186,7 @@ class World:
                 ) * ac.throttle
         # 三元矢量偏航：归一化指令直接映射到喷口偏角，推力越小力矩越小。
         tvc_y = clamp(act.tvc_yaw, -1.0, 1.0) * spec.tvc if spec.tvc > 0.0 else 0.0
-        return da, de, dr, tvc_p, tvc_y
+        return da, de, dr, tvc_p, tvc_y, dc
 
     def _integrate_rigid(self, ac: Aircraft, act: Action) -> None:
         """6DOF：刚体六自由度积分（气动力/力矩 + 陀螺耦合 + 欧拉运动学）。"""
@@ -1949,40 +2201,36 @@ class World:
         mach = mach_number(V, ac.z)
         thrust = self._apply_power(ac, act, mach)
 
-        da, de, dr, tvc_p, tvc_y = self._surface_commands(ac, act, V, alpha, qbar)
+        da, de, dr, tvc_p, tvc_y, dc = self._surface_commands(
+            ac, act, V, alpha, qbar,
+        )
         ac.tvc_cmd = tvc_p
+        # 鸭翼作动器/铰链/涡状态先更新，后面的升力与力矩都用本步的实际偏度。
+        self._update_canard_state(ac, dc, act, alpha, qbar)
 
-        # 升力曲线：失速后升力快速衰减；矢量喷口机型衰减更慢，
-        # 因为喷流仍能把机头压在超大迎角上，机身也持续提供涡升力。
-        # 有矢量增升时，线性段一直延伸到新的失速迎角，之后才进入衰减，
-        # 相当于喷流把可用升力上限整体抬高。
-        a_abs = abs(alpha)
-        alpha_stall = self._alpha_stall_effective(ac)
-        if a_abs <= alpha_stall:
-            # 线性段也要服从超声速升力损失：cl_alpha 按失速迎角处刚好达到
-            # cl_max 标定，M1.6 以上再整体乘 lift_scale。
-            cl_lin = spec.cl0 + spec.cl_alpha * alpha
-            cl_lim = spec.cl_max_at(mach)
-            cl = clamp(cl_lin, -cl_lim, cl_lim)
-        else:
-            cl_stall = spec.cl0 + spec.cl_alpha * alpha_stall
-            cl_stall = min(cl_stall, spec.cl_max_at(mach))
-            decay_rate = 1.6 if spec.tvc <= 0.0 else 1.0
-            floor = 0.35 if spec.tvc <= 0.0 else 0.55
-            decay = max(floor, 1.0 - decay_rate * (a_abs - alpha_stall))
-            cl = math.copysign(cl_stall * decay, alpha)
+        # 统一升力曲线：主翼 CL、鸭翼 CL、总 CL 一次算清。鸭翼涡增升与
+        # 主翼下洗、超声速升力损失都在 _lift_components 里各记一次。
+        cl_w, cl_c, cl = self._lift_components(ac, alpha, mach)
         k_ind = 1.0 / (math.pi * spec.aspect_ratio * spec.oswald)
-        mach = mach_number(V, ac.z)
         cd = (
             cd0_at(mach, spec.cd0)
-            + k_ind * cl * cl
+            + k_ind * cl_w * cl_w
             + 0.8 * beta * beta
             + BRAKE_CD * clamp(act.brake, 0.0, 1.0)
         )
+        if spec.canard:
+            # 鸭翼自身的型阻、诱导阻力与偏转阻力，按面积比折算到主翼参考面积。
+            cd += spec.canard_area_ratio * (
+                spec.canard_cd0
+                + spec.canard_induced_k * cl_c * cl_c
+                + spec.canard_deflect_drag * ac.canard_deg * ac.canard_deg
+            )
         cy = spec.cy_beta * beta
 
         qs = qbar * spec.wing_area
-        lift = qs * cl
+        # 结构限制：总升力不能超过 ±n_struct·W，过失速高动压段也不能凭空多出 g。
+        max_lift = max(spec.n_struct, 0.0) * ac.weight
+        lift = clamp(qs * cl, -max_lift, max_lift)
         drag = qs * cd
         side = qs * cy
         # 推力取 _apply_power 的结果：它已经把军推/加力分开、按燃油削减并
@@ -2003,6 +2251,14 @@ class World:
         dvb = fy / m + G * sf * ct + ac.p * ac.wb - ac.r * ac.u
         dwb = fz / m + G * cf * ct + ac.q * ac.u - ac.p * ac.vb
 
+        lift_c = 0.0
+        if spec.canard:
+            # 结构限幅后按同一比例缩放鸭翼升力，保证力矩与合力来自同一个流场。
+            scale = 1.0
+            if abs(qs * cl) > 1e-9:
+                scale = clamp(lift / (qs * cl), -1.0, 1.0)
+            lift_c = qs * spec.canard_area_ratio * cl_c * scale
+
         # 气动力矩（无量纲系数 × 动压 × 面积 × 特征长度）
         b, c = spec.span, spec.chord
         p_hat = ac.p * b / (2.0 * V)
@@ -2018,13 +2274,37 @@ class World:
         pitch_m = qs * c * (
             spec.cm_alpha * alpha * stab + spec.cm_q * q_hat + spec.cm_de * de
         )
-        if tvc_p != 0.0:
-            # 矢量喷口的推力方向偏转在尾段产生俯仰力矩，低速时补足舵面权限。
-            pitch_m += thrust * tvc_p * 0.35 * spec.length
         yaw_m = qs * b * (
             spec.cn_beta * beta + spec.cn_r * r_hat
             + spec.cn_dr * dr + spec.cn_da * da
         )
+        if spec.canard:
+            # 全动鸭翼升力绕重心的抬头力矩（鸭翼在重心之前，正升力=抬头）。
+            pitch_m += lift_c * spec.canard_arm
+            if ac.canard_diff_deg != 0.0 and spec.canard_span > 0.0:
+                # 差动鸭翼：左右各偏 ±diff，升力差产生滚转力矩，阻力差产生偏航。
+                half_area = 0.5 * spec.canard_area
+                d = ac.canard_diff_deg
+                cl_l = spec.canard_cl_at(alpha + ac.canard_deg + d, mach)
+                cl_r = spec.canard_cl_at(alpha + ac.canard_deg - d, mach)
+                lift_l = qbar * half_area * cl_l
+                lift_r = qbar * half_area * cl_r
+                arm_y = spec.canard_span / 4.0
+                roll_m += arm_y * (lift_l - lift_r)
+                drag_l = qbar * half_area * (
+                    spec.canard_cd0
+                    + spec.canard_induced_k * cl_l * cl_l
+                    + spec.canard_deflect_drag * (ac.canard_deg + d) ** 2
+                )
+                drag_r = qbar * half_area * (
+                    spec.canard_cd0
+                    + spec.canard_induced_k * cl_r * cl_r
+                    + spec.canard_deflect_drag * (ac.canard_deg - d) ** 2
+                )
+                yaw_m += arm_y * (drag_r - drag_l)
+        if tvc_p != 0.0:
+            # 矢量喷口的推力方向偏转在尾段产生俯仰力矩，低速时补足舵面权限。
+            pitch_m += thrust * tvc_p * 0.35 * spec.length
         if tvc_y != 0.0:
             # 三元矢量喷口的偏航分量：近零速时舵面无效，这是唯一能给出
             # 偏航力矩的通道（钟摆在顶点附近的侧摆靠它）。
@@ -2068,7 +2348,7 @@ class World:
         # 派生出点质量视角的状态，供观测、武器、渲染和裁判复用
         ac.v = max(math.sqrt(ac.u * ac.u + ac.vb * ac.vb + ac.wb * ac.wb), 1.0)
         ac.gamma = math.asin(clamp(wz / ac.v, -1.0, 1.0))
-        ac.n = clamp(lift / ac.weight, N_MIN, 12.0)
+        ac.n = clamp(lift / ac.weight, N_MIN, spec.n_struct)
         ac.bank = ac.phi
 
     def _update_lock(self) -> None:

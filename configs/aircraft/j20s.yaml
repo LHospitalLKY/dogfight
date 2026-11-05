@@ -36,10 +36,28 @@ airframe:
   tvc_deg: 0
   tvc_alpha_max_deg: 0
   tvc_cl_bonus: 0.0
+  # 全动鸭翼：与 J-20A 同一套几何/作动器参数。
   canard: true
-  canard_cl_bonus: 0.35
+  canard_area_ratio: 0.14
+  canard_arm_ratio: 1.25
+  canard_chord_m: 1.45
+  canard_deflect_max_deg: 25
+  canard_rate_max_deg_s: 40
+  canard_tau_s: 0.12
+  canard_cl_alpha: 3.6
+  canard_cl_max: 1.5
+  canard_alpha_stall_deg: 20
+  canard_downwash: 0.10
+  # 同 J-20A：全动鸭翼绕转轴的铰链力矩系数约 0.05 量级。
+  canard_hinge_coeff: 0.06
+  canard_actuator_torque_knm: 35
+  canard_post_stall_alpha_deg: 35
+  canard_cl_bonus: 0.15
   canard_alpha_max_deg: 30
   canard_stall_shift_deg: 8
+  # 同 J-20A：全机静稳定导数 cm_alpha + 0.14×1.25×3.6 = -0.02（中立稳定）。
+  cm_alpha: -0.65
+  cm_de: 0.0
 
 sensors:
   # 与 J-20A 同口径：双座座舱盖加长，正面取 0.003 m²（约 −25 dBsm），
