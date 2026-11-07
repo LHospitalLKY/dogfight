@@ -16,9 +16,29 @@ initial:
 teams:
   - name: red
     aircraft: J-20A
+    loadout:
+      ir:
+        weapon: PL-10
+        count: 2                # 全近距挂载（与 F-15EX 同为 6 枚）
+      radar:
+        weapon: PL-15
+        count: 4                # 全近距挂载：不挂中距弹
+      countermeasures:
+        chaff: 30
+        flare: 24
     radar_policy: auto
   - name: blue
     aircraft: F-15EX
+    loadout:
+      ir:
+        weapon: AIM-9X
+        count: 2               # 全近距挂载（与 J-20A 同为 6 枚）
+      radar:
+        weapon: AIM-120C
+        count: 4                # 全近距挂载：不挂中距弹
+      countermeasures:
+        chaff: 30
+        flare: 60
     radar_policy: auto
 
 awacs: false

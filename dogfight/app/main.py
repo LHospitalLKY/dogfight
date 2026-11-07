@@ -51,6 +51,7 @@ def build_world(
     y_offset: float | None = None,
     awacs: bool | None = None,
     scenario: Scenario | None = None,
+    seed: int | None = None,
 ) -> World:
     sc = scenario or resolve_scenario()
     specs = [team.aircraft.spec for team in sc.teams]
@@ -60,6 +61,7 @@ def build_world(
     headings = tuple(team.heading_deg for team in sc.teams)
     if swap:
         headings = (headings[1], headings[0])
+    extra = {} if seed is None else {"seed": seed}
     return World(
         specs,
         dt=sc.physics_dt,
@@ -73,6 +75,7 @@ def build_world(
         z_ceiling=init.ceiling_m,
         awacs=sc.awacs if awacs is None else awacs,
         headings=headings,
+        **extra,
     )
 
 

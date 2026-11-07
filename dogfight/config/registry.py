@@ -153,8 +153,8 @@ def parse_loadout(raw: object, weapons: dict[str, MissileSpec], source: str) -> 
     return Loadout(ir=slot("ir"), radar=slot("radar"), chaff=chaff, flare=flare)
 
 
-def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> AircraftEntry:
-    unknown = set(raw) - {"id", "name", "airframe", "sensors", "loadout", "agent"}
+def parse_aircraft(raw: dict, source: str) -> AircraftEntry:
+    unknown = set(raw) - {"id", "name", "airframe", "sensors", "agent"}
     if unknown:
         raise ConfigError(f"{source}: 未知字段 {', '.join(sorted(unknown))}")
     name = raw.get("name")
@@ -166,7 +166,6 @@ def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> A
 
     frame = apply_fields(raw.get("airframe", {}), AIRCRAFT_FRAME_FIELDS, source, "airframe")
     sensors = apply_fields(raw.get("sensors", {}), AIRCRAFT_SENSOR_FIELDS, source, "sensors")
-    loadout = parse_loadout(raw.get("loadout"), weapons, source)
 
     base_mass = frame.pop("base_mass", None)
     if base_mass is None:
@@ -183,7 +182,9 @@ def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> A
         raise ConfigError(f"{source}: airframe.aspect_ratio 必须为正")
     if frame.get("n_struct", 0.0) <= 1.0:
         raise ConfigError(f"{source}: airframe.n_struct_g 必须大于 1")
-    frame["mass"] = base_mass + loadout.weapon_mass
+    # 挂载在场景里给出：机体配置只保留空机+燃油质量。
+    frame["base_mass"] = base_mass
+    frame["mass"] = base_mass
 
     missing = [
         field for field in ("mass", "wing_area", "cl_max", "n_struct", "thrust_max",
@@ -194,7 +195,7 @@ def parse_aircraft(raw: dict, weapons: dict[str, MissileSpec], source: str) -> A
         raise ConfigError(f"{source}: 缺少必填的机体参数 {', '.join(missing)}")
 
     try:
-        spec = AircraftSpec(name=name, loadout=loadout, **{**frame, **sensors})
+        spec = AircraftSpec(name=name, **{**frame, **sensors})
     except TypeError as exc:
         raise ConfigError(f"{source}: {exc}") from exc
 
@@ -247,16 +248,14 @@ def load_weapons(directory: str | Path) -> dict[str, MissileSpec]:
     return weapons
 
 
-def load_aircraft(
-    directory: str | Path, weapons: dict[str, MissileSpec]
-) -> dict[str, AircraftEntry]:
+def load_aircraft(directory: str | Path) -> dict[str, AircraftEntry]:
     directory = Path(directory)
     if not directory.is_dir():
         raise ConfigError(f"{directory}: 机体配置目录不存在")
     entries: dict[str, AircraftEntry] = {}
     for path in sorted(directory.glob("*.yaml")):
         raw = _read_yaml(path)
-        entry = parse_aircraft(raw, weapons, str(path))
+        entry = parse_aircraft(raw, str(path))
         if entry.id in entries:
             raise ConfigError(f"{path}: 机体 id 重复 {entry.id!r}")
         entries[entry.id] = entry
@@ -269,5 +268,5 @@ def load_aircraft_and_weapons(config_dir: str | Path) -> tuple[dict, dict]:
     """从 configs/ 目录一次加载武器与机体。"""
     config_dir = Path(config_dir)
     weapons = load_weapons(config_dir / "weapons")
-    aircraft = load_aircraft(config_dir / "aircraft", weapons)
+    aircraft = load_aircraft(config_dir / "aircraft")
     return weapons, aircraft

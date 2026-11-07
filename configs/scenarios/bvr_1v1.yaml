@@ -15,9 +15,29 @@ initial:
 teams:
   - name: red
     aircraft: SU-57
+    loadout:
+      ir:
+        weapon: R-73
+        count: 4
+      radar:
+        weapon: R-77-1
+        count: 2
+      countermeasures:
+        chaff: 24
+        flare: 18
     radar_policy: auto
   - name: blue
     aircraft: F-16V
+    loadout:
+      ir:
+        weapon: AIM-9X
+        count: 4
+      radar:
+        weapon: AIM-120C
+        count: 4
+      countermeasures:
+        chaff: 30
+        flare: 60
     radar_policy: auto
 
 awacs: false

@@ -24,11 +24,31 @@ initial:
 teams:
   - name: red
     aircraft: SU-57
+    loadout:
+      ir:
+        weapon: R-73
+        count: 4
+      radar:
+        weapon: R-77-1
+        count: 2
+      countermeasures:
+        chaff: 24
+        flare: 18
     radar_policy: auto
     opening_tactic: flank
     heading_deg: 30          # 朝东，向 F-16V 所在的 x 方向接近
   - name: blue
     aircraft: F-16V
+    loadout:
+      ir:
+        weapon: AIM-9X
+        count: 4
+      radar:
+        weapon: AIM-120C
+        count: 4
+      countermeasures:
+        chaff: 30
+        flare: 60
     radar_policy: auto
     opening_tactic: default
     heading_deg: 90         # 向北巡航（CAP 直线航段），给 Su-57 侧翼空间

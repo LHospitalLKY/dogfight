@@ -453,6 +453,10 @@ class Observation:
     # 当前侧滑角 rad：舵面混控里会叠加 0.6β 的侧滑对齐项，战术层要给方向舵
     # 一个明确的偏航指令时，必须把它扣掉，否则大侧滑下舵面会反向。
     own_beta: float = 0.0
+    # 本机航迹角速度（rad/s，已低通）：战术层的指向控制用它做阻尼，
+    # 避免高速下靠“方位误差 -> 满坡度”来回过冲形成 1 s 周期的摆振。
+    own_psi_rate: float = 0.0
+    own_gamma_rate: float = 0.0
     dof: int = 3                     # 当前内核自由度，过失速只在 6DOF 生效
     own_tvc: bool = False            # 本机是否带推力矢量喷口
     own_canard: bool = False         # 本机是否带全动鸭翼（过失速迎角上限由鸭翼给出）
@@ -599,6 +603,11 @@ class Aircraft:
     canard_diff_deg: float = 0.0   # 差动偏度 rad（左 +，右 -）
     canard_vortex: float = 0.0     # 脱体涡强度 0..1（带一阶滞后）
     canard_hinge: float = 0.0      # 铰链力矩占可用扭矩的比例 0..1
+    # ---- 主翼后缘可动翼面 / 全动垂尾状态 ----
+    elevon_deg: float = 0.0        # 后缘翼面实际偏度 rad（正=抬头）
+    elevon_cmd: float = 0.0        # 后缘翼面作动器指令 rad
+    fin_deg: float = 0.0           # 全动垂尾实际偏度 rad（正=机头右偏）
+    fin_cmd: float = 0.0           # 全动垂尾作动器指令 rad
     # 机炮待发弹丸的累计余量：射速高于物理步频时，按帧补发而不是每帧固定一发。
     gun_pending: float = 0.0
     # 越过验证高度上限只记录一次事件，不再判定“解体”。
@@ -678,6 +687,10 @@ class Missile:
     # 需用过载是钳位/舵机滞后之前的原始指令，可用过载是结构与动压的合成上限。
     g_req: float = 0.0
     g_avail: float = 0.0
+    # 本次交会迄今的真实最近距离 m（逐段线段最近点的历史最小值）。
+    # 引信要等弹真正掠过最近点才起爆，用它作为脱靶量，避免把
+    # “刚进入引信半径那一步的距离”当成脱靶量。
+    miss_best: float = 1e9
 
     @property
     def speed(self) -> float:
@@ -976,6 +989,7 @@ class World:
         x_offset: float = 1500.0,
         awacs: bool | tuple[bool, bool] = True,
         headings: tuple[float | None, float | None] = (None, None),
+        seed: int | None = 20261027,
     ) -> None:
         if dof not in (2, 3, 6):
             raise ValueError("dof 只支持 2、3 或 6")
@@ -1024,8 +1038,11 @@ class World:
         self.bullets: list[Bullet] = []
         # 已投放的干扰物（箔条云 / 热诱弹），失效后保留到清理，供渲染层读数。
         self.counters: list[Countermeasure] = []
-        # 干扰诱骗用的随机源固定种子，保证回放与实验可复现。
-        self._rng = random.Random(20261027)
+        # 干扰诱骗、机炮散布、近炸杀伤判定的随机源。
+        # 默认固定种子保证回放可复现；批量实验必须逐局传不同 seed，
+        # 否则各局的随机序列完全相同（旧实现里 roll_seed 只取发射时刻，
+        # 导致大量弹共用同一次掷骰）。
+        self._rng = random.Random(seed)
 
         # 蓝机在 y 方向带一点初始偏移，避免完全镜像导致的确定性对称僵局。
         # 2DOF 只是缺少垂直自由度，初始高度仍取 z0。
@@ -1331,7 +1348,15 @@ class World:
         # （guided=False）的弹弹道再也修正不了，同样不该占用照射通道，否则
         # 战术层会一直以为“还在中制导段”，永远不补射。
         radar_support = any(
-            m.alive and m.owner == i and m.spec.is_radar and m.guided and not m.active
+            m.alive and m.owner == i and m.spec.is_radar and m.guided
+            and (
+                not m.active
+                # 主动弹自主捕获后若导引头丢锁，载机仍可能用火控雷达
+                # 通过数据链接管；给一个很短的确认窗口，避免单帧盲区
+                # 让雷达反复开关。
+                or m.blind_t > 0.1
+                or m.fov_t > 0.1
+            )
             for m in self.missiles
         )
 
@@ -1502,6 +1527,8 @@ class World:
                 math.asin(clamp(me.vb / max(me.v, 1.0), -1.0, 1.0))
                 if me.rigid else 0.0
             ),
+            own_psi_rate=me.psi_rate,
+            own_gamma_rate=me.gamma_rate,
             dof=self.dof,
             own_tvc=me.spec.tvc > 0.0,
             own_canard=me.spec.canard,
@@ -2032,32 +2059,42 @@ class World:
             ac.canard_vortex += (target - ac.canard_vortex) * dt / (tau_eff + dt)
         ac.canard_vortex = clamp(ac.canard_vortex, 0.0, 1.0)
 
-    def _canard_pitch_command(
+    def _pitch_demand(
         self, ac: Aircraft, alpha: float, q_cmd: float,
-        qbar: float, V: float, mach: float,
+        qbar: float, V: float,
     ) -> float:
-        """由俯仰力矩需求反解鸭翼对称偏度（正=抬头）。
+        """俯仰力矩需求（正=抬头）。
 
-        无平尾机型没有 cm_de：俯仰完全由鸭翼升力绕重心的力矩提供。先抵消
-        当前翼身静稳定力矩，再叠加角速度误差项，最后把所需鸭翼 CL 反解成
-        当地迎角，偏度按物理定义 δc = α_c - α。
+        先抵消当前翼身静稳定/阻尼力矩，再叠加角速度误差项。鸭翼与后缘
+        升降副翼按可用权限分配同一个需求，保证两套操纵面不会各自重复
+        提供全部力矩。
         """
         spec = ac.spec
-        if spec.canard_area <= 0.0 or spec.canard_arm <= 0.0:
-            return 0.0
-        qs = qbar * spec.wing_area
         c = spec.chord
         q_hat = ac.q * c / (2.0 * max(V, 1.0))
         stab = 1.0
         if abs(alpha) > self._alpha_stall_effective(ac):
             stab = self._stall_stab_scale(ac, alpha)
+        qs = qbar * spec.wing_area
         m_wb = qs * c * (spec.cm_alpha * alpha * stab + spec.cm_q * q_hat)
         mass = ac.mass if ac.mass > 0.0 else spec.mass
-        iyy = spec.iyy_of(mass)
-        # 角速度误差项：全动鸭翼的带宽受 40°/s 左右的作动器速率限制，
-        # 增益不能用平尾机型的 1.5×(q_cmd-q) 量级——那样会把速率环推到
-        # 饱和区并诱发持续振荡。这里按等效俯仰时间常数 ~0.3 s 取 1.5/s。
-        m_des = -m_wb + iyy * 1.5 * (q_cmd - ac.q)
+        return -m_wb + spec.iyy_of(mass) * 1.5 * (q_cmd - ac.q)
+
+    def _canard_pitch_command(
+        self, ac: Aircraft, alpha: float, q_cmd: float,
+        qbar: float, V: float, mach: float, share: float = 1.0,
+    ) -> float:
+        """由俯仰力矩需求反解鸭翼对称偏度（正=抬头）。
+
+        无平尾机型没有 cm_de：俯仰由鸭翼升力与主翼后缘升降副翼共同绕
+        重心的力矩提供。share 是分配给鸭翼的力矩份额（0~1），剩余份额
+        由 _elevon_pitch_command 反解到后缘翼面。
+        """
+        spec = ac.spec
+        if spec.canard_area <= 0.0 or spec.canard_arm <= 0.0:
+            return 0.0
+        m_des = self._pitch_demand(ac, alpha, q_cmd, qbar, V)
+        m_des *= clamp(share, 0.0, 1.0)
         denom = qbar * spec.canard_area * spec.canard_arm
         if denom <= 1e-9:
             return 0.0
@@ -2065,6 +2102,63 @@ class World:
         alpha_c = self._canard_alpha_for_cl(ac, cl_c_des, mach)
         dc = alpha_c - alpha
         return clamp(dc, -spec.canard_deflect_max, spec.canard_deflect_max)
+
+    def _elevon_pitch_command(
+        self, ac: Aircraft, m_des: float, qbar: float,
+    ) -> float:
+        """把分配到的俯仰力矩反解成主翼后缘翼面偏度（正=抬头）。
+
+        后缘翼面在重心之后：上偏（正偏度）产生向下的增量升力，绕重心
+        抬头。偏度以 rad 返回，由作动器状态限制位置与速率。
+        """
+        spec = ac.spec
+        if not spec.elevon or spec.elevon_area <= 0.0 or spec.elevon_arm <= 0.0:
+            return 0.0
+        denom = (
+            qbar * spec.elevon_area * spec.elevon_arm * spec.elevon_cl_alpha
+        )
+        if denom <= 1e-9:
+            return 0.0
+        return clamp(m_des / denom, -spec.elevon_deflect_max,
+                     spec.elevon_deflect_max)
+
+    def _update_elevon_state(
+        self, ac: Aircraft, de_cmd: float, qbar: float,
+    ) -> None:
+        """主翼后缘翼面作动器：位置/速率限幅与一阶延迟。"""
+        spec = ac.spec
+        dt = self.dt
+        if not spec.elevon or spec.elevon_area <= 0.0:
+            ac.elevon_deg = ac.elevon_cmd = 0.0
+            return
+        dmax = max(spec.elevon_deflect_max, 0.0)
+        cmd = clamp(de_cmd, -dmax, dmax)
+        tau = max(spec.elevon_tau, 0.0)
+        lag = 1.0 if tau <= 0.0 else dt / (tau + dt)
+        step = max(spec.elevon_rate_max, 0.0) * dt
+        nxt = ac.elevon_deg + (cmd - ac.elevon_deg) * lag
+        nxt = clamp(nxt, ac.elevon_deg - step, ac.elevon_deg + step)
+        ac.elevon_deg = clamp(nxt, -dmax, dmax)
+        ac.elevon_cmd = cmd
+
+    def _update_fin_state(
+        self, ac: Aircraft, df_cmd: float, qbar: float,
+    ) -> None:
+        """全动垂尾作动器：位置/速率限幅与一阶延迟。"""
+        spec = ac.spec
+        dt = self.dt
+        if not spec.all_moving_fin or spec.fin_area <= 0.0:
+            ac.fin_deg = ac.fin_cmd = 0.0
+            return
+        dmax = max(spec.fin_deflect_max, 0.0)
+        cmd = clamp(df_cmd, -dmax, dmax)
+        tau = max(spec.fin_tau, 0.0)
+        lag = 1.0 if tau <= 0.0 else dt / (tau + dt)
+        step = max(spec.fin_rate_max, 0.0) * dt
+        nxt = ac.fin_deg + (cmd - ac.fin_deg) * lag
+        nxt = clamp(nxt, ac.fin_deg - step, ac.fin_deg + step)
+        ac.fin_deg = clamp(nxt, -dmax, dmax)
+        ac.fin_cmd = cmd
 
     def _stall_stab_scale(self, ac: Aircraft, alpha: float) -> float:
         """过失速段纵向静稳定力矩的衰减系数（0~1）。
@@ -2081,13 +2175,13 @@ class World:
 
     def _surface_commands(
         self, ac: Aircraft, act: Action, V: float, alpha: float, qbar: float,
-    ) -> tuple[float, float, float, float, float, float]:
+    ) -> tuple[float, float, float, float, float, float, float, float]:
         """增稳内回路：把战术层的 (bank, n) 翻译成舵面/鸭翼偏度。
 
         这是 6DOF 与 3DOF 的关键衔接——战术层仍然只关心“转多快、拉几个 g”，
         由这里负责配平、阻尼和协调转弯，避免把飞控品质问题暴露给战术层。
-        有全动鸭翼时俯仰由鸭翼升力力矩提供（de=0），返回的最后一个量是
-        鸭翼对称偏度指令。
+        俯仰力矩在平尾/鸭翼与主翼后缘升降副翼之间按可用权限分配；
+        J-20/Su-57 的全动垂尾与方向舵共用偏航指令。
         """
         spec = ac.spec
         mach = mach_number(V, ac.z)
@@ -2148,17 +2242,43 @@ class World:
             q_cmd = clamp(k_alpha * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
             alpha_trim = alpha_cmd
 
+        # 可用的俯仰力矩权限（N·m）：鸭翼/平尾与主翼后缘升降副翼共同分配。
+        a_can = 0.0
+        if spec.canard and spec.canard_area > 0.0 and spec.canard_arm > 0.0:
+            a_can = (
+                qbar * spec.canard_area * spec.canard_arm
+                * max(spec.canard_cl_max, 1e-6)
+            )
+        a_tail = qbar * spec.wing_area * spec.chord * abs(spec.cm_de)
+        a_ele = (
+            qbar * spec.elevon_area * spec.elevon_arm
+            * max(spec.elevon_cl_alpha * spec.elevon_deflect_max, 1e-6)
+        )
+
         dc = 0.0
         de = 0.0
-        if spec.canard and spec.canard_area > 0.0 and spec.canard_arm > 0.0:
-            # 全动鸭翼：无平尾，俯仰完全由鸭翼升力绕重心的力矩提供。
+        de_e = 0.0
+        if a_can > 1e-9:
+            # 全动鸭翼：与后缘升降副翼按权限比例分担同一个俯仰力矩需求。
+            share_e = a_ele / (a_can + a_ele) if a_ele > 1e-9 else 0.0
             dc = self._canard_pitch_command(
-                ac, alpha, q_cmd, qbar, V, mach,
+                ac, alpha, q_cmd, qbar, V, mach, share=1.0 - share_e,
             )
-        elif abs(spec.cm_de) > 1e-9:
+            if share_e > 0.0:
+                m_des = self._pitch_demand(ac, alpha, q_cmd, qbar, V)
+                de_e = self._elevon_pitch_command(ac, m_des * share_e, qbar)
+        elif a_tail > 1e-9:
+            # 平尾承担配平；机动所需的额外力矩按权限分一部分给后缘翼面。
+            share_e = a_ele / (a_tail + a_ele) if a_ele > 1e-9 else 0.0
             # 前馈抵消静稳定力矩，否则稳态迎角只能达到指令的 ~85%。
             de_trim = -(spec.cm_alpha * alpha_trim) / spec.cm_de
-            de = clamp(de_trim - 1.5 * (q_cmd - ac.q), -1.0, 1.0)
+            de = clamp(
+                de_trim - (1.0 - share_e) * 1.5 * (q_cmd - ac.q),
+                -1.0, 1.0,
+            )
+            if share_e > 0.0:
+                m_extra = a_tail * 1.5 * (q_cmd - ac.q)
+                de_e = self._elevon_pitch_command(ac, m_extra * share_e, qbar)
 
         # 航向：侧滑角 → 目标偏航角速度 → 方向舵（同时抑制侧滑与偏航振荡）
         beta = math.asin(clamp(ac.vb / V, -1.0, 1.0))
@@ -2169,6 +2289,11 @@ class World:
         else:
             r_cmd = clamp(2.0 * beta, -0.5, 0.5)
         dr = clamp(3.0 * (r_cmd - ac.r), -1.0, 1.0)
+        # 全动垂尾：整片绕转轴偏转，与方向舵共用同一个归一化偏航指令。
+        # 方向舵效率 cn_dr 在 J-20/Su-57 上只保留残余份额，避免重复计数。
+        df = 0.0
+        if spec.all_moving_fin and spec.fin_area > 0.0:
+            df = dr * spec.fin_deflect_max
         # 矢量喷口：迎角误差越大喷流偏得越多。低速时舵面几乎没有力矩，
         # 这一路是 Su-57 能维持大迎角、过失速机动的关键。
         tvc_p = 0.0
@@ -2186,7 +2311,7 @@ class World:
                 ) * ac.throttle
         # 三元矢量偏航：归一化指令直接映射到喷口偏角，推力越小力矩越小。
         tvc_y = clamp(act.tvc_yaw, -1.0, 1.0) * spec.tvc if spec.tvc > 0.0 else 0.0
-        return da, de, dr, tvc_p, tvc_y, dc
+        return da, de, dr, tvc_p, tvc_y, dc, de_e, df
 
     def _integrate_rigid(self, ac: Aircraft, act: Action) -> None:
         """6DOF：刚体六自由度积分（气动力/力矩 + 陀螺耦合 + 欧拉运动学）。"""
@@ -2201,12 +2326,14 @@ class World:
         mach = mach_number(V, ac.z)
         thrust = self._apply_power(ac, act, mach)
 
-        da, de, dr, tvc_p, tvc_y, dc = self._surface_commands(
+        da, de, dr, tvc_p, tvc_y, dc, de_e, df = self._surface_commands(
             ac, act, V, alpha, qbar,
         )
         ac.tvc_cmd = tvc_p
-        # 鸭翼作动器/铰链/涡状态先更新，后面的升力与力矩都用本步的实际偏度。
+        # 鸭翼/后缘翼面/全动垂尾作动器先更新，后面的升力与力矩都用本步的实际偏度。
         self._update_canard_state(ac, dc, act, alpha, qbar)
+        self._update_elevon_state(ac, de_e, qbar)
+        self._update_fin_state(ac, df, qbar)
 
         # 统一升力曲线：主翼 CL、鸭翼 CL、总 CL 一次算清。鸭翼涡增升与
         # 主翼下洗、超声速升力损失都在 _lift_components 里各记一次。
@@ -2224,6 +2351,15 @@ class World:
                 spec.canard_cd0
                 + spec.canard_induced_k * cl_c * cl_c
                 + spec.canard_deflect_drag * ac.canard_deg * ac.canard_deg
+            )
+        cl_e = 0.0
+        if spec.elevon and spec.elevon_area > 0.0:
+            # 后缘翼面偏度产生的增量升力（正偏度=后缘上偏=负升力）。
+            cl_e = -spec.elevon_cl_alpha * ac.elevon_deg
+            cl += spec.elevon_area_ratio * cl_e
+            cd += (
+                spec.elevon_area_ratio * spec.elevon_deflect_drag
+                * ac.elevon_deg * ac.elevon_deg
             )
         cy = spec.cy_beta * beta
 
@@ -2251,13 +2387,17 @@ class World:
         dvb = fy / m + G * sf * ct + ac.p * ac.wb - ac.r * ac.u
         dwb = fz / m + G * cf * ct + ac.q * ac.u - ac.p * ac.vb
 
+        # 结构限幅后按同一比例缩放各独立翼面的升力，保证力矩与合力来自
+        # 同一个流场（主翼升力已被结构上限截断）。
+        scale = 1.0
+        if abs(qs * cl) > 1e-9:
+            scale = clamp(lift / (qs * cl), -1.0, 1.0)
         lift_c = 0.0
         if spec.canard:
-            # 结构限幅后按同一比例缩放鸭翼升力，保证力矩与合力来自同一个流场。
-            scale = 1.0
-            if abs(qs * cl) > 1e-9:
-                scale = clamp(lift / (qs * cl), -1.0, 1.0)
             lift_c = qs * spec.canard_area_ratio * cl_c * scale
+        lift_e = 0.0
+        if spec.elevon and spec.elevon_area > 0.0:
+            lift_e = qs * spec.elevon_area_ratio * cl_e * scale
 
         # 气动力矩（无量纲系数 × 动压 × 面积 × 特征长度）
         b, c = spec.span, spec.chord
@@ -2302,6 +2442,16 @@ class World:
                     + spec.canard_deflect_drag * (ac.canard_deg - d) ** 2
                 )
                 yaw_m += arm_y * (drag_r - drag_l)
+        if spec.elevon and spec.elevon_area > 0.0:
+            # 主翼后缘翼面在重心之后：正升力（后缘下偏）产生低头力矩，
+            # 因此上偏（正偏度，cl_e<0）抬头。与鸭翼/平尾共享同一套指令分配。
+            pitch_m -= lift_e * spec.elevon_arm
+        if spec.all_moving_fin and spec.fin_area > 0.0:
+            # 全动垂尾整片偏转：正偏度=机头右偏，产生正偏航力矩。
+            yaw_m += (
+                qbar * spec.fin_area * spec.fin_cn_alpha
+                * ac.fin_deg * spec.fin_arm
+            )
         if tvc_p != 0.0:
             # 矢量喷口的推力方向偏转在尾段产生俯仰力矩，低速时补足舵面权限。
             pitch_m += thrust * tvc_p * 0.35 * spec.length
@@ -2686,7 +2836,7 @@ class World:
                 fuel=mspec.propellant,
                 nx=nx, ny=ny, nz=nz,
                 ignited=(mspec.ignition_timeout <= 0.0),
-                roll_seed=int(round(self.t * 1000.0)) * 131 + i * 7919 + 1,
+                roll_seed=self._rng.getrandbits(63),
             )
         )
         if radar:
@@ -2999,9 +3149,41 @@ class World:
             m.blind_t = m.blind_t + dt if seeker_blind else 0.0
             fov_bad = ang_seeker > m.spec.gimbal and not midcourse
             m.fov_t = m.fov_t + dt if fov_bad else 0.0
-            if m.blind_t > MISSILE_BLIND_MAX or m.fov_t > MISSILE_FOV_MAX:
+            # 自主捕获后弹上导引头丢锁（多普勒盲区/出视场）时，如果载机
+            # 火控雷达仍在射程与照射锥内稳定跟踪同一目标，就由载机通过
+            # 数据链继续提供目标信息，弹不转无控；等弹上导引头重新捕获
+            # 后再交回弹上制导。载机雷达关机、被击落或目标进盲区时，
+            # 数据链随之中断，仍按原来的丢锁逻辑处理。
+            launcher_support = False
+            if m.spec.is_arh and m.active and (seeker_blind or fov_bad):
+                shooter = self.acs[m.owner]
+                if (
+                    shooter.alive
+                    and shooter.radar_on
+                    and shooter.contact >= CONTACT_FIRE
+                ):
+                    sdx = target.x - shooter.x
+                    sdy = target.y - shooter.y
+                    sdz = target.z - shooter.z
+                    sdist = max(
+                        math.sqrt(sdx * sdx + sdy * sdy + sdz * sdz), 1e-6
+                    )
+                    snx, sny, snz = nose_direction(shooter)
+                    sang = math.acos(clamp(
+                        (sdx * snx + sdy * sny + sdz * snz) / sdist,
+                        -1.0, 1.0,
+                    ))
+                    launcher_support = (
+                        sdist <= m.spec.max_range
+                        and sang <= SARH_ILLUM_FOV
+                        and radar_visibility(shooter, target) >= 0.5
+                    )
+            if (
+                (m.blind_t > MISSILE_BLIND_MAX or m.fov_t > MISSILE_FOV_MAX)
+                and not launcher_support
+            ):
                 m.guided = False
-            elif not seeker_blind and not fov_bad:
+            elif not launcher_support and not seeker_blind and not fov_bad:
                 # 弹体轴转向目标视线：弹体可以转得比速度矢量快，二者之差
                 # 就是迎角（气动舵面因此建立升力）。但迎角受气动极限约束，
                 # 超出后翼面失速；这里把弹体轴投影回迎角锥内。
@@ -3064,7 +3246,10 @@ class World:
             if (
                 m.guided and dist > 1.0 and m.t >= m.spec.guidance_delay
                 and not pre_ignition
-                and not seeker_blind and not fov_bad and m.mid_t <= 0.0
+                and (
+                    launcher_support
+                    or (not seeker_blind and not fov_bad and m.mid_t <= 0.0)
+                )
             ):
                 if decoy is not None:
                     tvx = tvy = tvz = 0.0   # 诱饵随风飘落，按静止目标处理
@@ -3169,9 +3354,9 @@ class World:
 
             # 近炸引信：用运动线段的最近点判定，避免高速下穿透目标。
             # 被诱骗的弹追的是诱饵，不会误伤真机。
-            if decoy is not None:
-                miss_dist = 1e9
-            else:
+            detonate = False
+            miss_dist = 1e9
+            if decoy is None:
                 sx, sy, sz = m.x - px, m.y - py, m.z - pz
                 seg2 = sx * sx + sy * sy + sz * sz
                 if seg2 > 1e-9:
@@ -3185,12 +3370,24 @@ class World:
                 cx_ = px + sx * tt
                 cy_ = py + sy * tt
                 cz_ = pz + sz * tt
-                miss_dist = math.sqrt(
+                seg_dist = math.sqrt(
                     (target.x - cx_) ** 2
                     + (target.y - cy_) ** 2
                     + (target.z - cz_) ** 2
                 )
-            if miss_dist <= m.spec.lethal_radius:
+                # 一个物理步的位移（PL-10 约 7–10 m）比 9 m 引信半径还大：
+                # 弹刚进圈就起爆的话，记下的是“触发那一步的距离”，穿过目标的
+                # 直击会被记成数米脱靶，进而把战斗部 PK 压低。真实引信是在弹
+                # 与目标最接近时起爆的，所以这里逐段跟踪线段最近距离的最小值，
+                # 等距离开始变大（已经掠过最近点）才起爆，并用该最小值作为
+                # 脱靶量。逐段线段覆盖了整条弹道，因此这个最小值就是真实
+                # 脱靶量，不受一步位移大于引信半径的影响。
+                if seg_dist < m.miss_best:
+                    m.miss_best = seg_dist
+                else:
+                    detonate = m.miss_best <= m.spec.lethal_radius
+                miss_dist = m.miss_best
+            if detonate:
                 # 引信触发后再掷一次杀伤概率：脱靶量越大、交会速度越高，
                 # 越可能只是近失；即使命中也可能只是打伤而不是击落。
                 ratio = miss_dist / m.spec.lethal_radius

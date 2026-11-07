@@ -167,6 +167,23 @@ AIRCRAFT_FRAME_FIELDS: dict[str, tuple[str, Converter]] = {
     "canard_hinge_coeff": ("canard_hinge_coeff", _float),
     "canard_actuator_torque_knm": ("canard_actuator_torque", _kn),
     "canard_post_stall_alpha_deg": ("canard_post_stall_alpha", _deg),
+    # 主翼后缘可动翼面（所有机型）与全动垂尾（J-20 / Su-57）。
+    "elevon": ("elevon", _bool),
+    "elevon_area_ratio": ("elevon_area_ratio", _float),
+    "elevon_arm_ratio": ("elevon_arm_ratio", _float),
+    "elevon_deflect_max_deg": ("elevon_deflect_max", _deg),
+    "elevon_rate_max_deg_s": ("elevon_rate_max", _deg_per_s),
+    "elevon_tau_s": ("elevon_tau", _float),
+    "elevon_cl_alpha": ("elevon_cl_alpha", _float),
+    "elevon_cl_max": ("elevon_cl_max", _float),
+    "elevon_deflect_drag": ("elevon_deflect_drag", _float),
+    "all_moving_fin": ("all_moving_fin", _bool),
+    "fin_area_ratio": ("fin_area_ratio", _float),
+    "fin_arm_ratio": ("fin_arm_ratio", _float),
+    "fin_deflect_max_deg": ("fin_deflect_max", _deg),
+    "fin_rate_max_deg_s": ("fin_rate_max", _deg_per_s),
+    "fin_tau_s": ("fin_tau", _float),
+    "fin_cn_alpha": ("fin_cn_alpha", _float),
 }
 
 # 机体的传感器/隐身参数

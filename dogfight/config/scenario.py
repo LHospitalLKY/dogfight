@@ -1,12 +1,15 @@
 """场景配置：把“用哪两架飞机、怎么开局、跑多久”从入口代码里分离出来。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
 
-from .registry import AircraftEntry, ConfigError
+from dogfight.specs.loadout import Loadout
+from dogfight.specs.weapon import MissileSpec
+
+from .registry import AircraftEntry, ConfigError, parse_loadout
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,9 @@ class InitialConditions:
 class TeamSpec:
     name: str
     aircraft: AircraftEntry
+    # 该队在本次场景里的挂载。武器挂载属于场景配置：同一机体在不同场景
+    # 可以挂不同弹，作战全重也随挂载质量变化。
+    loadout: Loadout | None = None
     radar_policy: str = "always"
     # 覆盖机体默认的开局占位策略；None 表示沿用 aircraft.agent.opening_tactic。
     opening_tactic: str | None = None
@@ -58,7 +64,9 @@ def _number(raw: dict, key: str, default: float, source: str) -> float:
 
 
 def load_scenario(
-    path: str | Path, aircraft: dict[str, AircraftEntry]
+    path: str | Path,
+    aircraft: dict[str, AircraftEntry],
+    weapons: dict[str, MissileSpec],
 ) -> Scenario:
     path = Path(path)
     try:
@@ -88,7 +96,9 @@ def load_scenario(
         where = f"teams[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{path}: {where} 必须是键值表")
-        extra = set(item) - {"name", "aircraft", "radar_policy", "opening_tactic", "heading_deg"}
+        extra = set(item) - {
+            "name", "aircraft", "loadout", "radar_policy", "opening_tactic", "heading_deg",
+        }
         if extra:
             raise ConfigError(f"{path}: {where} 未知字段 {', '.join(sorted(extra))}")
         aircraft_id = item.get("aircraft")
@@ -98,6 +108,16 @@ def load_scenario(
             raise ConfigError(
                 f"{path}: {where}.aircraft: 未注册的机体 id {aircraft_id!r}"
             )
+        if item.get("loadout") is None:
+            raise ConfigError(f"{path}: {where}.loadout 必填（武器挂载属于场景配置）")
+        loadout = parse_loadout(item["loadout"], weapons, f"{path}: {where}")
+        entry = aircraft[aircraft_id]
+        # 把场景挂载装到机体上：作战全重 = 空机+燃油质量 + 挂载质量。
+        entry = replace(entry, spec=replace(
+            entry.spec,
+            loadout=loadout,
+            mass=entry.spec.base_mass + loadout.weapon_mass,
+        ))
         policy = item.get("radar_policy", "always")
         if policy not in ("always", "silent", "auto"):
             raise ConfigError(
@@ -120,7 +140,7 @@ def load_scenario(
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{path}: {where}.heading_deg 必须是数字") from exc
         teams.append(TeamSpec(
-            name=name, aircraft=aircraft[aircraft_id],
+            name=name, aircraft=entry, loadout=loadout,
             radar_policy=policy, opening_tactic=opening_tactic,
             heading_deg=heading_deg,
         ))
@@ -170,14 +190,16 @@ def load_scenario(
 
 
 def load_scenarios(
-    directory: str | Path, aircraft: dict[str, AircraftEntry]
+    directory: str | Path,
+    aircraft: dict[str, AircraftEntry],
+    weapons: dict[str, MissileSpec],
 ) -> dict[str, Scenario]:
     directory = Path(directory)
     if not directory.is_dir():
         raise ConfigError(f"{directory}: 场景配置目录不存在")
     scenarios: dict[str, Scenario] = {}
     for path in sorted(directory.glob("*.yaml")):
-        scenario = load_scenario(path, aircraft)
+        scenario = load_scenario(path, aircraft, weapons)
         if scenario.id in scenarios:
             raise ConfigError(f"{path}: 场景 id 重复 {scenario.id!r}")
         scenarios[scenario.id] = scenario

@@ -55,9 +55,25 @@ airframe:
   canard_cl_bonus: 0.15
   canard_alpha_max_deg: 30
   canard_stall_shift_deg: 8
+  # 同 J-20A：主翼后缘升降副翼与全动垂尾。
+  elevon_area_ratio: 0.14
+  elevon_arm_ratio: 0.35
+  elevon_deflect_max_deg: 25
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.6
+  elevon_cl_max: 1.0
+  all_moving_fin: true
+  fin_area_ratio: 0.12
+  fin_arm_ratio: 1.0
+  fin_deflect_max_deg: 20
+  fin_rate_max_deg_s: 45
+  fin_tau_s: 0.10
+  fin_cn_alpha: 1.6
   # 同 J-20A：全机静稳定导数 cm_alpha + 0.14×1.25×3.6 = -0.02（中立稳定）。
   cm_alpha: -0.65
   cm_de: 0.0
+  cn_dr: 0.02
 
 sensors:
   # 与 J-20A 同口径：双座座舱盖加长，正面取 0.003 m²（约 −25 dBsm），
@@ -70,17 +86,6 @@ sensors:
   side_array: true
   lband: false
   irst_range_km: 60
-
-loadout:
-  ir:
-    weapon: PL-10
-    count: 2
-  radar:
-    weapon: PL-15
-    count: 4
-  countermeasures:
-    chaff: 30
-    flare: 24
 
 agent:
   aggression: 0.80

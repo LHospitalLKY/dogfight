@@ -63,19 +63,24 @@ def _three_vertex(p):
     return (p[1], -p[2], -p[0])
 
 
-def _write_obj(path: Path, pts, faces, name: str, canopy_faces=None) -> None:
-    """写 three.js 用 OBJ；canopy_faces 是 faces 中要归入 canopy 的面序号。"""
-    body = []
-    canopy = []
+def _write_obj(path: Path, pts, faces, name: str, canopy_faces=None,
+               store_faces=None) -> None:
+    """写 three.js 用 OBJ；canopy_faces / store_faces 是 faces 的归组面序号。"""
+    groups = {"body": [], "canopy": [], "stores": []}
+    canopy_faces = canopy_faces or set()
+    store_faces = store_faces or set()
     for n, (idx, _material) in enumerate(faces):
-        if canopy_faces and n in canopy_faces:
-            canopy.append(idx)
+        if n in store_faces:
+            groups["stores"].append(idx)
+        elif n in canopy_faces:
+            groups["canopy"].append(idx)
         else:
-            body.append(idx)
+            groups["body"].append(idx)
     lines = [f"# dogfight web {MODEL_TAG}", f"o {name}"]
     for x, y, z in pts:
         lines.append(f"v {x:.3f} {y:.3f} {z:.3f}")
-    for kind, group in (("body", body), ("canopy", canopy)):
+    for kind in ("body", "canopy", "stores"):
+        group = groups[kind]
         if not group:
             continue
         lines.append(f"usemtl {kind}")
@@ -152,7 +157,7 @@ def export_models() -> dict:
         pts = [_three_vertex(p) for p in geo["pts"]]
         _write_obj(
             MODEL_DIR / asset.web.file, pts, geo["faces"],
-            name.lower().replace("-", ""), geo["canopy"],
+            name.lower().replace("-", ""), geo["canopy"], geo.get("stores"),
         )
         aircraft[name] = {
             "url": f"/api/models/{asset.web.file}",
@@ -1036,6 +1041,13 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/assets/terrain/"):
             name = os.path.basename(path)
             self._send_file(ROOT / "assets" / "terrain" / name, "image/png")
+            return
+        if path.startswith("/assets/aircraft/"):
+            # 机体涂装贴图（J-20 的迷彩图等），与模型一起放在 assets/aircraft。
+            # 文件名含中文，浏览器会百分号编码，先解码再查文件。
+            name = os.path.basename(urllib.parse.unquote(path))
+            ctype = "image/png" if name.lower().endswith(".png") else "image/jpeg"
+            self._send_file(ROOT / "assets" / "aircraft" / name, ctype)
             return
         if path.startswith("/api/models/"):
             name = os.path.basename(path)

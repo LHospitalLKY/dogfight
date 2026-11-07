@@ -22,7 +22,7 @@ class ConfigBundle:
         """按 id 取内置场景；也允许直接传一个 YAML 路径。"""
         path = Path(name_or_path)
         if path.is_file():
-            return load_scenario(path, self.aircraft)
+            return load_scenario(path, self.aircraft, self.weapons)
         key = str(name_or_path)
         if key not in self.scenarios:
             known = ", ".join(sorted(self.scenarios))
@@ -33,7 +33,7 @@ class ConfigBundle:
 def load_bundle(config_dir: str | Path | None = None) -> ConfigBundle:
     config_dir = Path(config_dir) if config_dir else DEFAULT_CONFIG_DIR
     weapons, aircraft = load_aircraft_and_weapons(config_dir)
-    scenarios = load_scenarios(config_dir / "scenarios", aircraft)
+    scenarios = load_scenarios(config_dir / "scenarios", aircraft, weapons)
     return ConfigBundle(
         config_dir=config_dir,
         aircraft=aircraft,

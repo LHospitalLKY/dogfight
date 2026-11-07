@@ -7,7 +7,10 @@ three.js 里渲染的机体完全对得上；起落架/吊舱等也按同一套�
 产物：
     assets/silhouettes/su57_top.png     透明底轮廓（白填充 + 深描边）
     assets/silhouettes/f16_top.png
-    assets/silhouettes/top_views.png    两张轮廓的预览图（深色底、带标注）
+    assets/silhouettes/j20a_top.png     （J-20A / J-20S 共用）
+    assets/silhouettes/f15c_top.png
+    assets/silhouettes/f15ex_top.png    （F-15E / F-15EX 共用）
+    assets/silhouettes/top_views.png    上述轮廓的预览图（深色底、带标注）
 
 用法（在仓库根目录）：
     python -m tools.maintenance.build_silhouettes
@@ -91,20 +94,24 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _preview(images) -> None:
+def _preview(images, columns: int = 3) -> None:
     font = _font(30)
     pad = 24
     cell_w = max(im.width for _, im, _ in images) + pad * 2
     cell_h = max(im.height for _, im, _ in images) + pad * 2 + 42
-    sheet = Image.new("RGBA", (cell_w * len(images), cell_h), (7, 18, 15, 255))
+    rows = (len(images) + columns - 1) // columns
+    cols = min(columns, len(images))
+    sheet = Image.new("RGBA", (cell_w * cols, cell_h * rows), (7, 18, 15, 255))
     draw = ImageDraw.Draw(sheet)
     for k, (label, im, color) in enumerate(images):
-        x = k * cell_w
-        draw.rectangle((x, 0, x + cell_w - 1, cell_h - 1), outline=(24, 42, 34))
+        gx, gy = k % columns, k // columns
+        x = gx * cell_w
+        y = gy * cell_h
+        draw.rectangle((x, y, x + cell_w - 1, y + cell_h - 1), outline=(24, 42, 34))
         sheet.paste(im, (x + (cell_w - im.width) // 2,
-                         pad + (cell_h - 42 - im.height) // 2), im)
+                         y + pad + (cell_h - 42 - im.height) // 2), im)
         tw = draw.textlength(label, font=font)
-        draw.text((x + (cell_w - tw) / 2, cell_h - 34), label,
+        draw.text((x + (cell_w - tw) / 2, y + cell_h - 34), label,
                   font=font, fill=color)
     path = os.path.join(OUT_DIR, "top_views.png")
     sheet.convert("RGB").save(path)
@@ -113,12 +120,21 @@ def _preview(images) -> None:
 
 def main() -> int:
     os.makedirs(OUT_DIR, exist_ok=True)
-    su57 = _build(MODEL_BY_NAME["SU-57"], "su57")
-    f16 = _build(MODEL_BY_NAME["F-16V"], "f16")
-    _preview([
-        ("SU-57  ORTHO TOP", su57, TEAM_COLORS[0]),
-        ("F-16V  ORTHO TOP", f16, TEAM_COLORS[1]),
-    ])
+    builds = (
+        ("SU-57", "su57", TEAM_COLORS[0]),
+        ("F-16V", "f16", TEAM_COLORS[1]),
+        ("J-20A", "j20a", TEAM_COLORS[0]),
+        ("F-15C", "f15c", TEAM_COLORS[1]),
+        ("F-15EX", "f15ex", TEAM_COLORS[0]),
+    )
+    images = []
+    for name, stem, color in builds:
+        if name not in MODEL_BY_NAME:
+            print(f"跳过 {name}：原始 OBJ 未就位", flush=True)
+            continue
+        images.append((f"{name}  ORTHO TOP", _build(MODEL_BY_NAME[name], stem),
+                       color))
+    _preview(images)
     return 0
 
 

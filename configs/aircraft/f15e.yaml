@@ -36,6 +36,14 @@ airframe:
   tvc_alpha_max_deg: 0
   tvc_cl_bonus: 0.0
   canard: false
+  # 主翼后缘襟副翼（约 5.7 m²，0.10 S）也参与俯仰配平与机动。
+  elevon_area_ratio: 0.10
+  elevon_arm_ratio: 0.30
+  elevon_deflect_max_deg: 20
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.6
+  elevon_cl_max: 1.0
 
 sensors:
   rcs: 6.0
@@ -47,17 +55,6 @@ sensors:
   lband: false
   irst_range_km: 0           # 狙击手/Litening 吊舱由外挂提供，此处不计
   pod_irst_range_km: 45      # 对地瞄准吊舱兼具 IRST 能力
-
-loadout:
-  ir:
-    weapon: AIM-9X
-    count: 4
-  radar:
-    weapon: AIM-120C
-    count: 4
-  countermeasures:
-    chaff: 30
-    flare: 60
 
 agent:
   aggression: 0.72

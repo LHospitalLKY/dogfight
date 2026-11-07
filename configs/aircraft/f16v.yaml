@@ -4,7 +4,7 @@ name: F-16V
 
 airframe:
   # 10,787.4 kg（半油 + 6 枚弹）中的空机/燃油部分 + 250 kg 光电吊舱；
-  # 挂载质量由 loader 按 loadout 自动加上。
+  # 挂载质量由场景配置按 loadout 加上。
   base_mass_kg: 11037.4
   wing_area_m2: 27.87
   cl_max: 1.5
@@ -33,6 +33,14 @@ airframe:
   bullet_mass_kg: 0.102
   bullet_diameter_m: 0.020
   gun_spread: 0.003
+  # 主翼后缘襟副翼（约 3.3 m²，0.12 S）也参与俯仰配平与机动。
+  elevon_area_ratio: 0.12
+  elevon_arm_ratio: 0.30
+  elevon_deflect_max_deg: 20
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.6
+  elevon_cl_max: 1.0
 
 sensors:
   rcs: 1.2
@@ -41,17 +49,6 @@ sensors:
   rcs_back: 2.0
   radar_range_km: 70
   pod_irst_range_km: 45    # Legion 级光电吊舱
-
-loadout:
-  ir:
-    weapon: AIM-9X
-    count: 4
-  radar:
-    weapon: AIM-120C
-    count: 2
-  countermeasures:
-    chaff: 30
-    flare: 60
 
 agent:
   aggression: 0.75

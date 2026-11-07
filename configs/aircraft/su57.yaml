@@ -3,7 +3,7 @@ id: SU-57
 name: SU-57
 
 airframe:
-  # 空机 + 半油；挂载质量由 loader 按 loadout 自动加到作战全重。
+  # 空机 + 半油；挂载质量由场景配置按 loadout 加到作战全重。
   base_mass_kg: 24500
   wing_area_m2: 78.8
   cl_max: 1.6
@@ -37,6 +37,24 @@ airframe:
   tvc_deg: 15
   tvc_alpha_max_deg: 55
   tvc_cl_bonus: 0.30
+  # 主翼后缘升降副翼（约 9.5 m²，0.12 S）与全动垂尾（两片约 9.5 m²，
+  # 0.12 S）：俯仰不再只靠平尾，偏航由整片垂尾提供。
+  elevon_area_ratio: 0.12
+  elevon_arm_ratio: 0.35
+  elevon_deflect_max_deg: 20
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.7
+  elevon_cl_max: 1.0
+  all_moving_fin: true
+  fin_area_ratio: 0.12
+  fin_arm_ratio: 1.0
+  fin_deflect_max_deg: 20
+  fin_rate_max_deg_s: 45
+  fin_tau_s: 0.10
+  fin_cn_alpha: 1.6
+  # 全动垂尾已是主要偏航操纵面，方向舵只保留少量残余效率。
+  cn_dr: 0.02
 
 sensors:
   rcs: 0.5
@@ -47,17 +65,6 @@ sensors:
   side_array: true
   lband: true
   irst_range_km: 60
-
-loadout:
-  ir:
-    weapon: R-73
-    count: 4
-  radar:
-    weapon: R-77-1
-    count: 2
-  countermeasures:
-    chaff: 24
-    flare: 18
 
 agent:
   aggression: 0.85

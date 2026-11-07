@@ -68,10 +68,12 @@ def bbox(verts):
     return (min(xs), max(xs)), (min(ys), max(ys)), (min(zs), max(zs))
 
 
-def cluster(points, faces, voxel, canopy_faces=frozenset()):
+def cluster(points, faces, voxel, canopy_faces=frozenset(),
+            store_faces=frozenset()):
     """体素聚类抽稀：同格顶点合并到平均值，退化/重复面直接丢弃。
 
-    faces 为 (索引元组, 材质名)；返回 (新顶点表, [(面索引, "body"/"canopy")])。
+    faces 为 (索引元组, 材质名)；返回 (新顶点表, [(面索引, 面类别)])，
+    面类别为 "body" / "canopy" / "stores"（外挂导弹、副油箱等）。
     """
     cells: dict[tuple[int, int, int], list[float]] = {}
     for x, y, z in points:
@@ -103,7 +105,12 @@ def cluster(points, faces, voxel, canopy_faces=frozenset()):
         if sig in seen:
             continue
         seen.add(sig)
-        kind = "canopy" if n in canopy_faces else "body"
+        if n in store_faces:
+            kind = "stores"
+        elif n in canopy_faces:
+            kind = "canopy"
+        else:
+            kind = "body"
         out.append((tuple(poly), kind))
     return pts, out
 
@@ -133,7 +140,8 @@ def _convert_su57(verts, faces, length: float) -> dict:
         engines.append(list(conv((x_exit, ey, ez))))
     # 座舱盖只有 glass.001；screen / Glowing_green 是仪表面片，仍归 body。
     canopy = {n for n, (_idx, material) in enumerate(faces) if material == "glass.001"}
-    return {"pts": pts, "faces": faces, "engines": engines, "canopy": canopy}
+    return {"pts": pts, "faces": faces, "engines": engines,
+            "canopy": canopy, "stores": set()}
 
 
 def _convert_f16(verts, faces, length: float) -> dict:
@@ -167,7 +175,124 @@ def _convert_f16(verts, faces, length: float) -> dict:
             continue
         if max(abs(verts[i][0] - cx) for i in idx) < 0.8:
             canopy.add(n)
-    return {"pts": pts, "faces": faces, "engines": engines, "canopy": canopy}
+    return {"pts": pts, "faces": faces, "engines": engines,
+            "canopy": canopy, "stores": set()}
+
+
+def _convert_j20(verts, faces, length: float) -> dict:
+    """J-20：OBJ 纵轴 Z、机头 +Z、+Y 向上；输出机体系（x 前、y 右、z 下）。
+
+    原始模型没有座舱/喷口分组：座舱盖按机背上的几何区域选取，双发喷口
+    取发动机材质在尾端的两个出口环。J-20 无外挂（导弹在弹舱内）。
+    """
+    (x0, x1), (y0, y1), (z0, z1) = bbox(verts)
+    cx, cy, cz = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0
+    span_x, span_y, span_z = x1 - x0, y1 - y0, z1 - z0
+    s = length / span_z
+
+    def conv(v):
+        return ((v[2] - cz) * s, -(v[0] - cx) * s, -(v[1] - cy) * s)
+
+    pts = [conv(v) for v in verts]
+    # 双发喷口：mat0 是尾段/喷管材质（z 192–240），出口环取该材质的最小 z。
+    nozzle = set()
+    for idx, material in faces:
+        if material == "mat0":
+            nozzle.update(idx)
+    engines = []
+    if nozzle:
+        z_exit = min(verts[i][2] for i in nozzle)
+        ring = [verts[i] for i in nozzle
+                if verts[i][2] <= z_exit + 0.005 * span_z]
+        for left in (True, False):
+            side = [p for p in ring if (p[0] < cx) == left]
+            if not side:
+                continue
+            ex = sum(p[0] for p in side) / len(side)
+            ey = sum(p[1] for p in side) / len(side)
+            engines.append(list(conv((ex, ey, z_exit))))
+    # 座舱盖：按三视图量取，机头起约 17%–31%（即尾部起 69%–82.7%）、
+    # 机背 y ≥ 50.8%、中线附近 ±8.5% 翼展的蒙皮面。
+    canopy = set()
+    z_lo, z_hi = z0 + 0.690 * span_z, z0 + 0.827 * span_z
+    y_lo = y0 + 0.508 * span_y
+    x_lim = 0.085 * span_x
+    for n, (idx, _material) in enumerate(faces):
+        poly = [verts[i] for i in idx]
+        cz_f = sum(p[2] for p in poly) / len(poly)
+        cy_f = sum(p[1] for p in poly) / len(poly)
+        if (z_lo <= cz_f <= z_hi and cy_f >= y_lo
+                and max(abs(p[0] - cx) for p in poly) <= x_lim):
+            canopy.add(n)
+    return {"pts": pts, "faces": faces, "engines": engines,
+            "canopy": canopy, "stores": set()}
+
+
+def _convert_f15(verts, faces, length: float) -> dict:
+    """F-15C / F-15E / F-15EX 共用：OBJ 纵轴 Z、机头 +Z、+Y 向上。
+
+    原始模型只按贴图分材质，没有座舱、导弹、副油箱的分组：
+    - 机体蒙皮占绝大多数面（F-15C 为 db77f96e_dds，F-15EX 为 cba3dd14_dds），
+      其余材质的面（AIM-120 级中距弹、翼尖 AIM-9）一律归为外挂物 stores；
+    - 座舱盖按机背上的几何区域（机头起 24.4%–33.4%，即尾部起 66.2%–75.3%；
+      y ≥ 51.9%、中线 ±0.6 m）选取；
+    - 双发喷口取机腹后段两个出口环。
+    """
+    (x0, x1), (y0, y1), (z0, z1) = bbox(verts)
+    cx, cy, cz = (x0 + x1) / 2.0, (y0 + y1) / 2.0, (z0 + z1) / 2.0
+    span_x, span_y, span_z = x1 - x0, y1 - y0, z1 - z0
+    s = length / span_z
+
+    def conv(v):
+        return ((v[2] - cz) * s, -(v[0] - cx) * s, -(v[1] - cy) * s)
+
+    pts = [conv(v) for v in verts]
+    # 面数最多的材质是机体蒙皮，其余材质是挂载（导弹/挂架/吊舱）。
+    counts: dict[str, int] = {}
+    for _idx, material in faces:
+        counts[material] = counts.get(material, 0) + 1
+    body_material = max(counts, key=counts.get) if counts else "body"
+    stores = {n for n, (_idx, material) in enumerate(faces)
+              if material != body_material}
+
+    # 双发喷口：机腹后段（下 30% 高度、中线 ±10% 翼展）最靠后的两个出口环。
+    # 横向不能放宽：再宽一点就会把平尾根部的后缘当成"最靠后的出口"。
+    engines = []
+    body_verts = set()
+    for n, (idx, _material) in enumerate(faces):
+        if n not in stores:
+            body_verts.update(idx)
+    rear = [verts[i] for i in body_verts
+            if abs(verts[i][0] - cx) <= 0.10 * span_x
+            and verts[i][1] <= y0 + 0.30 * span_y]
+    if rear:
+        z_exit = min(p[2] for p in rear)
+        ring = [p for p in rear if p[2] <= z_exit + 0.005 * span_z]
+        for left in (True, False):
+            side = [p for p in ring if (p[0] < cx) == left]
+            if not side:
+                continue
+            ex = sum(p[0] for p in side) / len(side)
+            ey = sum(p[1] for p in side) / len(side)
+            engines.append(list(conv((ex, ey, z_exit))))
+
+    # 座舱盖：按三视图量取，机头起 24.4%–33.4%（即尾部起 66.2%–75.3%）、
+    # 机背 y ≥ 51.9%、中线 ±0.6 m 的蒙皮面。
+    canopy = set()
+    z_lo, z_hi = z0 + 0.662 * span_z, z0 + 0.753 * span_z
+    y_lo = y0 + 0.519 * span_y
+    x_lim = 0.031 * span_z
+    for n, (idx, _material) in enumerate(faces):
+        if n in stores:
+            continue
+        poly = [verts[i] for i in idx]
+        cz_f = sum(p[2] for p in poly) / len(poly)
+        cy_f = sum(p[1] for p in poly) / len(poly)
+        if (z_lo <= cz_f <= z_hi and cy_f >= y_lo
+                and max(abs(p[0] - cx) for p in poly) <= x_lim):
+            canopy.add(n)
+    return {"pts": pts, "faces": faces, "engines": engines,
+            "canopy": canopy, "stores": stores}
 
 
 def _convert_default(verts, faces, length: float, forward: str = "+x") -> dict:
@@ -191,17 +316,16 @@ def _convert_default(verts, faces, length: float, forward: str = "+x") -> dict:
         def conv(v):
             return (sign * (v[2] - cz) * s, -(v[0] - cx) * s, -(v[1] - cy) * s)
     pts = [conv(v) for v in verts]
-    return {"pts": pts, "faces": faces, "engines": [], "canopy": set()}
+    return {"pts": pts, "faces": faces, "engines": [],
+            "canopy": set(), "stores": set()}
 
 
 # 原始 OBJ 的轴向约定不统一，按注册表里的 converter 名分派（新增机型在此登记）。
 CONVERTERS = {
     "su57": _convert_su57,
     "f16": _convert_f16,
-    # J-20 / F-15 的 converter 待对应 OBJ 到位后按其轴向校准；
-    # 当前按"纵轴 X、机头 +X"的常见约定给出默认换算，喷口/座舱暂留空。
-    "j20": lambda v, f, l: _convert_default(v, f, l, forward="+x"),
-    "f15": lambda v, f, l: _convert_default(v, f, l, forward="+x"),
+    "j20": _convert_j20,
+    "f15": _convert_f15,
 }
 
 
@@ -219,11 +343,18 @@ def convert_model(path: str | Path, converter: str, length: float) -> dict:
 
 def load_model(path: str | Path, converter: str, length: float, voxel: float,
                keep_materials: set | None = None) -> dict:
-    """换算后按体素抽稀，供资产缺失时的 Web 兜底与俯视轮廓使用。"""
+    """换算后按体素抽稀，供资产缺失时的 Web 兜底与俯视轮廓使用。
+
+    外挂物（导弹/副油箱等）不参与简化：俯视轮廓只画机体，挂载由前端
+    单独渲染；因此 stores 面在这里直接剔除。
+    """
     geo = convert_model(path, converter, length)
+    stores = geo.get("stores", set())
     faces = []
     canopy = set()
     for n, (idx, material) in enumerate(geo["faces"]):
+        if n in stores:
+            continue
         if keep_materials is not None and material not in keep_materials:
             continue
         if n in geo["canopy"]:

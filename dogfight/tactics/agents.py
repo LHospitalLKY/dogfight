@@ -29,6 +29,11 @@ from dogfight.core.sim import (
 
 # 期望角速度的软上限，避免目标突然跳到正后方时拉出离谱的指令。
 MAX_GAMMA_DOT = math.radians(20.0)
+# 航迹角速度阻尼：指向控制先把“方位/俯仰误差 × 增益”算成期望航迹角速度，
+# 再减去已经开始转的那部分。没有这一项时，高速下几度的方位误差就会被
+# 换算成数 g 的横向过载，飞机压坡度 → 过冲 → 反向压坡度，形成约 1 s
+# 周期的摆振（15 km 近距场景里 J-20 看起来一直在抖）。
+RATE_DAMP = 0.8
 # 能量-高度约束：爬升角上限由比剩余功率 Ps 决定，高速时才允许额外 zoom。
 ZOOM_ALLOWANCE = math.radians(25.0)
 GAMMA_CAP = math.radians(55.0)
@@ -71,6 +76,12 @@ VERTICAL_N = 6.5
 # 剩下的三成要留给阻力损失、推力不足和拉起段的过载延迟。14 km、2.3 倍失速
 # 时 2R 已经吃掉 89% 的多余动能，动作必然在过顶前失速。
 VERTICAL_CLIMB_MARGIN = 0.65
+# 超机动机型（6DOF + 矢量喷口/全动鸭翼）的放宽量：过失速段喷流偏转与鸭翼
+# 仍能提供操纵力矩和额外升力，过顶时不必全靠动能付账，允许 2R 占到 90%。
+VERTICAL_CLIMB_MARGIN_SUPER = 0.90
+# 同一批机型的可用过载准入折减：拉起段的过载由矢量/鸭翼补足，不必按
+# 常规气动机型的 6.0–6.5 g 卡死。
+SUPER_VERTICAL_N_FACTOR = 0.70
 # 防御转向反转的时间门槛：威胁持续位于反侧超过该时长才换向。
 # 否则每次重新进入防御原语都会按瞬时方位翻一次，形成“无收益的反向机动”。
 DEF_REVERSE_TIME = 1.5
@@ -209,21 +220,37 @@ def aim_action(
     cg = max(math.cos(obs.own_gamma), 0.25)
     chi_max = G / (v * cg) * max(obs.own_n_avail, 0.5) * 0.9
 
-    psi_dot = clamp(wrap_pi(az_error) * gain, -chi_max, chi_max)
+    psi_dot = clamp(
+        wrap_pi(az_error) * gain - obs.own_psi_rate * RATE_DAMP,
+        -chi_max, chi_max,
+    )
 
     ps_climb = math.asin(clamp(obs.own_ps / v, -0.95, 0.95))
     zoom = clamp(obs.own_speed_frac - 1.6, 0.0, 1.0) * ZOOM_ALLOWANCE
     gamma_cap = clamp(ps_climb + zoom, GAMMA_FLOOR, GAMMA_CAP)
     target_gamma = clamp(obs.own_gamma + el_error, GAMMA_FLOOR, gamma_cap)
-    gamma_dot = clamp((target_gamma - obs.own_gamma) * gain,
-                      -MAX_GAMMA_DOT, MAX_GAMMA_DOT)
+    gamma_dot = clamp(
+        (target_gamma - obs.own_gamma) * gain
+        - obs.own_gamma_rate * RATE_DAMP,
+        -MAX_GAMMA_DOT, MAX_GAMMA_DOT,
+    )
 
     a = cg + v * gamma_dot / G              # 垂直方向升力分量
-    if a < 0.0 and obs.own_gamma > math.radians(30.0):
-        # 机头已经高高抬起，而能量只允许更小的爬升角：必须推杆（负过载）
-        # 把航迹压下来。旧的 max(a, 0.12) 把推杆指令吃掉了，低速大航迹角
-        # 时实际 γ̇ 只剩 +0.3°/s，飞机会“挂”在机头上以 70–80° 缓慢爬升
-        # （近失速爬升但不掉速的僵持）。推杆时限幅在人体短时负过载极限。
+    # 相对航迹（速度矢量）的仰角误差：`el_error` 相对机头，6DOF 下含一个
+    # 迎角分量。大迎角时目标即使正好在航迹上，el_error 也会是 -20° 左右，
+    # 用它的符号去判断“要不要推杆”会让正常盘旋也反复推拉。
+    vel_el_error = obs.los_el - obs.own_gamma
+    if a < 0.0 and (
+        obs.own_gamma > math.radians(8.0)
+        or vel_el_error < math.radians(-20.0)
+    ):
+        # 机头已经抬高、或目标明显在下方：此时必须推杆。旧实现只在
+        # gamma>30° 时才肯推杆，目标在正下方而 gamma 还只有 20–30° 时
+        # 会被下面的 max(a, 0.12) 强制拉成正升力，飞机只能一路抬头
+        # 爬升，最后失速。
+        # 门限不能放到任意小的俯仰误差上：高速平飞/下滑时视线在机头
+        # 附近来回穿越零点，负过载与正过载会以 1 Hz 左右来回切换，
+        # 反而变成更明显的俯仰抖动。
         return Action(
             bank=0.0,
             n=clamp(a, -2.5, -0.05),
@@ -1161,15 +1188,13 @@ class TacticalAgent:
     def _apply_canard(self, act: Action, obs: Observation) -> Action:
         """全动鸭翼的战术层调度：配平交给内回路，这里只给显式干预。
 
-        - 高过载大坡度：给一点对称抬头偏度（涡调度），配合主翼升力；
-        - 滚转：坡度误差较大时用差动鸭翼辅助，减轻副翼在大迎角下的权限不足。
+        鸭翼同时承担俯仰配平和涡升力，内回路每步都会按当前迎角/过载反解
+        需要的偏度。战术层若再用 25% 的固定偏度覆盖它，会和内回路抢控制权：
+        过载在门限附近时指令来回切换，飞机会持续俯仰抖动。这里只保留
+        差动鸭翼的滚转辅助，对称偏度完全交给飞控。
         """
         if not obs.own_canard:
             return act
-        # 高过载大坡度：给一点对称抬头偏度（涡调度），配合主翼升力。
-        # 常规配平与过失速段的力矩求解都交给内回路，避免战术层与飞控打架。
-        if act.canard is None and act.n > 4.0 and abs(act.bank) >= 0.75:
-            act.canard = 0.25
         if not act.roll_free:
             phi_cmd = (
                 -clamp(act.bank, -math.pi / MAX_BANK, math.pi / MAX_BANK)
@@ -2304,6 +2329,15 @@ class TacticalAgent:
             return "BREAK" if (vs_missile or ir) else "BEAM"
         return self._pick_maneuver(cands, None, obs, vs_missile)
 
+    @staticmethod
+    def _super_capable(obs: Observation) -> bool:
+        """是否具备超机动能力：6DOF 内核下的矢量喷口或全动鸭翼。
+
+        这类机型在过失速段仍能靠喷流偏转/鸭翼产生操纵力矩与额外升力，
+        垂直机动的拉起段不必完全依赖动能，因此殷麦曼/筋斗的门限可以放宽。
+        """
+        return obs.dof >= 6 and (obs.own_tvc or obs.own_canard)
+
     def _vertical_climb_ok(self, obs: Observation) -> bool:
         """垂直机动的高度增量能否只用“多余动能”付清。
 
@@ -2313,6 +2347,7 @@ class TacticalAgent:
         过顶前速度就会被抽到失速附近，剩下的只是高航迹角上的盘旋滑落
         （14 km、2.3 倍失速时拉 5 g：2R ≈ 5.0 km，可用动能只有 5.4 km，
         占 93%，必然做不完）。过载够不够只是必要条件，这一条是能量上的充分性。
+        对矢量喷口/全动鸭翼机型，这个裕度放宽到 90%。
         """
         v = obs.own_speed
         v_stall = v / max(obs.own_speed_frac, 1e-3)
@@ -2320,7 +2355,11 @@ class TacticalAgent:
         r = v * v / (G * math.sqrt(max(n * n - 1.0, 1.0)))
         climb = 2.0 * r
         avail = max((v * v - v_stall * v_stall), 0.0) / (2.0 * G)
-        return climb <= VERTICAL_CLIMB_MARGIN * avail
+        margin = (
+            VERTICAL_CLIMB_MARGIN_SUPER if self._super_capable(obs)
+            else VERTICAL_CLIMB_MARGIN
+        )
+        return climb <= margin * avail
 
     def _defense_ok(self, primitive: str, obs: Observation) -> bool:
         """防御机动的准入条件，全部取自机动层的能力声明。"""
@@ -2354,7 +2393,11 @@ class TacticalAgent:
         # 垂直机动要连续数秒拉 6 g 以上才能过顶。可用过载不足时拉不起
         # 半圈，动作会退化成“大坡度缓爬 + 持续掉速”，最后挂在高航迹角
         # 上滑落（高空低动压时的典型表现）。宁可改做水平/下降类规避。
-        if m.min_n_avail and obs.own_n_avail < m.min_n_avail:
+        # 矢量喷口/全动鸭翼机型在过失速段还能补力矩，门限按比例折减。
+        need_n = m.min_n_avail
+        if need_n and self._super_capable(obs):
+            need_n *= SUPER_VERTICAL_N_FACTOR
+        if need_n and obs.own_n_avail < need_n:
             return False
         # 过载够只是必要条件：还要有多余动能把 2R 的爬升付清。
         if m.ps_positive and primitive in ("IMMELMANN", "LOOP") and not (
@@ -2589,7 +2632,9 @@ class TacticalAgent:
             "HIGH_G_SPLIT_S": self._high_g_split_s,
             "HIGH_G_BARREL": self._high_g_barrel,
             "BEAM": self._beam,
-            "PURE": lambda o: pursuit_action(o, o.off_az, o.off_el),
+            "PURE": lambda o: pursuit_action(
+                o, o.off_az, o.los_el - o.own_gamma,
+            ),
             "LEAD": lambda o: pursuit_action(o, *lead_point(o, 1.0)),
             "LAG": lambda o: pursuit_action(o, *lead_point(o, -0.6)),
             "GUN_LEAD": self._gun_lead_action,
@@ -2620,7 +2665,7 @@ class TacticalAgent:
             return self._press_turn(obs)
         fn = self._maneuvers.get(primitive)
         if fn is None:
-            return aim_action(obs, obs.off_az, obs.off_el)
+            return aim_action(obs, obs.off_az, obs.los_el - obs.own_gamma)
         return fn(obs)
 
     def _press_turn(self, obs: Observation) -> Action:
@@ -2632,7 +2677,10 @@ class TacticalAgent:
         _limit_energy 的低速保护约束），掉头时间压到 20 s 以内，双方才能
         真正建立起接近率。
         """
-        act = aim_action(obs, obs.off_az, obs.off_el, gain=3.0, throttle=1.0)
+        act = aim_action(
+            obs, obs.off_az, obs.los_el - obs.own_gamma,
+            gain=3.0, throttle=1.0,
+        )
         cap = min(obs.own_n_avail, max(obs.own_n_sustain * 1.6, 4.0))
         if act.n > cap:
             act.n = cap

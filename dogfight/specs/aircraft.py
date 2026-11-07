@@ -34,6 +34,10 @@ class AircraftSpec:
     cd0: float                  # 零升阻力系数
     aspect_ratio: float         # 展弦比
     oswald: float = 0.8
+    # 空机 + 燃油质量 kg（不含挂载）。挂载由场景配置给出，作战全重
+    # mass = base_mass + loadout.weapon_mass，因此同一机体在不同场景可以
+    # 挂不同弹而得到不同的全重。0 表示未区分，直接沿用 mass。
+    base_mass: float = 0.0
     hp_max: float = 100.0
     gun_range: float = 900.0    # m
     gun_cone: float = math.radians(8.0)
@@ -136,6 +140,33 @@ class AircraftSpec:
     canard_cl_bonus: float = 0.0
     canard_alpha_max: float = 0.0             # 涡强饱和的鸭翼当地迎角 rad
     canard_stall_shift: float = 0.0           # 满涡时主翼失速角右移量 rad
+
+    # ---- 主翼后缘可动翼面（襟副翼/升降副翼） ----
+    # 所有战斗机的主翼后缘都有可动翼面。它们既参与襟翼增升，也能对称偏转
+    # 提供俯仰力矩；对无平尾的 J-20 来说，这是鸭翼之外唯一的俯仰操纵面。
+    elevon: bool = True
+    # 后缘可动翼面总面积与主翼面积之比 S_e/S。
+    elevon_area_ratio: float = 0.10
+    # 气动中心到重心的距离，按主翼平均气动弦长归一化（正=在重心之后）。
+    elevon_arm_ratio: float = 0.35
+    elevon_deflect_max: float = math.radians(20.0)   # 最大偏度 rad
+    elevon_rate_max: float = math.radians(55.0)      # 最大偏转速率 rad/s
+    elevon_tau: float = 0.08                         # 作动器一阶时间常数 s
+    elevon_cl_alpha: float = 2.6                     # 偏度升力线斜率 1/rad
+    elevon_cl_max: float = 1.0                       # 偏转产生的 CLmax
+    elevon_deflect_drag: float = 0.05                # 每 rad² 的偏转阻力
+
+    # ---- 全动垂尾（J-20 / Su-57） ----
+    # 全动垂尾绕整片翼面转轴偏转，偏航权限由整片面积产生，而不是只有
+    # 后缘方向舵；下面的几何/操纵参数缺省为 0，只有 all_moving_fin=True
+    # 且配置了面积/力臂时才会产生偏航力矩。
+    all_moving_fin: bool = False
+    fin_area_ratio: float = 0.0               # 两片垂尾总面积/主翼面积
+    fin_arm_ratio: float = 0.0                # 垂尾气动中心到重心距离/平均气动弦
+    fin_deflect_max: float = math.radians(20.0)
+    fin_rate_max: float = math.radians(45.0)
+    fin_tau: float = 0.10
+    fin_cn_alpha: float = 1.6                 # 整片垂尾侧力斜率 1/rad
 
     # ---- 挂载：近距弹 / 中距弹 / 干扰物 ----
     loadout: Loadout = Loadout()
@@ -261,6 +292,31 @@ class AircraftSpec:
         cl_stall = clamp(cl_stall, -self.canard_cl_max, self.canard_cl_max)
         decay = max(0.35, 1.0 - 1.6 * (a_abs - self.canard_alpha_stall))
         return math.copysign(cl_stall * decay, alpha_c)
+
+    # ---- 主翼后缘可动翼面 / 全动垂尾几何 ----
+    @property
+    def elevon_area(self) -> float:
+        """两侧后缘可动翼面的总面积 m²。"""
+        if not self.elevon:
+            return 0.0
+        return max(0.0, self.elevon_area_ratio) * self.wing_area
+
+    @property
+    def elevon_arm(self) -> float:
+        """后缘翼面气动中心到重心的力臂 m（正=在重心之后）。"""
+        return max(0.0, self.elevon_arm_ratio) * self.chord
+
+    @property
+    def fin_area(self) -> float:
+        """两片全动垂尾的总面积 m²。"""
+        if not self.all_moving_fin:
+            return 0.0
+        return max(0.0, self.fin_area_ratio) * self.wing_area
+
+    @property
+    def fin_arm(self) -> float:
+        """垂尾气动中心到重心的力臂 m（正=在重心之后）。"""
+        return max(0.0, self.fin_arm_ratio) * self.chord
 
     def wing_cl_at(self, alpha: float, mach: float, *,
                    boost: float = 0.0, stall_shift: float = 0.0,

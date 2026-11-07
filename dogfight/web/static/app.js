@@ -945,6 +945,7 @@
         assignMissileUV(geo.body);
         missileShared.add(geo.body);
         missileShared.add(geo.canopy);
+        missileShared.add(geo.stores);
         MISSILE_GEOS[name] = geo;
       }),
     ];
@@ -956,6 +957,7 @@
     const groups = {
       body: { pos: [], count: 0 },
       canopy: { pos: [], count: 0 },
+      stores: { pos: [], count: 0 },
     };
     let material = "body";
     const lines = text.split(/\r?\n/);
@@ -967,7 +969,7 @@
         verts.push([+parts[1], +parts[2], +parts[3]]);
       } else if (raw.startsWith("usemtl ")) {
         const name = raw.slice(7).trim();
-        material = name === "canopy" ? "canopy" : "body";
+        material = (name === "canopy" || name === "stores") ? name : "body";
       } else if (kind === "f ") {
         const idx = raw.trim().split(/\s+/).slice(1)
           .map((tok) => parseInt(tok.split("/")[0], 10) - 1);
@@ -984,7 +986,7 @@
       }
     }
     const out = {};
-    for (const key of ["body", "canopy"]) {
+    for (const key of ["body", "canopy", "stores"]) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.Float32BufferAttribute(groups[key].pos, 3));
       geo.computeVertexNormals();
@@ -1027,11 +1029,75 @@
     };
   }
 
-  function camoCanvas() {
+  function camoCanvas(size = CAMO_TEX_SIZE) {
     const cv = document.createElement("canvas");
-    cv.width = CAMO_TEX_SIZE;
-    cv.height = CAMO_TEX_SIZE;
+    cv.width = size;
+    cv.height = size;
     return cv;
+  }
+
+  // J-20 实机涂装：读取 assets/aircraft/J20涂装贴图.png，保留原图软边块形，
+  // 把亮度重映射到 J20涂装.jpg 的深灰蓝区间（暗部 #444b53、亮部 #7d858e）。
+  // 贴图加载是异步的：先把画布填成中性深灰，加载完成后再重绘并触发上传。
+  function paintJ20Texture(url, cv, tex) {
+    const g = cv.getContext("2d");
+    const S = cv.width;
+    g.fillStyle = "#5b636c";
+    g.fillRect(0, 0, S, S);
+    const img = new Image();
+    img.onload = () => {
+      // 源图是 2×2 四象限图集，直接整图缩放会把四块接缝投到机身上，
+      // 看起来像被切成四个不连续的象限。这里只取左上象限作为连续花纹。
+      const sw = Math.max(1, Math.floor(img.width / 2));
+      const sh = Math.max(1, Math.floor(img.height / 2));
+      g.drawImage(img, 0, 0, sw, sh, 0, 0, S, S);
+      const frame = g.getImageData(0, 0, S, S);
+      const d = frame.data;
+      const lo = [56, 63, 72];
+      const hi = [110, 118, 127];
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) / 255;
+        // 原图亮度集中在 0.55–0.9，先拉开对比再压进深灰区间。
+        const t = clamp((lum - 0.46) / 0.42, 0.0, 1.0);
+        d[i] = lo[0] + (hi[0] - lo[0]) * t;
+        d[i + 1] = lo[1] + (hi[1] - lo[1]) * t;
+        d[i + 2] = lo[2] + (hi[2] - lo[2]) * t;
+      }
+      g.putImageData(frame, 0, 0);
+      // 极淡的蒙皮分块线，避免大面积纯色显得像塑料。
+      const rnd = camoRng(97);
+      g.strokeStyle = "rgba(44, 50, 58, 0.16)";
+      g.lineWidth = 1;
+      for (let i = 0; i < 40; i += 1) {
+        const x = rnd() * S;
+        const y = rnd() * S;
+        const len = 40 + rnd() * 130;
+        g.beginPath();
+        g.moveTo(x, y);
+        g.lineTo(x + (rnd() < 0.5 ? len : 0), y + (rnd() < 0.5 ? len : 0));
+        g.stroke();
+      }
+      tex.needsUpdate = true;
+    };
+    img.onerror = () => {
+      // 贴图缺失时保持中性深灰，至少不出现白机。
+      tex.needsUpdate = true;
+    };
+    img.src = url;
+  }
+
+  let camoBlankTexture = null;
+
+  function blankTexture() {
+    if (!camoBlankTexture) {
+      const cv = camoCanvas(1);
+      const g = cv.getContext("2d");
+      g.fillStyle = "#ffffff";
+      g.fillRect(0, 0, 1, 1);
+      camoBlankTexture = new THREE.CanvasTexture(cv);
+      camoBlankTexture.needsUpdate = true;
+    }
+    return camoBlankTexture;
   }
 
   // 贴图边缘无缝平铺：同一笔在 3x3 邻域重复绘制。
@@ -1220,31 +1286,55 @@
     };
   }
 
+  // 机头雷达罩分界：从机头起约 11%（camoFz = -0.5 + 0.11 = -0.39）。
+  // 过渡带只有 0.01 个机身长（约 20 cm），形成清晰的雷达罩分界线。
+  const RADOME_EDGE = [-0.395, -0.385];
+
+  // 垂尾国籍标识：mark 为 cn / us / ru；markCenter 是（three.js 局部 z, 上方向 y）
+  // 的标识中心，markSize 为标识半径（m），markLateral 限定垂尾所在的 |x| 区间，
+  // 避免把标识同时画到机身侧面。
   const CAMO_SPECS = {
     "F-16V": { draw: f16CamoTexture, tile: 4.0, len: 15.06, seed: 3,
       nose: [64, 70, 78], noseAmt: 1.0, tint: 0.0, base: [148, 130, 98],
-      rim: 0.42, glow: 0.75 },
+      rim: 0.42, glow: 0.75, mark: "us", markCenter: [6.8, 1.60],
+      markSize: 0.72, markLateral: [0.0, 0.40] },
     "SU-57": { draw: su57CamoTexture, tile: 9.2, len: 20.1, seed: 17,
-      nose: [148, 156, 165], noseAmt: 0.85, tint: 0.26, rim: 0.85, glow: 0.5 },
-    // J-20：银灰机身 + 深蓝灰大斑块（参考图一）
-    "J-20A": { draw: grayCamoTexture({ base: "#c3cbd3", dark: "#7b8794",
-        dark2: "#67727f", light: "#e4e9ee" }), tile: 9.0, len: 21.2, seed: 41,
-      nose: [116, 124, 134], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
-    "J-20S": { draw: grayCamoTexture({ base: "#c3cbd3", dark: "#7b8794",
-        dark2: "#67727f", light: "#e4e9ee" }), tile: 9.0, len: 21.2, seed: 41,
-      nose: [116, 124, 134], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
-    // F-15C：浅灰空优双色（参考图二上）
-    "F-15C": { draw: grayCamoTexture({ base: "#aab4bc", dark: "#87939e",
-        dark2: "#7a8792", light: "#cdd5da" }), tile: 7.6, len: 19.43, seed: 52,
-      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
+      nose: [148, 156, 165], noseAmt: 0.85, tint: 0.26, rim: 0.85, glow: 0.5,
+      mark: "ru", markCenter: [5.95, 1.00], markSize: 0.80,
+      markLateral: [2.60, 3.90] },
+    // J-20：直接使用 assets/aircraft/J20涂装贴图.png 的软边块形，
+    // 颜色重映射为 J20涂装.jpg 的深灰蓝。雷达罩为深灰，分界按实机取 11%。
+    // neutral：机体完全不叠加队伍色（底色、自发光、轮廓光都改为中性）。
+    "J-20A": { image: "assets/aircraft/J20涂装贴图.png", tile: 9.0, len: 21.2,
+      seed: 41, base: [255, 255, 255], nose: [58, 63, 70], noseAmt: 1.0,
+      noseEdge: RADOME_EDGE, tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      mark: "cn", markCenter: [9.12, 1.28], markSize: 0.85,
+      markLateral: [2.10, 3.40] },
+    "J-20S": { image: "assets/aircraft/J20涂装贴图.png", tile: 9.0, len: 21.2,
+      seed: 41, base: [255, 255, 255], nose: [58, 63, 70], noseAmt: 1.0,
+      noseEdge: RADOME_EDGE, tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      mark: "cn", markCenter: [9.12, 1.28], markSize: 0.85,
+      markLateral: [2.10, 3.40] },
+    // F-15C：蓝灰空优双色（参考图二上）
+    "F-15C": { draw: grayCamoTexture({ base: "#175c97ff", dark: "#212527ff",
+        dark2: "#0f3654ff", light: "#040404ff" }), tile: 7.6, len: 19.43, seed: 52,
+      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7,
+      mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
+      markLateral: [1.55, 2.00] },
     // F-15E：深蓝灰打击型（参考图二中）
-    "F-15E": { draw: grayCamoTexture({ base: "#77828d", dark: "#5b6671",
-        dark2: "#4f5a65", light: "#98a3ac" }), tile: 7.6, len: 19.43, seed: 63,
-      nose: [42, 46, 52], noseAmt: 1.0, tint: 0.0, rim: 0.6, glow: 0.7 },
-    // F-15EX：蓝灰 + 深色斑块（参考图二下）
-    "F-15EX": { draw: grayCamoTexture({ base: "#8b96a2", dark: "#68737f",
-        dark2: "#5c6773", light: "#aeb8c1" }), tile: 7.6, len: 19.43, seed: 74,
-      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7 },
+    "F-15E": { draw: grayCamoTexture({ base: "#175c97ff", dark: "#212527ff",
+        dark2: "#0f3654ff", light: "#040404ff" }), tile: 7.6, len: 19.43, seed: 63,
+      nose: [42, 46, 52], noseAmt: 1.0, tint: 0.0, rim: 0.6, glow: 0.7,
+      mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
+      markLateral: [1.55, 2.00] },
+    // F-15EX：不用迷彩，机翼中央灰蓝 → 翼尖灰的横向渐变（整体压深）。
+    // halfSpan 为机体半翼展（m），渐变按 three.js 局部 x（机体横向）计算。
+    "F-15EX": { gradient: ["#3d566e", "#5b6167"], halfSpan: 6.53,
+      tile: 7.6, len: 19.43, seed: 74, base: [255, 255, 255],
+      nose: [52, 56, 62], noseAmt: 1.0, noseEdge: RADOME_EDGE,
+      tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
+      markLateral: [1.55, 2.00] },
   };
   const camoTextures = {};
   const camoMaterials = {};
@@ -1252,12 +1342,26 @@
   function camoTexture(name) {
     if (!camoTextures[name]) {
       const spec = CAMO_SPECS[name];
-      const tex = new THREE.CanvasTexture(spec.draw(CAMO_SEED + spec.seed));
-      tex.wrapS = THREE.RepeatWrapping;
-      tex.wrapT = THREE.RepeatWrapping;
-      tex.anisotropy = 4;
-      tex.needsUpdate = true;
-      camoTextures[name] = tex;
+      if (spec.image) {
+        const cv = camoCanvas(1024);
+        const tex = new THREE.CanvasTexture(cv);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.anisotropy = 8;
+        tex.needsUpdate = true;
+        paintJ20Texture(spec.image, cv, tex);
+        camoTextures[name] = tex;
+      } else if (spec.draw) {
+        const tex = new THREE.CanvasTexture(spec.draw(CAMO_SEED + spec.seed));
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.anisotropy = 4;
+        tex.needsUpdate = true;
+        camoTextures[name] = tex;
+      } else {
+        // 渐变涂装不采样贴图，绑定 1x1 白纹理占位。
+        camoTextures[name] = blankTexture();
+      }
     }
     return camoTextures[name];
   }
@@ -1267,25 +1371,47 @@
     const cached = camoMaterials[key];
     if (cached) return cached;
     const part = CAMO_SPECS[name] || CAMO_SPECS["SU-57"];
-    const tint = Math.min(0.34, part.tint);
-    const rimColor = new THREE.Color(rgbHex(mix(RGB.TEAM[team], [255, 255, 255], 0.35)));
+    // neutral：该机不叠加任何队伍色（涂装按真实配色呈现）。
+    const neutral = part.neutral === true;
+    const tint = neutral ? 0.0 : Math.min(0.34, part.tint);
+    const rimColor = new THREE.Color(rgbHex(
+      neutral ? [214, 219, 225] : mix(RGB.TEAM[team], [255, 255, 255], 0.35)
+    ));
     const mat = new THREE.MeshStandardMaterial({
       color: new THREE.Color(rgbHex(mix(part.base || [255, 255, 255], RGB.TEAM[team], tint))),
       roughness: 0.80,
       metalness: 0.03,
-      emissive: new THREE.Color(rgbHex(mix(RGB.TEAM[team], [255, 255, 255], part.glow ?? 0.5))),
-      emissiveIntensity: 0.05,
+      emissive: new THREE.Color(rgbHex(
+        neutral ? [0, 0, 0] : mix(RGB.TEAM[team], [255, 255, 255], part.glow ?? 0.5)
+      )),
+      emissiveIntensity: neutral ? 0.0 : 0.05,
       side: THREE.DoubleSide,
     });
     const noseVec = new THREE.Vector3(
       part.nose[0] / 255, part.nose[1] / 255, part.nose[2] / 255
     );
+    const noseEdge = part.noseEdge || [-0.42, -0.35];
+    const gradA = new THREE.Color(part.gradient ? part.gradient[0] : "#ffffff");
+    const gradB = new THREE.Color(part.gradient ? part.gradient[1] : "#ffffff");
+    const MARK_KINDS = { cn: 1.0, ru: 2.0, us: 3.0 };
+    const markCenter = part.markCenter || [0.0, 0.0];
+    const markLat = part.markLateral || [0.0, 0.0];
     mat.onBeforeCompile = (shader) => {
       shader.uniforms.uCamoTex = { value: camoTexture(name) };
       shader.uniforms.uCamoScale = { value: 1.0 / part.tile };
       shader.uniforms.uCamoLen = { value: part.len };
+      shader.uniforms.uCamoMode = { value: part.gradient ? 1.0 : 0.0 };
+      shader.uniforms.uGradCenter = { value: gradA };
+      shader.uniforms.uGradEdge = { value: gradB };
+      shader.uniforms.uHalfSpan = { value: part.halfSpan || 6.5 };
       shader.uniforms.uNoseColor = { value: noseVec };
       shader.uniforms.uNoseAmt = { value: part.noseAmt };
+      shader.uniforms.uNoseEdge0 = { value: noseEdge[0] };
+      shader.uniforms.uNoseEdge1 = { value: noseEdge[1] };
+      shader.uniforms.uMarkKind = { value: MARK_KINDS[part.mark] || 0.0 };
+      shader.uniforms.uMarkCenter = { value: new THREE.Vector2(markCenter[0], markCenter[1]) };
+      shader.uniforms.uMarkSize = { value: part.markSize || 0.6 };
+      shader.uniforms.uMarkLat = { value: new THREE.Vector2(markLat[0], markLat[1]) };
       shader.uniforms.uRimColor = { value: rimColor };
       shader.uniforms.uRimAmt = { value: part.rim ?? 0.85 };
       shader.vertexShader = `varying vec3 vCamoPos;
@@ -1308,10 +1434,47 @@ varying vec3 vRimV;
 uniform sampler2D uCamoTex;
 uniform float uCamoScale;
 uniform float uCamoLen;
+uniform float uCamoMode;
+uniform vec3 uGradCenter;
+uniform vec3 uGradEdge;
+uniform float uHalfSpan;
 uniform vec3 uNoseColor;
 uniform float uNoseAmt;
+uniform float uNoseEdge0;
+uniform float uNoseEdge1;
+uniform float uMarkKind;
+uniform vec2 uMarkCenter;
+uniform float uMarkSize;
+uniform vec2 uMarkLat;
 uniform vec3 uRimColor;
 uniform float uRimAmt;
+
+float camoFill(float d, float w) {
+  return 1.0 - smoothstep(-w, w, d);
+}
+// 正五角星 SDF（iq）：r 为外接半径，rf 控制内凹深度（0.4–0.5）。
+float camoStar5(vec2 p, float r, float rf) {
+  const vec2 k1 = vec2(0.809016994375, -0.587785252292);
+  const vec2 k2 = vec2(-k1.x, k1.y);
+  p.x = abs(p.x);
+  p -= 2.0 * max(dot(k1, p), 0.0) * k1;
+  p -= 2.0 * max(dot(k2, p), 0.0) * k2;
+  p.x = abs(p.x);
+  p.y -= r;
+  vec2 ba = rf * vec2(-k1.y, k1.x) - vec2(0.0, 1.0);
+  float h = clamp(dot(p, ba) / dot(ba, ba), 0.0, r);
+  return length(p - ba * h) * sign(p.y * ba.x - p.x * ba.y);
+}
+// 凸四边形（顶点按逆时针给出）：取四条边外侧半平面距离的最大值。
+// 角点处会略低估距离，但符号正确，用来做填充边界不会漏笔。
+float camoQuad(vec2 p, vec2 a, vec2 b, vec2 c, vec2 d) {
+  vec2 n0 = vec2(b.y - a.y, a.x - b.x);
+  vec2 n1 = vec2(c.y - b.y, b.x - c.x);
+  vec2 n2 = vec2(d.y - c.y, c.x - d.x);
+  vec2 n3 = vec2(a.y - d.y, d.x - a.x);
+  return max(max(dot(p - a, normalize(n0)), dot(p - b, normalize(n1))),
+             max(dot(p - c, normalize(n2)), dot(p - d, normalize(n3))));
+}
 ${shader.fragmentShader}`;
       shader.fragmentShader = shader.fragmentShader.replace(
         "#include <map_fragment>",
@@ -1324,10 +1487,76 @@ ${shader.fragmentShader}`;
   vec3 camoCol = texture2D(uCamoTex, camoP.zy).rgb * camoW.x
     + texture2D(uCamoTex, camoP.xz).rgb * camoW.y
     + texture2D(uCamoTex, camoP.xy).rgb * camoW.z;
-  diffuseColor.rgb *= camoCol;
+  vec3 camoBody = diffuseColor.rgb * camoCol;
+  if (uCamoMode > 0.5) {
+    // 翼展方向渐变：机体中线（|x| 小）灰蓝，翼尖灰。
+    float camoT = smoothstep(0.10, 1.0, clamp(abs(vCamoPos.x) / uHalfSpan, 0.0, 1.0));
+    camoBody = mix(uGradCenter, uGradEdge, camoT);
+  }
   float camoFz = vCamoPos.z / uCamoLen;
-  float camoNose = (1.0 - smoothstep(-0.42, -0.35, camoFz)) * uNoseAmt;
-  diffuseColor.rgb = mix(diffuseColor.rgb, uNoseColor, camoNose);`
+  float camoNose = (1.0 - smoothstep(uNoseEdge0, uNoseEdge1, camoFz)) * uNoseAmt;
+  diffuseColor.rgb = mix(camoBody, uNoseColor, camoNose);
+
+  // 垂尾国籍标识：仅画在垂尾外侧的平面上。
+  if (uMarkKind > 0.5) {
+    vec2 mp = (vec2(vCamoPos.z, vCamoPos.y) - uMarkCenter) / uMarkSize;
+    float latGate = smoothstep(uMarkLat.x - 0.08, uMarkLat.x + 0.08, abs(vCamoPos.x))
+      * (1.0 - smoothstep(uMarkLat.y - 0.08, uMarkLat.y + 0.08, abs(vCamoPos.x)));
+    float gate = smoothstep(0.40, 0.58, camoN.x) * latGate
+      * (1.0 - smoothstep(1.38, 1.52, abs(mp.x)))
+      * (1.0 - smoothstep(0.84, 0.96, abs(mp.y)));
+    if (gate > 0.002) {
+      float w = 0.03;
+      vec3 mk = diffuseColor.rgb;
+      if (uMarkKind < 1.5) {
+        // 中国空军“八一”军徽：全部尺寸来自参考图的像素量测（外接半径 R=1）。
+        // 金边星 1.0R、红底星 0.746R、内凹 0.384；横条金边 ±1.1015R、红芯 ±1.063R，
+        // 金边半高 0.297R、红芯半高 0.230R，整条比星心低约 0.045R。
+        // 换算到 shader：mp 空间 1 单位 = 2R，故外接半径 0.500。
+        vec3 cnGold = mix(vec3(0.60, 0.53, 0.33), diffuseColor.rgb, 0.18);
+        vec3 cnRed = mix(vec3(0.48, 0.19, 0.20), diffuseColor.rgb, 0.15);
+        float cnBarHi = max(abs(mp.y + 0.025) - 0.1490, abs(mp.x) - 1.1015);
+        float cnBarIn = max(abs(mp.y + 0.025) - 0.1130, abs(mp.x) - 1.0630);
+        mk = mix(mk, cnGold, camoFill(cnBarHi, w));
+        mk = mix(mk, cnRed, camoFill(cnBarIn, w));
+        mk = mix(mk, cnGold, camoFill(camoStar5(mp, 0.500, 0.384), w));
+        mk = mix(mk, cnRed, camoFill(camoStar5(mp, 0.373, 0.384), w));
+        // “八一”按笔画逐条量测重建（单位 R，q = mp*2）：
+        // 上横、右捺（上/中/尖三段）、左撇（上/尖两段）、下横及其右端上挑。
+        vec2 q = mp * 2.0;
+        float cnBa = camoQuad(q, vec2(-0.148, 0.119), vec2(0.129, 0.114),
+                                 vec2(0.152, 0.157), vec2(-0.160, 0.172));
+        cnBa = min(cnBa, camoQuad(q, vec2(0.072, 0.090), vec2(0.136, 0.090),
+                                     vec2(0.098, 0.212), vec2(0.086, 0.212)));
+        cnBa = min(cnBa, camoQuad(q, vec2(0.115, -0.014), vec2(0.220, -0.014),
+                                     vec2(0.136, 0.090), vec2(0.072, 0.090)));
+        cnBa = min(cnBa, camoQuad(q, vec2(0.158, -0.072), vec2(0.172, -0.072),
+                                     vec2(0.220, -0.014), vec2(0.115, -0.014)));
+        cnBa = min(cnBa, camoQuad(q, vec2(-0.168, -0.030), vec2(-0.103, -0.030),
+                                     vec2(-0.046, 0.083), vec2(-0.127, 0.083)));
+        cnBa = min(cnBa, camoQuad(q, vec2(-0.194, -0.072), vec2(-0.180, -0.072),
+                                     vec2(-0.103, -0.030), vec2(-0.168, -0.030)));
+        cnBa = min(cnBa, camoQuad(q, vec2(-0.155, -0.208), vec2(0.131, -0.208),
+                                     vec2(0.192, -0.155), vec2(-0.184, -0.155)));
+        cnBa = min(cnBa, camoQuad(q, vec2(0.110, -0.160), vec2(0.192, -0.160),
+                                     vec2(0.156, -0.116), vec2(0.146, -0.116)));
+        mk = mix(mk, cnGold, camoFill(cnBa, 0.020));
+      } else if (uMarkKind < 2.5) {
+        // 俄罗斯空军：白、蓝、红三层描边的红星。
+        mk = mix(mk, vec3(0.93, 0.94, 0.95), camoFill(camoStar5(mp, 0.52, 0.43), w));
+        mk = mix(mk, vec3(0.10, 0.24, 0.55), camoFill(camoStar5(mp, 0.47, 0.43), w));
+        mk = mix(mk, vec3(0.78, 0.09, 0.10), camoFill(camoStar5(mp, 0.41, 0.43), w));
+      } else {
+        // 美国空军：蓝圆盘 + 白五星 + 白条。
+        float bar = max(abs(mp.y) - 0.11, abs(mp.x) - 1.00);
+        float disc = length(mp) - 0.52;
+        mk = mix(mk, vec3(0.92, 0.93, 0.95), camoFill(bar, w));
+        mk = mix(mk, vec3(0.09, 0.22, 0.55), camoFill(disc, w));
+        mk = mix(mk, vec3(0.95, 0.96, 0.97), camoFill(camoStar5(mp, 0.45, 0.43), w));
+      }
+      diffuseColor.rgb = mix(diffuseColor.rgb, mk, gate);
+    }
+  }`
       );
       // 掠射边缘的 Fresnel 轮廓光：任何背景下机体边缘都有一圈队伍色亮边。
       shader.fragmentShader = shader.fragmentShader.replace(
@@ -1357,6 +1586,13 @@ ${shader.fragmentShader}`;
     color: new THREE.Color(rgbHex(RGB.CLAY_AO)),
     roughness: 0.80,
     metalness: 0.05,
+    side: THREE.DoubleSide,
+  });
+  // 外挂物（导弹/副油箱/挂架）：统一的中性浅灰金属色，与机体迷彩区分开。
+  const storesMat = new THREE.MeshStandardMaterial({
+    color: 0xd3d7db,
+    roughness: 0.55,
+    metalness: 0.35,
     side: THREE.DoubleSide,
   });
 
@@ -1792,6 +2028,7 @@ ${shader.fragmentShader}`;
       this.name = "";
       this.bodyMesh = null;
       this.canopyMesh = null;
+      this.storesMesh = null;
       this.flames = [];
       this.engineCount = -1;
       this.modelLen = REF_LENGTH;
@@ -1869,12 +2106,17 @@ ${shader.fragmentShader}`;
       this.modelGroup.clear();
       this.bodyMesh = null;
       this.canopyMesh = null;
+      this.storesMesh = null;
       this.flames = [];
       const geo = MODEL_GEOS[name];
       if (geo) {
         this.bodyMesh = new THREE.Mesh(geo.body, camoMaterial(this.team, name));
         this.canopyMesh = new THREE.Mesh(geo.canopy, canopyMat);
         this.modelGroup.add(this.bodyMesh, this.canopyMesh);
+        if (geo.stores && geo.stores.attributes.position.count > 0) {
+          this.storesMesh = new THREE.Mesh(geo.stores, storesMat);
+          this.modelGroup.add(this.storesMesh);
+        }
       }
       engines.forEach((eng, idx) => {
         const plume = makePlume(idx === 0 ? 0.35 : 1.75, ml);
@@ -3902,6 +4144,8 @@ ${shader.fragmentShader}`;
   const SIL_IMAGES = {};
   for (const [key, file] of Object.entries({
     "SU-57": "su57_top.png", "F-16V": "f16_top.png",
+    "J-20A": "j20a_top.png", "J-20S": "j20a_top.png",
+    "F-15C": "f15c_top.png", "F-15E": "f15ex_top.png", "F-15EX": "f15ex_top.png",
   })) {
     const img = new Image();
     img.src = `/assets/silhouettes/${file}`;
@@ -4060,6 +4304,7 @@ ${shader.fragmentShader}`;
     gl.flames = [];
     gl.body = null;
     gl.canopy = null;
+    gl.stores = null;
     const geo = MODEL_GEOS[ac.name];
     const ml = ac.model_len || REF_LENGTH;
     if (geo) {
@@ -4067,6 +4312,11 @@ ${shader.fragmentShader}`;
       gl.canopy = new THREE.Mesh(geo.canopy, canopyMat);
       gl.canopy.visible = !!ac.alive;
       gl.group.add(gl.body, gl.canopy);
+      if (geo.stores && geo.stores.attributes.position.count > 0) {
+        gl.stores = new THREE.Mesh(geo.stores, storesMat);
+        gl.stores.visible = !!ac.alive;
+        gl.group.add(gl.stores);
+      }
     }
     const engines = ac.engines || [];
     engines.forEach((eng, idx) => {
@@ -4101,6 +4351,7 @@ ${shader.fragmentShader}`;
     }
     if (gl.body) gl.body.material = ac.alive ? camoMaterial(ac.team, ac.name) : deadBodyMat;
     if (gl.canopy) gl.canopy.visible = !!ac.alive;
+    if (gl.stores) gl.stores.visible = !!ac.alive;
     gl.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
 
     const level = ac.alive ? clamp(ac.flame, 0, 1) : 0;
