@@ -24,8 +24,9 @@ assets/missiles/
 # 视觉金标截图（本地验收基线，体积大，不入库）
 docs/images/golden/
 
-# Web 前端启动时由 dogfight.view 导出的 three.js OBJ（生成物，不入库）
-dogfight/web/static/models/
+# Web 前端加载的 three.js OBJ（由 dogfight.view 从 assets/ 的源模型导出）。
+# 源模型体积大且不入库，这里导出后的精简版随仓库提供，保证 clone 下来即可渲染。
+# 改动导出规则后重新生成并提交这批文件。
 
 # 前端 1080p 采集上传的帧与编码视频（生成物，不入库）
 dogfight/web/captures/

@@ -154,6 +154,109 @@
   fillLight.position.copy(w2t([0.42, 0.36, -0.80]).multiplyScalar(1e6));
   scene.add(fillLight);
 
+  // ---------- P1.3 抗锯齿：屏幕空间 FXAA ----------
+  // MSAA（renderer 的 antialias）只抗几何边缘；尾焰、烟、发光带、细线这些
+  // 在片元里算出来的高频细节仍会闪。这里在 3D 层后补一遍 FXAA：
+  // ?fxaa=1 强制开、?fxaa=0 关闭；采集模式走软件光栅，默认关闭。
+  const FXAA_ON = (() => {
+    const v = new URLSearchParams(window.location.search).get("fxaa");
+    if (v === "1" || v === "on") return true;
+    if (v === "0" || v === "off") return false;
+    return !CAPTURE;
+  })();
+  const fxaaRT = new THREE.WebGLRenderTarget(2, 2, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: true,
+    stencilBuffer: false,
+    // WebGL2 下保留 MSAA：FXAA 只补细节，几何边缘仍交给多重采样。
+    samples: renderer.capabilities.isWebGL2 ? 4 : 0,
+  });
+  const fxaaScene = new THREE.Scene();
+  const fxaaCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const fxaaUniforms = {
+    uTex: { value: fxaaRT.texture },
+    uTexel: { value: new THREE.Vector2(1, 1) },
+  };
+  if (FXAA_ON) {
+    const quad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.ShaderMaterial({
+        uniforms: fxaaUniforms,
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec2 vUv;
+          uniform sampler2D uTex;
+          uniform vec2 uTexel;
+
+          float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+          void main() {
+            vec3 rgbM = texture2D(uTex, vUv).rgb;
+            float lM = luma(rgbM);
+            float lNW = luma(texture2D(uTex, vUv + vec2(-1.0, -1.0) * uTexel).rgb);
+            float lNE = luma(texture2D(uTex, vUv + vec2( 1.0, -1.0) * uTexel).rgb);
+            float lSW = luma(texture2D(uTex, vUv + vec2(-1.0,  1.0) * uTexel).rgb);
+            float lSE = luma(texture2D(uTex, vUv + vec2( 1.0,  1.0) * uTexel).rgb);
+
+            float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+            float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+            // 平坦区对比度不足时原样输出，避免整屏被抹糊。
+            if (lMax - lMin < max(0.0312, lMax * 0.125)) {
+              gl_FragColor = vec4(rgbM, 1.0);
+              return;
+            }
+
+            // 边缘方向：对角亮度差给出水平/垂直分量，归一化后限制在 8 texel。
+            vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+            float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+            float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+            dir = clamp(dir * rcpDirMin, -8.0, 8.0) * uTexel;
+
+            // 两档采样：A 偏锐、B 偏柔；B 越过局部亮度范围就退回 A。
+            vec3 rgbA = 0.5 * (texture2D(uTex, vUv + dir * (1.0 / 3.0 - 0.5)).rgb
+                             + texture2D(uTex, vUv + dir * (2.0 / 3.0 - 0.5)).rgb);
+            vec3 rgbB = rgbA * 0.5
+                      + 0.25 * (texture2D(uTex, vUv - dir * 0.5).rgb
+                              + texture2D(uTex, vUv + dir * 0.5).rgb);
+            float lB = luma(rgbB);
+            gl_FragColor = vec4((lB < lMin || lB > lMax) ? rgbA : rgbB, 1.0);
+          }
+        `,
+        depthTest: false,
+        depthWrite: false,
+      })
+    );
+    quad.frustumCulled = false;
+    fxaaScene.add(quad);
+  }
+
+  function resizeFxaa() {
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    fxaaRT.setSize(size.x, size.y);
+    fxaaUniforms.uTexel.value.set(1.0 / size.x, 1.0 / size.y);
+  }
+  resizeFxaa();
+
+  // 3D 层统一从这里出图：开 FXAA 时先渲染到离屏，再由全屏四边形合成到画布。
+  function renderFrame() {
+    if (!FXAA_ON) {
+      renderer.render(scene, camera);
+      return;
+    }
+    renderer.setRenderTarget(fxaaRT);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    renderer.render(fxaaScene, fxaaCam);
+  }
+
   // ---------- 战术地图地面 ----------
   // 分层：磨砂玻璃底台（含平面反射）→ 城市贴图 → 网格 → 边框/刻度 → 台面侧壁
   // → 扫描线。底台与地图都按世界米为单位，尺寸随 arena 缩放。
@@ -4692,6 +4795,7 @@ ${shader.fragmentShader}`;
     renderer.setSize(window.innerWidth, window.innerHeight, false);
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
+    resizeFxaa();
     resizeLabels();
     layoutAll();
     applyFloorSize();
@@ -4773,7 +4877,7 @@ ${shader.fragmentShader}`;
     updateCameraFrame();
     updateFloor(performance.now() / 1000.0);
     renderFloorReflection();
-    renderer.render(scene, camera);
+    renderFrame();
     if (!CAPTURE) drawLabels();
     if (CAPTURE) captureTick();
   }
