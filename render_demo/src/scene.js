@@ -151,7 +151,7 @@
     const key = new THREE.DirectionalLight(0xf6f9ff, 1.7);
     key.position.set(-16, 22, -14);
     if (castShadow) {
-      key.castShadow = true;
+      key.castShadow = !((q.get("dbg") || "").includes("noshadow"));
       key.shadow.mapSize.set(2048, 2048);
       const c = key.shadow.camera;
       c.left = -20; c.right = 20; c.top = 20; c.bottom = -20;
@@ -197,7 +197,8 @@
     j20: { file: "j20", label: "J-20", body: 0x454e58, seamZ: 1.55, seamX: 2.10 },
     f16: { file: "f16", label: "F-16C", body: 0x4b535c, seamZ: 1.20, seamX: 1.50 },
     f15: { file: "f15ex", label: "F-15EX", body: 0x49525b, seamZ: 1.45, seamX: 1.95 },
-    su57: { file: "su57", label: "Su-57", body: 0x47505b, seamZ: 1.50, seamX: 2.05 },
+    // Su-57 的 OBJ 把整个上半机身都归进了 canopy 分组，不能当座舱玻璃用
+    su57: { file: "su57", label: "Su-57", body: 0x47505b, seamZ: 1.50, seamX: 2.05, noCanopy: true },
   };
 
   function aircraftMaterials(mode, spec) {
@@ -218,7 +219,7 @@
       body: MAT.skinMaterial({
         color: spec.body, metalness: 0.34, roughness: 0.62,
         seamPeriodZ: spec.seamZ, seamPeriodX: spec.seamX, seamWidth: 0.024,
-        seamDark: 0.20, mottle: 0.025, roughSpread: 0.12,
+        seamDark: 0.0, mottle: 0.0, roughSpread: 0.0,
         clearcoat: 0.06, clearcoatRoughness: 0.85, envMapIntensity: 0.45,
         noseZ: spec.noseZ, radomeColor: 0x2b3137, radomeRough: 0.64,
         nozzleZ: spec.nozzleZ, nozzleColor: 0x4b4640,
@@ -234,7 +235,7 @@
 
   function buildAircraft(geoBody, geoCanopy, mode) {
     const group = new THREE.Group();
-    const body = MAT.weldAndSmooth(geoBody, 42);
+    const body = MAT.weldAndSmooth(geoBody, 72);
     body.computeBoundingBox();
     const bb = body.boundingBox;
     const len = bb.max.z - bb.min.z;
@@ -244,6 +245,10 @@
       nozzleZ: bb.max.z - len * 0.115,
     });
     const mats = aircraftMaterials(mode, spec);
+    if ((q.get("dbg") || "").includes("normals")) {
+      mats.body = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+      mats.canopy = mats.body;
+    }
 
     const meshes = {};
     const m = new THREE.Mesh(body, mats.body);
@@ -253,7 +258,7 @@
     if (!(q.get("dbg") || "").includes("bodyless")) group.add(m);
 
     let cbb = null;
-    if (geoCanopy && geoCanopy.attributes.position.count) {
+    if (geoCanopy && geoCanopy.attributes.position.count && !spec.noCanopy) {
       // 座舱：直接用模型自带的 canopy 分组（不做重放样、不开孔、不改位置）
       const cg = MAT.weldAndSmooth(geoCanopy, 34);
       cg.computeBoundingBox();
@@ -284,10 +289,10 @@
     const s = schemes[name] || schemes["R-73"];
     return {
       body: MAT.skinMaterial({
-        color: s.base, metalness: 0.38, roughness: 0.36,
+        color: s.base, metalness: 0.26, roughness: 0.46,
         seamPeriodZ: 0.30, seamPeriodX: 0.34, seamWidth: 0.006,
-        seamDark: 0.42, mottle: 0.03, roughSpread: 0.16,
-        clearcoat: 0.45, clearcoatRoughness: 0.22,
+        seamDark: 0.0, mottle: 0.0, roughSpread: 0.0,
+        clearcoat: 0.12, clearcoatRoughness: 0.55, envMapIntensity: 0.55,
       }),
       nose: MAT.dielectricMaterial(0x2f343a, 0.52),
       nozzle: MAT.nozzleMaterial(),
@@ -300,7 +305,7 @@
 
   function buildMissile(geo, name) {
     const g = new THREE.Group();
-    const body = MAT.weldAndSmooth(geo.body, 38);
+    const body = MAT.weldAndSmooth(geo.body, 80);
     body.computeBoundingBox();
     const bb = body.boundingBox;
     const len = bb.max.z - bb.min.z;
@@ -312,6 +317,10 @@
     ];
     const mats = missileMaterials(name);
     const parts = MAT.splitBy(body, 2, cuts);
+    if ((q.get("dbg") || "").includes("normals")) {
+      const nm = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+      mats.body = nm; mats.band = nm; mats.nose = nm; mats.nozzle = nm;
+    }
     const keys = ["nose", "band", "body", "nozzle"];
     parts.forEach((p, i) => {
       if (!p.attributes.position.count) return;
@@ -380,18 +389,18 @@
         const c = new THREE.Vector3();
         cbb.getCenter(c);
         cbb.getSize(size);
-        frame(c, [-0.46, 0.52, -0.72], Math.max(size.x, size.y, size.z) * 0.85, 30, 1.0);
+        frame(c, [-0.46, 0.52, -0.72], Math.max(size.x, size.y, size.z) * 1.45, 30, 1.0);
       } else {
         const c = new THREE.Vector3();
         bb.getCenter(c);
         bb.getSize(size);
         const half = size.length() / 2;
         if (view === "rear") {
-          frame(c, [0.55, 0.20, 0.80], half * 0.50, 32, 0.98);
+          frame(c, [0.60, 0.52, 0.61], half * 0.52, 32, 1.0);
         } else if (view === "detail") {
           frame(c, [-0.42, 0.30, -0.86], half * 0.40, 30, 1.0);
         } else {
-          frame(c, [-0.64, 0.34, -0.70], half * 0.55, 31, 1.0);
+          frame(c, [-0.64, 0.34, -0.70], half * 0.60, 31, 1.0);
         }
       }
       render();

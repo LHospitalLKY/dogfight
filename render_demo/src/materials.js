@@ -66,14 +66,22 @@
           const ax = fn[a * 3], ay = fn[a * 3 + 1], az = fn[a * 3 + 2];
           if (ax * fx + ay * fy + az * fz >= cosLim) { sx += ax; sy += ay; sz += az; }
         }
-        const len = Math.hypot(sx, sy, sz) || 1;
+        const len = Math.hypot(sx, sy, sz);
         const o = (t * 3 + k) * 3;
         outPos[o] = verts[vi * 3];
         outPos[o + 1] = verts[vi * 3 + 1];
         outPos[o + 2] = verts[vi * 3 + 2];
-        outNrm[o] = sx / len;
-        outNrm[o + 1] = sy / len;
-        outNrm[o + 2] = sz / len;
+        // 薄壁件（垂尾、翼面）两侧被 1mm 焊接合并时，相反方向的法线会互相
+        // 抵消成长度 0，归一化后得到 (0,0,0) 的坏法线，表现为整块死黑。
+        if (len < 1e-6) {
+          outNrm[o] = fx;
+          outNrm[o + 1] = fy;
+          outNrm[o + 2] = fz;
+        } else {
+          outNrm[o] = sx / len;
+          outNrm[o + 1] = sy / len;
+          outNrm[o + 2] = sz / len;
+        }
       }
     }
     const geo = new THREE.BufferGeometry();
@@ -421,7 +429,6 @@
             vec3 P = vObjP;
             float lines = panel_seam(P);
             roughnessFactor *= 0.94 + ${o.roughSpread.toFixed(3)} * (fbm3(P * 0.9) - 0.5);
-            roughnessFactor = mix(roughnessFactor, roughnessFactor + 0.12, lines * 0.6);
             float rn = ${noseExpr};
             float nz = ${nozzleExpr};
             roughnessFactor = mix(roughnessFactor, ${o.radomeRough.toFixed(3)}, rn);

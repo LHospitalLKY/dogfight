@@ -11,7 +11,6 @@ const SHOTS = [
   { name: "f15_hero", shot: "f15_hero", w: 1600, h: 900 },
   { name: "f15_canopy", shot: "f15_canopy", w: 1600, h: 900 },
   { name: "su57_hero", shot: "su57_hero", w: 1600, h: 900 },
-  { name: "su57_canopy", shot: "su57_canopy", w: 1600, h: 900 },
   { name: "missiles", shot: "missiles", w: 1600, h: 900 },
 ];
 
