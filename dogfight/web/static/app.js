@@ -111,6 +111,16 @@
     };
   })();
 
+  // 近距检视模式：/?inspect=0|1 把指定机体按真实尺寸放到相机前缓慢环绕，
+  // 只用于核对材质/法线细节（正常观战不受影响）。
+  const INSPECT = (() => {
+    const raw = new URLSearchParams(window.location.search).get("inspect");
+    if (raw === null || raw === "") return null;
+    if (raw === "missiles" || raw === "msl") return "missiles";
+    const idx = parseInt(raw, 10);
+    return Number.isFinite(idx) ? clamp(idx, 0, 1) : null;
+  })();
+
   // ---------- three.js 场景 ----------
   const canvas = document.getElementById("scene");
   const renderer = new THREE.WebGLRenderer({
@@ -127,6 +137,9 @@
   // 仅对内建材质（机体/导弹）生效；地面为 ShaderMaterial，不受色调映射影响。
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
+  // 检视模式靠得近、光源直射面积大，正常曝光会把浅灰蒙皮推到纯白，
+  // 压低曝光才能看清迷彩块与曲面高光的层次。
+  if (INSPECT !== null) renderer.toneMappingExposure = 0.88;
   if (CAPTURE) {
     canvas.classList.add("capture-mode");
     // 采集只导出 WebGL 画面，DOM 覆盖层（HUD/标签/条纹/暗角）不参与合成，
@@ -145,6 +158,56 @@
     50, VIEW_W / VIEW_H, 1, 1e7
   );
 
+  // 摄影棚环境贴图：机体/导弹/座舱的金属与玻璃需要方向明确的高光来源，
+  // 只给 PBR 材质（MeshPhysicalMaterial）用，地面是 ShaderMaterial 不受影响。
+  scene.environment = (() => {
+    const env = new THREE.Scene();
+    const dome = new THREE.Mesh(
+      new THREE.SphereGeometry(120, 32, 20),
+      new THREE.ShaderMaterial({
+        side: THREE.BackSide,
+        depthWrite: false,
+        uniforms: {
+          top: { value: new THREE.Color().setRGB(0.012, 0.016, 0.022) },
+          mid: { value: new THREE.Color().setRGB(0.030, 0.040, 0.052) },
+          bot: { value: new THREE.Color().setRGB(0.002, 0.003, 0.004) },
+        },
+        vertexShader: "varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+        fragmentShader: `varying vec3 vP; uniform vec3 top, mid, bot;
+          void main() {
+            float h = normalize(vP).y;
+            vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.75)) : mix(mid, bot, pow(-h, 0.55));
+            gl_FragColor = vec4(c, 1.0);
+          }`,
+      })
+    );
+    env.add(dome);
+    const softbox = (w, h, pos, rot, rgb) => {
+      const m = new THREE.Mesh(
+        new THREE.PlaneGeometry(w, h),
+        new THREE.MeshBasicMaterial({
+          color: new THREE.Color().setRGB(rgb[0], rgb[1], rgb[2]),
+          side: THREE.DoubleSide,
+        })
+      );
+      m.position.set(pos[0], pos[1], pos[2]);
+      m.rotation.set(rot[0], rot[1], rot[2]);
+      env.add(m);
+    };
+    // 顶部长条主光、左前侧光、右后冷补光、地面弱反弹
+    softbox(34, 12, [0, 26, 2], [Math.PI / 2, 0, 0], [2.4, 2.45, 2.55]);
+    softbox(4.2, 26, [-24, 8, -12], [0, Math.PI / 2, 0], [1.5, 1.5, 1.55]);
+    softbox(3.0, 20, [24, 6, 4], [0, -Math.PI / 2, 0], [0.7, 0.95, 1.3]);
+    softbox(24, 2.6, [2, 9, 26], [0, Math.PI, 0], [1.4, 1.33, 1.20]);
+    softbox(40, 40, [0, -6, 0], [-Math.PI / 2, 0, 0], [0.05, 0.06, 0.08]);
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const tex = pmrem.fromScene(env, 0.02).texture;
+    pmrem.dispose();
+    dome.geometry.dispose();
+    dome.material.dispose();
+    return tex;
+  })();
+
   const ambient = new THREE.AmbientLight(0xffffff, 0.42);
   scene.add(ambient);
   const keyLight = new THREE.DirectionalLight(0xdfe8ff, 0.86);
@@ -153,6 +216,25 @@
   const fillLight = new THREE.DirectionalLight(0xffd8c0, 0.24);
   fillLight.position.copy(w2t([0.42, 0.36, -0.80]).multiplyScalar(1e6));
   scene.add(fillLight);
+
+  // 检视模式补光：正常观战距离远，靠轮廓光即可；近距看材质时暗色蒙皮
+  // 需要方向明确的主光/侧光，否则曲面与高光都看不出来。
+  const inspectLights = [];
+  if (INSPECT !== null) {
+    ambient.intensity = 0.04;
+    const rig = [
+      { color: 0xf6f9ff, intensity: 0.50, dir: [-0.60, -0.56, 0.44] },
+      { color: 0xa9c8f5, intensity: 0.22, dir: [0.55, 0.10, -0.75] },
+      { color: 0xffe9d6, intensity: 0.08, dir: [0.25, 0.90, 0.35] },
+    ];
+    for (const r of rig) {
+      const light = new THREE.DirectionalLight(r.color, r.intensity);
+      light.target.position.set(0, 0, 0);
+      scene.add(light.target);
+      scene.add(light);
+      inspectLights.push({ light, dir: w2t(r.dir).normalize() });
+    }
+  }
 
   // ---------- P1.3 抗锯齿：屏幕空间 FXAA ----------
   // MSAA（renderer 的 antialias）只抗几何边缘；尾焰、烟、发光带、细线这些
@@ -957,6 +1039,8 @@
       scanMat,
     };
     applyFloorSize();
+    // 检视模式只展示机体：地图在近距下过亮、细节过密，会把暗色蒙皮压成剪影。
+    floorGroup.visible = INSPECT === null;
   }
 
   function applyFloorSize() {
@@ -974,7 +1058,7 @@
 
   // 在主动画之前把场景以镜像相机渲染到低分辨率目标，供地台采样。
   function renderFloorReflection() {
-    if (!floorState) return;
+    if (!floorState || !floorGroup.visible) return;
     const z = floorState.z;
     const p = camera.position;
     camera.getWorldDirection(floorReflDir);
@@ -995,7 +1079,7 @@
   }
 
   function updateFloor(t) {
-    if (!floorState) return;
+    if (!floorState || !floorGroup.visible) return;
     const cx = camera.position.x;
     const cz = camera.position.z;
     floorState.baseMat.uniforms.uCam.value.set(cx, cz);
@@ -1044,7 +1128,7 @@
       ...Object.entries(MISSILE_URLS).map(async ([name, url]) => {
         const res = await fetch(url + ver, { cache: "no-store" });
         const text = await res.text();
-        const geo = parseOBJ(text);
+        const geo = parseOBJ(text, 80);
         assignMissileUV(geo.body);
         missileShared.add(geo.body);
         missileShared.add(geo.canopy);
@@ -1055,7 +1139,92 @@
     await Promise.all(jobs).catch((err) => console.error("模型加载失败", err));
   })();
 
-  function parseOBJ(text) {
+  // 服务端导出的 OBJ 每个三角形都是独立顶点，直接 computeVertexNormals 会得到
+  // 全平面着色：机身曲面碎成一块块棱面，远看就像一层蒙皮网格。这里先按 1 mm
+  // 量化焊接顶点，再按夹角阈值平均法线，既让曲面连续，又保住进气道唇口、
+  // 翼前缘这类真实硬边。
+  function weldAndSmooth(rawGeo, angleDeg) {
+    const pos = rawGeo.attributes.position.array;
+    const n = pos.length / 3;
+    if (!n) return rawGeo;
+    const q = 1e3; // 1 mm
+    const map = new Map();
+    const verts = [];
+    const index = new Int32Array(n);
+    for (let i = 0; i < n; i += 1) {
+      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+      const key = `${Math.round(x * q)}|${Math.round(y * q)}|${Math.round(z * q)}`;
+      let id = map.get(key);
+      if (id === undefined) {
+        id = verts.length / 3;
+        map.set(key, id);
+        verts.push(x, y, z);
+      }
+      index[i] = id;
+    }
+    const triCount = n / 3;
+    const fn = new Float32Array(triCount * 3);
+    for (let t = 0; t < triCount; t += 1) {
+      const a = index[t * 3] * 3, b = index[t * 3 + 1] * 3, c = index[t * 3 + 2] * 3;
+      const ax = verts[b] - verts[a], ay = verts[b + 1] - verts[a + 1], az = verts[b + 2] - verts[a + 2];
+      const bx = verts[c] - verts[a], by = verts[c + 1] - verts[a + 1], bz = verts[c + 2] - verts[a + 2];
+      let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
+      const len = Math.hypot(nx, ny, nz) || 1;
+      fn[t * 3] = nx / len;
+      fn[t * 3 + 1] = ny / len;
+      fn[t * 3 + 2] = nz / len;
+    }
+    // 顶点 → 相邻面
+    const adj = new Map();
+    for (let t = 0; t < triCount; t += 1) {
+      for (let k = 0; k < 3; k += 1) {
+        const v = index[t * 3 + k];
+        let list = adj.get(v);
+        if (!list) { list = []; adj.set(v, list); }
+        list.push(t);
+      }
+    }
+    const cosLim = Math.cos((angleDeg * Math.PI) / 180);
+    const outPos = new Float32Array(n * 3);
+    const outNrm = new Float32Array(n * 3);
+    for (let t = 0; t < triCount; t += 1) {
+      const fx = fn[t * 3], fy = fn[t * 3 + 1], fz = fn[t * 3 + 2];
+      for (let k = 0; k < 3; k += 1) {
+        const vi = index[t * 3 + k];
+        const list = adj.get(vi);
+        let sx = 0, sy = 0, sz = 0;
+        for (let j = 0; j < list.length; j += 1) {
+          const a = list[j];
+          const ax = fn[a * 3], ay = fn[a * 3 + 1], az = fn[a * 3 + 2];
+          if (ax * fx + ay * fy + az * fz >= cosLim) { sx += ax; sy += ay; sz += az; }
+        }
+        const len = Math.hypot(sx, sy, sz);
+        const o = (t * 3 + k) * 3;
+        outPos[o] = verts[vi * 3];
+        outPos[o + 1] = verts[vi * 3 + 1];
+        outPos[o + 2] = verts[vi * 3 + 2];
+        // 薄壁件（翼面、垂尾）两侧被 1mm 焊接合并时，相反方向的法线会互相
+        // 抵消成长度 0，归一化后变成坏法线（整块死黑），回退到面法线。
+        if (len < 1e-6) {
+          outNrm[o] = fx;
+          outNrm[o + 1] = fy;
+          outNrm[o + 2] = fz;
+        } else {
+          outNrm[o] = sx / len;
+          outNrm[o + 1] = sy / len;
+          outNrm[o + 2] = sz / len;
+        }
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(outPos, 3));
+    geo.setAttribute("normal", new THREE.BufferAttribute(outNrm, 3));
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();
+    return geo;
+  }
+
+  function parseOBJ(text, bodyAngle) {
     const verts = [];
     const groups = {
       body: { pos: [], count: 0 },
@@ -1092,9 +1261,10 @@
     for (const key of ["body", "canopy", "stores"]) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.Float32BufferAttribute(groups[key].pos, 3));
-      geo.computeVertexNormals();
-      geo.computeBoundingSphere();
-      out[key] = geo;
+      // 座舱玻璃尺寸小、需要更硬的边界；机体/挂架用较大角度让蒙皮连续。
+      const angle = key === "canopy" ? 34 : key === "stores" ? 60 : (bodyAngle || 72);
+      out[key] = weldAndSmooth(geo, angle);
+      out[key].computeBoundingSphere();
     }
     return out;
   }
@@ -1480,10 +1650,15 @@
     const rimColor = new THREE.Color(rgbHex(
       neutral ? [214, 219, 225] : mix(RGB.TEAM[team], [255, 255, 255], 0.35)
     ));
-    const mat = new THREE.MeshStandardMaterial({
+    // 低可视度金属漆：中等金属度 + 偏高粗糙度，薄清漆层只提供一层高光；
+    // 纯漫反射在暗背景下会显得像塑料，金属度与清漆让蒙皮有真实反光。
+    const mat = new THREE.MeshPhysicalMaterial({
       color: new THREE.Color(rgbHex(mix(part.base || [255, 255, 255], RGB.TEAM[team], tint))),
-      roughness: 0.80,
-      metalness: 0.03,
+      roughness: 0.62,
+      metalness: 0.34,
+      clearcoat: 0.06,
+      clearcoatRoughness: 0.85,
+      envMapIntensity: 0.45,
       emissive: new THREE.Color(rgbHex(
         neutral ? [0, 0, 0] : mix(RGB.TEAM[team], [255, 255, 255], part.glow ?? 0.5)
       )),
@@ -1676,14 +1851,26 @@ ${shader.fragmentShader}`;
     return mat;
   }
 
-  const canopyMat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(rgbHex(RGB.CANOPY)),
-    roughness: 0.25,
-    metalness: 0.15,
+  // 镀膜座舱玻璃：薄壳透射 + 强清漆高光，带一点金色吸收；
+  // 沿用模型自带的 canopy 分组，只换材质，不改它的位置与形状。
+  const canopyMat = new THREE.MeshPhysicalMaterial({
+    color: new THREE.Color("#e9e5db").convertSRGBToLinear(),
+    metalness: 0.0,
+    roughness: 0.02,
+    transmission: 0.94,
+    thickness: 0.10,
+    ior: 1.52,
+    attenuationColor: new THREE.Color("#cfae74").convertSRGBToLinear(),
+    attenuationDistance: 0.9,
+    clearcoat: 1.0,
+    clearcoatRoughness: 0.03,
     transparent: true,
-    opacity: 0.55,
     depthWrite: false,
     side: THREE.DoubleSide,
+    envMapIntensity: 1.15,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
   });
   const deadBodyMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(rgbHex(RGB.CLAY_AO)),
@@ -1692,10 +1879,13 @@ ${shader.fragmentShader}`;
     side: THREE.DoubleSide,
   });
   // 外挂物（导弹/副油箱/挂架）：统一的中性浅灰金属色，与机体迷彩区分开。
-  const storesMat = new THREE.MeshStandardMaterial({
+  const storesMat = new THREE.MeshPhysicalMaterial({
     color: 0xd3d7db,
-    roughness: 0.55,
-    metalness: 0.35,
+    roughness: 0.50,
+    metalness: 0.30,
+    clearcoat: 0.10,
+    clearcoatRoughness: 0.80,
+    envMapIntensity: 0.50,
     side: THREE.DoubleSide,
   });
 
@@ -1770,8 +1960,9 @@ ${shader.fragmentShader}`;
   const missileMats = {};
   const missileDeadMat = new THREE.MeshStandardMaterial({
     color: 0x9a9ea4,
-    roughness: 0.62,
-    metalness: 0.22,
+    roughness: 0.48,
+    metalness: 0.24,
+    envMapIntensity: 0.45,
     side: THREE.DoubleSide,
   });
   const missileShared = new Set([missileDeadMat]);
@@ -1780,11 +1971,14 @@ ${shader.fragmentShader}`;
     const key = `${team}|${name}`;
     let mat = missileMats[key];
     if (mat) return mat;
-    mat = new THREE.MeshStandardMaterial({
+    mat = new THREE.MeshPhysicalMaterial({
       map: missileTexture(name),
       color: new THREE.Color(rgbHex(mix([255, 255, 255], RGB.TEAM[team], 0.10))),
       roughness: 0.46,
-      metalness: 0.32,
+      metalness: 0.26,
+      clearcoat: 0.12,
+      clearcoatRoughness: 0.80,
+      envMapIntensity: 0.50,
       side: THREE.DoubleSide,
     });
     missileMats[key] = mat;
@@ -2212,10 +2406,16 @@ ${shader.fragmentShader}`;
       this.storesMesh = null;
       this.flames = [];
       const geo = MODEL_GEOS[name];
-      if (geo) {
+      const __noGeo = new URLSearchParams(location.search).get("nogeo") === "1";
+      if (geo && !__noGeo) {
         this.bodyMesh = new THREE.Mesh(geo.body, camoMaterial(this.team, name));
-        this.canopyMesh = new THREE.Mesh(geo.canopy, canopyMat);
-        this.modelGroup.add(this.bodyMesh, this.canopyMesh);
+        this.modelGroup.add(this.bodyMesh);
+        // Su-57 的 OBJ 把整个上半机身都归进了 canopy 分组，套玻璃会让半架
+        // 飞机变透明，因此该机型不单独渲染座舱罩。
+        if (name !== "SU-57") {
+          this.canopyMesh = new THREE.Mesh(geo.canopy, canopyMat);
+          this.modelGroup.add(this.canopyMesh);
+        }
         if (geo.stores && geo.stores.attributes.position.count > 0) {
           this.storesMesh = new THREE.Mesh(geo.stores, storesMat);
           this.modelGroup.add(this.storesMesh);
@@ -2452,9 +2652,14 @@ ${shader.fragmentShader}`;
       this.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
       const focal = (window.innerHeight / 2.0) / Math.tan((50.0 * Math.PI / 180.0) / 2.0);
       const targetPx = 46.0 * clamp(8000.0 / cameraDepth, 2.0, 3.0);
-      const k = targetPx * cameraDepth / (focal * REF_LENGTH);
+      // 检视模式按真实尺寸显示；正常观战仍做屏幕尺寸补偿，远距也看得清。
+      const k = (INSPECT !== null && INSPECT === this.team)
+        ? 1.0
+        : targetPx * cameraDepth / (focal * REF_LENGTH);
       this.group.scale.setScalar(k);
-      this.group.visible = !!ac.alive;
+      // 检视模式只显示被检视的那一架；其余机体按真实尺寸必然巨大，
+      // 会横穿近距镜头（导弹陈列里尤其明显），直接隐藏。
+      this.group.visible = !!ac.alive && (INSPECT === null || INSPECT === this.team);
 
       const t = simT || 0.0;
       if (this.effectLastT !== null && t < this.effectLastT) {
@@ -2486,14 +2691,16 @@ ${shader.fragmentShader}`;
       gp[3] = pos.x; gp[4] = floorY; gp[5] = pos.z;
       this.groundGeo.attributes.position.needsUpdate = true;
       this.ring.position.set(pos.x, floorY, pos.z);
-      this.groundLine.visible = this.ring.visible = !!ac.alive;
+      // 检视模式只留机体本身，避免地面投影线/包线圆穿过近距画面。
+      const showRings = INSPECT === null;
+      this.groundLine.visible = this.ring.visible = !!ac.alive && showRings;
 
       const gunRange = ac.gun_range || 0.0;
       this.envOuter.position.set(pos.x, pos.y, pos.z);
       this.envInner.position.copy(this.envOuter.position);
       this.envOuter.scale.setScalar(gunRange);
       this.envInner.scale.setScalar(gunRange * 0.5);
-      this.envOuter.visible = this.envInner.visible = !!ac.alive && gunRange > 0.0;
+      this.envOuter.visible = this.envInner.visible = !!ac.alive && gunRange > 0.0 && showRings;
     }
   }
 
@@ -4412,9 +4619,12 @@ ${shader.fragmentShader}`;
     const ml = ac.model_len || REF_LENGTH;
     if (geo) {
       gl.body = new THREE.Mesh(geo.body, ac.alive ? camoMaterial(ac.team, ac.name) : deadBodyMat);
-      gl.canopy = new THREE.Mesh(geo.canopy, canopyMat);
-      gl.canopy.visible = !!ac.alive;
-      gl.group.add(gl.body, gl.canopy);
+      gl.canopy = ac.name === "SU-57" ? null : new THREE.Mesh(geo.canopy, canopyMat);
+      gl.group.add(gl.body);
+      if (gl.canopy) {
+        gl.canopy.visible = !!ac.alive;
+        gl.group.add(gl.canopy);
+      }
       if (geo.stores && geo.stores.attributes.position.count > 0) {
         gl.stores = new THREE.Mesh(geo.stores, storesMat);
         gl.stores.visible = !!ac.alive;
@@ -4492,6 +4702,8 @@ ${shader.fragmentShader}`;
   }
 
   function updateAttitude(snap) {
+    // 采集时 HUD 整体隐藏，姿态仪（以及它独立的 WebGL 上下文）无需渲染。
+    if (CAPTURE) return;
     for (let i = 0; i < 2; i += 1) {
       const ac = snap.acs[i];
       const part = attitudeParts[i];
@@ -4632,11 +4844,14 @@ ${shader.fragmentShader}`;
       const depth = Math.max(1.0, cameraPos.distanceTo(w2t(ac.pos)));
       view.update(ac, depth, snap.t);
     }
-    updateTrails(snap);
-    updateMissiles(snap);
-    updatePredictions(snap);
-    updateGunfire(snap);
-    updateMarks(snap);
+    // 检视模式只保留被检视的机体/陈列，弹道、尾迹、炮火等叠加层全部跳过。
+    if (INSPECT === null) {
+      updateTrails(snap);
+      updateMissiles(snap);
+      updatePredictions(snap);
+      updateGunfire(snap);
+      updateMarks(snap);
+    }
   }
 
   function updateHud(snap) {
@@ -4684,8 +4899,83 @@ ${shader.fragmentShader}`;
     document.getElementById("btn-follow").textContent = label;
   }
 
+  // 检视模式的环绕相机：锁定指定机体/导弹陈列中心，按真实尺寸缓慢环绕。
+  // 首帧后暂停对局，保证近距画面稳定（只影响检视模式）。
+  let inspectPauseSent = false;
+  let missileShowcase = null;
+
+  // 模型是并行异步加载的，第一帧快照可能早于最后一枚导弹的解析完成。
+  // 陈列只创建一次，必须等全部模型就绪，否则会永远少几枚。
+  let modelsLoaded = false;
+  MODELS_READY.then(() => { modelsLoaded = true; });
+
+  // 导弹独立陈列：直接用主程序加载的导弹几何与导弹材质，横排展示。
+  function ensureMissileShowcase(base) {
+    if (missileShowcase) return missileShowcase;
+    if (!modelsLoaded) return null;
+    const names = ["AIM-120C", "AIM-9X", "PL-15", "PL-10", "R-77-1", "R-73"];
+    const usable = names.filter((n) => MISSILE_GEOS[n]
+      && MISSILE_GEOS[n].body.attributes.position.count > 0);
+    if (!usable.length) return null;
+    const g = new THREE.Group();
+    const spacing = 2.1;
+    usable.forEach((n, i) => {
+      const mesh = new THREE.Mesh(MISSILE_GEOS[n].body, missileMaterial(0, n));
+      mesh.position.x = (i - (usable.length - 1) / 2) * spacing;
+      g.add(mesh);
+    });
+    g.position.copy(base).add(new THREE.Vector3(0, -600, 0));
+    scene.add(g);
+    missileShowcase = g;
+    return g;
+  }
+
+  function orbitCamera(target, dist, yaw, pitch) {
+    camera.position.set(
+      target.x + dist * Math.cos(pitch) * Math.cos(yaw),
+      target.y + dist * Math.sin(pitch),
+      target.z - dist * Math.cos(pitch) * Math.sin(yaw)
+    );
+    camera.up.set(0, 1, 0);
+    camera.lookAt(target);
+    for (const it of inspectLights) {
+      it.light.position.copy(target).addScaledVector(it.dir, 100);
+      it.light.target.position.copy(target);
+      it.light.target.updateMatrixWorld();
+    }
+  }
+
+  function updateInspectCamera() {
+    if (INSPECT === null || !snapshot || !snapshot.acs) return false;
+    if (!inspectPauseSent) {
+      inspectPauseSent = true;
+      fetch("/api/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "pause" }),
+      }).catch(() => { /* 采集页可能没有控制接口 */ });
+    }
+    // 采集时用视频时间轴驱动环绕，渲染再慢，成片里的转速也是稳定的；
+    // 交互检视则跟随真实时间。
+    const t = CAPTURE ? capState.i / CAPTURE.fps : performance.now() / 1000.0;
+    if (INSPECT === "missiles") {
+      if (!snapshot.acs[0]) return false;
+      const g = ensureMissileShowcase(w2t(snapshot.acs[0].pos));
+      if (!g) return false;
+      const center = g.position.clone().add(new THREE.Vector3(0, 0, 1.2));
+      orbitCamera(center, 9.2, t * 0.30 + 0.6, 0.18);
+      return true;
+    }
+    const ac = snapshot.acs[INSPECT];
+    if (!ac) return false;
+    const len = ac.model_len || REF_LENGTH;
+    orbitCamera(w2t(ac.pos), len * 1.15, t * 0.26 + 0.8, 0.34 + Math.sin(t * 0.19) * 0.05);
+    return true;
+  }
+
   function updateCameraFrame() {
     if (!snapshot) return;
+    if (updateInspectCamera()) return;
     const c = snapshot.camera;
     const target = new THREE.Vector3(c.cx, c.cz, -c.cy);
     const pitch = clamp(c.pitch + localPitch, 0.05, 1.45);
