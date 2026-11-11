@@ -2,12 +2,17 @@ const puppeteer = require("puppeteer");
 const path = require("path");
 
 const SHOTS = [
-  { name: "j20_hero", shot: "hero", w: 1600, h: 900 },
-  { name: "j20_canopy", shot: "canopy", w: 1600, h: 900 },
-  { name: "j20_rear", shot: "rear", w: 1600, h: 900 },
-  { name: "j20_detail", shot: "detail", w: 1600, h: 900 },
+  { name: "j20_hero", shot: "j20_hero", w: 1600, h: 900 },
+  { name: "j20_canopy", shot: "j20_canopy", w: 1600, h: 900 },
+  { name: "j20_rear", shot: "j20_rear", w: 1600, h: 900 },
+  { name: "j20_detail", shot: "j20_detail", w: 1600, h: 900 },
+  { name: "f16_hero", shot: "f16_hero", w: 1600, h: 900 },
+  { name: "f16_canopy", shot: "f16_canopy", w: 1600, h: 900 },
+  { name: "f15_hero", shot: "f15_hero", w: 1600, h: 900 },
+  { name: "f15_canopy", shot: "f15_canopy", w: 1600, h: 900 },
+  { name: "su57_hero", shot: "su57_hero", w: 1600, h: 900 },
+  { name: "su57_canopy", shot: "su57_canopy", w: 1600, h: 900 },
   { name: "missiles", shot: "missiles", w: 1600, h: 900 },
-  { name: "j20_legacy", shot: "legacy", w: 1600, h: 900 },
 ];
 
 const BASE = process.env.BASE || "http://127.0.0.1:8099/render_demo/src/index.html";

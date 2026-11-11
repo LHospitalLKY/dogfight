@@ -1,6 +1,6 @@
 /* 独立材质预览场景（不接入工程代码）。
- * 用途：给 j20.obj / 导弹 OBJ 换一套更真实的 PBR 材质并出静态渲染图。
- * 用法：index.html?shot=hero|canopy|rear|detail|missiles|legacy&w=1600&h=900
+ * 用途：给 j20 / f16 / f15 / su57 与导弹 OBJ 换一套更真实的 PBR 材质并出静态渲染图。
+ * 用法：index.html?shot=j20_hero|j20_canopy|f16_hero|f16_canopy|...|missiles&w=1600&h=900
  */
 (function () {
   "use strict";
@@ -192,17 +192,19 @@
   // ------------------------------------------------------------ 材质套装
   const MODELS = "/dogfight/web/static/models";
 
-  function aircraftMaterials(mode) {
+  // 各机型的少数可调参数：机体色与蒙皮分块周期（其余参数共用一个真实感基线）
+  const AIRCRAFT = {
+    j20: { file: "j20", label: "J-20", body: 0x454e58, seamZ: 1.55, seamX: 2.10 },
+    f16: { file: "f16", label: "F-16C", body: 0x4b535c, seamZ: 1.20, seamX: 1.50 },
+    f15: { file: "f15ex", label: "F-15EX", body: 0x49525b, seamZ: 1.45, seamX: 1.95 },
+    su57: { file: "su57", label: "Su-57", body: 0x47505b, seamZ: 1.50, seamX: 2.05 },
+  };
+
+  function aircraftMaterials(mode, spec) {
     if (mode === "legacy") {
       return {
         body: new THREE.MeshStandardMaterial({
           color: MAT.srgb(0x6a7178), roughness: 0.82, metalness: 0.15, side: THREE.DoubleSide,
-        }),
-        nose: new THREE.MeshStandardMaterial({
-          color: MAT.srgb(0x5d646b), roughness: 0.85, metalness: 0.1, side: THREE.DoubleSide,
-        }),
-        nozzle: new THREE.MeshStandardMaterial({
-          color: MAT.srgb(0x3c4045), roughness: 0.8, metalness: 0.3, side: THREE.DoubleSide,
         }),
         canopy: new THREE.MeshStandardMaterial({
           color: MAT.srgb(0x9fb3bd), roughness: 0.25, metalness: 0.15,
@@ -211,34 +213,38 @@
       };
     }
     return {
-      // 低可视度哑光金属漆：金属度中等（金属漆而不是镜面铝），粗糙度偏高，
-      // 雷达罩/尾喷口在同一着色器里按 z 平滑过渡，避免锯齿接缝。
+      // 低可视度哑光金属漆：金属度中等（金属漆而不是镜面铝），粗糙度偏高；
+      // 雷达罩/尾喷口在同一着色器里按 z 平滑过渡，避免按三角形切材质留下锯齿。
       body: MAT.skinMaterial({
-        color: 0x454e58, metalness: 0.34, roughness: 0.62,
-        seamPeriodZ: 1.55, seamPeriodX: 2.10, seamWidth: 0.024,
+        color: spec.body, metalness: 0.34, roughness: 0.62,
+        seamPeriodZ: spec.seamZ, seamPeriodX: spec.seamX, seamWidth: 0.024,
         seamDark: 0.20, mottle: 0.025, roughSpread: 0.12,
         clearcoat: 0.06, clearcoatRoughness: 0.85, envMapIntensity: 0.45,
-        noseZ: -8.95, radomeColor: 0x2b3137, radomeRough: 0.64,
-        nozzleZ: 9.30, nozzleColor: 0x4b4640,
+        noseZ: spec.noseZ, radomeColor: 0x2b3137, radomeRough: 0.64,
+        nozzleZ: spec.nozzleZ, nozzleColor: 0x4b4640,
       }),
+      // 镀膜座舱玻璃：沿用模型自带的座舱分组，只换材质，不动它的位置与形状。
       canopy: MAT.glassMaterial({
         tint: 0xe9e5db, roughness: 0.02, thickness: 0.10,
         transmission: 0.94, attenuationColor: 0xcfae74, attenuationDistance: 0.9,
-        envMapIntensity: 1.15,
-        doubleSide: !(q.get("dbg") || "").includes("gl=front"),
-        clipY: null,
+        envMapIntensity: 1.15, doubleSide: true, clipY: null,
       }),
     };
   }
 
-  function buildAircraft(geoBody, geoCanopy, mats) {
+  function buildAircraft(geoBody, geoCanopy, mode) {
     const group = new THREE.Group();
-    let body = MAT.weldAndSmooth(geoBody, 42);
-    // 默认不挖机身开口：座舱罩边缘已经下沉到蒙皮以下，靠机身自然遮挡即可。
-    // 需要看内饰时用 dbg=cut 打开。
-    if ((q.get("dbg") || "").includes("cut")) {
-      body = MAT.cutRegion(body, (x, y, z) => !(y > -0.02 && z > -7.30 && z < -4.70 && Math.abs(x) < 0.40));
-    }
+    const body = MAT.weldAndSmooth(geoBody, 42);
+    body.computeBoundingBox();
+    const bb = body.boundingBox;
+    const len = bb.max.z - bb.min.z;
+    const spec = Object.assign({}, AIRCRAFT[shot.split("_")[0]], {
+      // 机头雷达罩、尾喷口按各机自身长度比例定位，换机型不用手调
+      noseZ: bb.min.z + len * 0.165,
+      nozzleZ: bb.max.z - len * 0.115,
+    });
+    const mats = aircraftMaterials(mode, spec);
+
     const meshes = {};
     const m = new THREE.Mesh(body, mats.body);
     m.castShadow = true;
@@ -246,96 +252,23 @@
     meshes.body = m;
     if (!(q.get("dbg") || "").includes("bodyless")) group.add(m);
 
+    let cbb = null;
     if (geoCanopy && geoCanopy.attributes.position.count) {
-      // 按模型轮廓重新放样出干净的座舱罩（原模型边缘是一圈尖三角形）
-      const shell = MAT.canopyShell(geoCanopy, { baseY: 0.060, topDrop: 0.055, slices: 60, ring: 32 });
-      const cm = new THREE.Mesh(shell, mats.canopy);
+      // 座舱：直接用模型自带的 canopy 分组（不做重放样、不开孔、不改位置）
+      const cg = MAT.weldAndSmooth(geoCanopy, 34);
+      cg.computeBoundingBox();
+      cbb = cg.boundingBox;
+      const cm = new THREE.Mesh(cg, mats.canopy);
       cm.castShadow = false;
       cm.receiveShadow = false;
       cm.renderOrder = 4;
       group.add(cm);
       meshes.canopy = cm;
-
-      // 舱框裙边：从玻璃罩边界向下拉一圈深色薄壁，把玻璃与蒙皮那条参差的
-      // 相交线压住，交界处看起来就是一道干净的密封条。
-      if (!(q.get("dbg") || "").includes("noedge")) {
-        const skirt = MAT.rimSkirt(shell, -0.05);
-        const sm = new THREE.Mesh(skirt, MAT.trimMaterial(0x14171b));
-        sm.renderOrder = 3;
-        group.add(sm);
-      }
-
-      // 座舱弓形框：在玻璃罩上叠两条细窄的深色环带，避免整块玻璃过于“果冻”
-      if (!(q.get("dbg") || "").includes("noribs")) {
-        const rings = shell.userData.rings;
-        const K = shell.userData.ringCount;
-        const ribMat = MAT.trimMaterial(0x121517);
-        ribMat.polygonOffset = true;
-        ribMat.polygonOffsetFactor = -4;
-        ribMat.polygonOffsetUnits = -4;
-        const cc = shell.boundingSphere.center;
-        const grow = (p, i) => {
-          // 沿截面法向略向外扩，避免与玻璃共面闪烁
-          const x = (p[i] - cc.x) * 1.012 + cc.x;
-          const y = (p[i + 1] - cc.y) * 1.012 + cc.y;
-          return [x, y, p[i + 2]];
-        };
-        [0.28, 0.62].forEach((u) => {
-          const i0 = Math.max(0, Math.min(rings.length - 2, Math.round(u * (rings.length - 1))));
-          const r0 = rings[i0];
-          const r1 = rings[i0 + 1];
-          const P = [];
-          for (let j = 0; j < K - 1; j += 1) {
-            const a = grow(r0, j * 3);
-            const b = grow(r0, (j + 1) * 3);
-            const c2 = grow(r1, (j + 1) * 3);
-            const d = grow(r1, j * 3);
-            P.push(...a, ...b, ...c2, ...a, ...c2, ...d);
-          }
-          const rg = new THREE.BufferGeometry();
-          rg.setAttribute("position", new THREE.Float32BufferAttribute(P, 3));
-          rg.computeVertexNormals();
-          const rib = new THREE.Mesh(rg, ribMat);
-          rib.renderOrder = 5;
-          group.add(rib);
-        });
-      }
-
-      // 座舱内衬：同一层壳缩一圈、压暗，透过玻璃看到的是深色座舱而不是蒙皮
-      const c = shell.boundingSphere.center;
-      const liner = new THREE.Mesh(shell, MAT.trimMaterial(0x0a0c0f));
-      liner.scale.set(0.982, 0.965, 0.994);
-      liner.position.copy(c).multiplyScalar(-1);
-      liner.position.y -= 0.008;
-      const lw = new THREE.Group();
-      lw.add(liner);
-      lw.position.copy(c);
-      if (!(q.get("dbg") || "").includes("noliner")) group.add(lw);
-    }
-
-    // 座舱内部：深色座椅 + 一点仪表微光，隔玻璃看进去有层次
-    if (shot !== "legacy" && !(q.get("dbg") || "").includes("nointerior")) {
-      const inner = new THREE.Group();
-
-      const seat = new THREE.Mesh(
-        new THREE.BoxGeometry(0.34, 0.40, 0.28),
-        new THREE.MeshStandardMaterial({ color: MAT.srgb(0x14171a), roughness: 0.7, metalness: 0.2 }),
-      );
-      seat.position.set(0, 0.11, -5.62);
-      seat.rotation.x = 0.22;
-      inner.add(seat);
-
-      const hud = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.24, 0.15),
-        new THREE.MeshBasicMaterial({ color: MAT.srgb(0x3fe0b0), transparent: true, opacity: 0.42, side: THREE.DoubleSide }),
-      );
-      hud.position.set(0.02, 0.21, -6.42);
-      hud.rotation.set(0.16, 0.0, 0.0);
-      inner.add(hud);
-      group.add(inner);
     }
 
     group.userData.meshes = meshes;
+    group.userData.bb = bb;
+    group.userData.cbb = cbb;
     return group;
   }
 
@@ -428,29 +361,38 @@
   }
 
   // ------------------------------------------------------------ 组装
-  function loadJ20(mode) {
-    return MAT.loadObj(`${MODELS}/j20.obj`).then((geo) => {
-      const mats = aircraftMaterials(mode);
-      const model = buildAircraft(geo.body, geo.canopy, mats);
+  function loadAircraft(key, mode) {
+    const a = AIRCRAFT[key] || AIRCRAFT.j20;
+    return MAT.loadObj(`${MODELS}/${a.file}.obj`).then((geo) => {
+      const model = buildAircraft(geo.body, geo.canopy, mode);
       scene.add(model);
       lights(true);
       return model;
     });
   }
 
-  function shootJ20() {
-    loadJ20("pbr").then(() => {
-      if (shot === "hero") {
-        frame(new THREE.Vector3(0, 0.14, -0.15), [-0.64, 0.34, -0.70], 6.9, 31, 1.0);
-      } else if (shot === "canopy") {
-        frame(new THREE.Vector3(0, 0.26, -6.0), [-0.46, 0.52, -0.72], 2.3, 30, 1.0);
-      } else if (shot === "rear") {
-        frame(new THREE.Vector3(0, 0.16, 4.9), [0.55, 0.20, 0.80], 6.3, 32, 0.98);
-      } else if (shot === "detail") {
-        frame(new THREE.Vector3(-0.6, 0.10, -1.2), [-0.42, 0.30, -0.86], 5.0, 30, 1.0);
-      } else if (shot === "legacy") {
-        scene.environment = null;
-        frame(new THREE.Vector3(0, 0.14, -0.15), [-0.64, 0.34, -0.70], 6.9, 31, 1.0);
+  function shootAircraft(key, view, mode) {
+    loadAircraft(key, mode).then((model) => {
+      const bb = model.userData.bb;
+      const cbb = model.userData.cbb;
+      const size = new THREE.Vector3();
+      if (view === "canopy" && cbb) {
+        const c = new THREE.Vector3();
+        cbb.getCenter(c);
+        cbb.getSize(size);
+        frame(c, [-0.46, 0.52, -0.72], Math.max(size.x, size.y, size.z) * 0.85, 30, 1.0);
+      } else {
+        const c = new THREE.Vector3();
+        bb.getCenter(c);
+        bb.getSize(size);
+        const half = size.length() / 2;
+        if (view === "rear") {
+          frame(c, [0.55, 0.20, 0.80], half * 0.50, 32, 0.98);
+        } else if (view === "detail") {
+          frame(c, [-0.42, 0.30, -0.86], half * 0.40, 30, 1.0);
+        } else {
+          frame(c, [-0.64, 0.34, -0.70], half * 0.55, 31, 1.0);
+        }
       }
       render();
     });
@@ -511,6 +453,13 @@
     window.__shotError = String(e.message || e);
   });
 
-  if (shot === "missiles") shootMissiles();
-  else shootJ20();
+  if (shot === "missiles") {
+    shootMissiles();
+  } else {
+    const parts = shot.split("_");
+    const key = parts[0];
+    const view = parts[1] || "hero";
+    if (key === "j20" && view === "legacy") scene.environment = null;
+    shootAircraft(key, view, view === "legacy" ? "legacy" : "pbr");
+  }
 })();
