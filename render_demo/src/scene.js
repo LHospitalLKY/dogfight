@@ -254,16 +254,27 @@
 
     let cbb = null;
     if (geoCanopy && geoCanopy.attributes.position.count) {
-      // 座舱：直接用模型自带的 canopy 分组（不做重放样、不开孔、不改位置）
+      // 座舱：保持模型自带分组的位置与形状，只按“算出来的面法线”分材质——
+      // 朝上的穹顶给玻璃，朝外/朝下的下缘给深色舱框（原模型下缘是尖三角形，
+      // 当作框带处理正好，不再需要重放样或开孔）。
       const cg = MAT.weldAndSmooth(geoCanopy, 34);
       cg.computeBoundingBox();
       cbb = cg.boundingBox;
-      const cm = new THREE.Mesh(cg, mats.canopy);
+      const parts = MAT.splitByNormal(cg, (nx, ny) => ny > 0.22);
+      const cm = new THREE.Mesh(parts[0], mats.canopy);
       cm.castShadow = false;
       cm.receiveShadow = false;
       cm.renderOrder = 4;
       group.add(cm);
       meshes.canopy = cm;
+
+      if (parts[1].attributes.position.count) {
+        const fm = new THREE.Mesh(parts[1], MAT.trimMaterial(0x1b2026));
+        fm.castShadow = false;
+        fm.receiveShadow = false;
+        fm.renderOrder = 3;
+        group.add(fm);
+      }
     }
 
     group.userData.meshes = meshes;

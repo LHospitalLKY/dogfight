@@ -311,6 +311,31 @@
     return g;
   }
 
+  // 按算出来的面法线切分几何。座舱盖不做任何形状/位置改动：法线朝上的面
+  // 归为玻璃穹顶，朝外/朝下的下缘归为舱框，交界处由几何本身决定。
+  function splitByNormal(geo, keep) {
+    const pos = geo.attributes.position.array;
+    const nrm = geo.attributes.normal.array;
+    const tri = pos.length / 9;
+    const bins = [{ p: [], n: [] }, { p: [], n: [] }];
+    for (let t = 0; t < tri; t += 1) {
+      const o = t * 9;
+      const nx = nrm[o] + nrm[o + 3] + nrm[o + 6];
+      const ny = nrm[o + 1] + nrm[o + 4] + nrm[o + 7];
+      const nz = nrm[o + 2] + nrm[o + 5] + nrm[o + 8];
+      const len = Math.hypot(nx, ny, nz) || 1;
+      const b = bins[keep(nx / len, ny / len, nz / len) ? 0 : 1];
+      for (let i = 0; i < 9; i += 1) { b.p.push(pos[o + i]); b.n.push(nrm[o + i]); }
+    }
+    return bins.map((b) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(b.p, 3));
+      g.setAttribute("normal", new THREE.Float32BufferAttribute(b.n, 3));
+      g.computeBoundingSphere();
+      return g;
+    });
+  }
+
   // ---------------------------------------------------------------- 着色注入
   const NOISE = `
     float hash31(vec3 p){
@@ -572,7 +597,7 @@
   }
 
   window.MAT = {
-    srgb, weldAndSmooth, splitBy, cutRegion, domeAndSkirt, canopyShell, rimSkirt, skinMaterial, glassMaterial,
+    srgb, weldAndSmooth, splitBy, splitByNormal, cutRegion, domeAndSkirt, canopyShell, rimSkirt, skinMaterial, glassMaterial,
     dielectricMaterial, nozzleMaterial, trimMaterial, loadObj, parseOBJ,
   };
 })();
