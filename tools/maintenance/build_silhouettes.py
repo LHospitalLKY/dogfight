@@ -10,6 +10,8 @@ three.js 里渲染的机体完全对得上；起落架/吊舱等也按同一套�
     assets/silhouettes/j20a_top.png     （J-20A / J-20S 共用）
     assets/silhouettes/f15c_top.png
     assets/silhouettes/f15ex_top.png    （F-15E / F-15EX 共用）
+    assets/silhouettes/j16_top.png
+    assets/silhouettes/j15t_top.png
     assets/silhouettes/top_views.png    上述轮廓的预览图（深色底、带标注）
 
 用法（在仓库根目录）：
@@ -126,6 +128,8 @@ def main() -> int:
         ("J-20A", "j20a", TEAM_COLORS[0]),
         ("F-15C", "f15c", TEAM_COLORS[1]),
         ("F-15EX", "f15ex", TEAM_COLORS[0]),
+        ("J-16", "j16", TEAM_COLORS[1]),
+        ("J-15T", "j15t", TEAM_COLORS[0]),
     )
     images = []
     for name, stem, color in builds:

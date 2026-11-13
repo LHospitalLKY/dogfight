@@ -2,7 +2,7 @@
 # 路径相对仓库根目录；新增机体/武器只需在这里加一项，three.js 导出、Web 兜底与轮廓生成会自动加载。
 # 机体只需要四个量：真实机长、体素抽稀尺度（米）、原始 OBJ、以及该 OBJ 的坐标换算器。
 # aircraft 的键必须与 configs/aircraft/*.yaml 里的 name 一致。
-version: web-obj-v4
+version: web-obj-v10
 
 aircraft:
   SU-57:
@@ -44,6 +44,34 @@ aircraft:
       source: assets/aircraft/J20.obj
       file: j20s.obj
       converter: j20
+
+  J-16:
+    length_m: 21.9
+    voxel_m: 0.32
+    web:
+      # 双座重型多用途型，机头 −X、+Y 向上；模型自带全套挂载。
+      source: assets/aircraft/j_16.obj
+      file: j16.obj
+      converter: j16
+      # 原始 99 万面：4 cm 体素 + 二次误差定位代表点（薄翼面厚度只有 7 cm，
+      # 体素再大就会把内外蒙皮并到一起，表面出现台阶），导出约 17 万面。
+      decimate_m: 0.04
+      # 与 J-15T 同一套涂装链路：烘焙 MTL 里的 DDS 颜色/法线贴图。
+      textures: true
+
+  J-15T:
+    length_m: 21.9
+    voxel_m: 0.32
+    web:
+      # 弹射型舰载机，与 J-16 同一轴向约定。
+      source: assets/aircraft/j_15t.obj
+      file: j15t.obj
+      converter: j15t
+      # 原始 79 万面，同样按 4 cm 体素 + 二次误差抽稀，导出约 16 万面。
+      decimate_m: 0.04
+      # 模型自带 MTL 与 DDS 涂装：烘焙机体颜色的贴图交给前端，
+      # 覆盖程序化迷彩（导出时会缩到 2048 并转 WebP）。
+      textures: true
 
   F-15C:
     length_m: 19.43

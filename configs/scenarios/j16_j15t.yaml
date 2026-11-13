@@ -1,0 +1,47 @@
+# 1v1 超视距对抗：J-16（空军重型多用途）vs J-15T（弹射型舰载），120 km 对头。
+# 无预警机支援，双方雷达 auto（自行开机搜索/跟踪/制导），600 s 时限。
+# 双方同为 WS-10B 双发、62 m² 翼面，差异主要在结构过载（9 g / 8.5 g）、
+# 阻力（0.044 / 0.045）与 J-15T 的固定鸭翼增升。
+id: j16-j15t
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 60000          # 每架距空域中心 60 km，总间距 120 km
+  altitude_m: 9000
+  y_offset_m: 100
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    aircraft: J-16
+    loadout:
+      ir:
+        weapon: PL-10
+        count: 4                # 4 近距 + 4 中距的标准对空构型
+      radar:
+        weapon: PL-15
+        count: 4                # J-16 可挂 6 枚，本局取与对手同量
+      countermeasures:
+        chaff: 30
+        flare: 24
+    radar_policy: auto
+  - name: blue
+    aircraft: J-15T
+    loadout:
+      ir:
+        weapon: PL-10
+        count: 4
+      radar:
+        weapon: PL-15
+        count: 4
+      countermeasures:
+        chaff: 30
+        flare: 24
+    radar_policy: auto
+
+awacs: false
+# seed 由实验脚本逐局传入；不在场景里固定，避免覆盖随机化。

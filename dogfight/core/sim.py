@@ -2237,14 +2237,16 @@ class World:
             alpha_trim = alpha
         else:
             # 全动鸭翼的作动器速率有限，迎角环增益取低带宽版本；
-            # 平尾舵机响应快，沿用原来的 8/s。
-            k_alpha = 3.0 if spec.canard else 8.0
+            # 平尾舵机响应快，沿用原来的 8/s。固定式鸭翼（deflect_max=0）
+            # 只增升不参与俯仰操纵，俯仰仍由平尾负责。
+            k_alpha = 3.0 if (spec.canard and spec.canard_deflect_max > 0.0) else 8.0
             q_cmd = clamp(k_alpha * (alpha_cmd - alpha) + gamma_dot, -0.9, 0.9)
             alpha_trim = alpha_cmd
 
         # 可用的俯仰力矩权限（N·m）：鸭翼/平尾与主翼后缘升降副翼共同分配。
         a_can = 0.0
-        if spec.canard and spec.canard_area > 0.0 and spec.canard_arm > 0.0:
+        if (spec.canard and spec.canard_deflect_max > 0.0
+                and spec.canard_area > 0.0 and spec.canard_arm > 0.0):
             a_can = (
                 qbar * spec.canard_area * spec.canard_arm
                 * max(spec.canard_cl_max, 1e-6)

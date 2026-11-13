@@ -24,6 +24,10 @@ class WebAsset:
     source: Path
     file: str
     converter: str
+    # 可选体素抽稀尺度（米）：导出前把三角形按该尺度聚类，0/None 表示不抽稀。
+    decimate_m: float | None = None
+    # 是否把 MTL 里机体材质的 DDS 涂装烘焙成 WebP 并交给前端使用。
+    textures: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,7 +83,7 @@ def _path(base: Path, raw, where: str) -> Path:
 
 
 def _parse_web(raw: dict, base: Path, where: str) -> WebAsset:
-    unknown = set(raw) - {"source", "file", "converter"}
+    unknown = set(raw) - {"source", "file", "converter", "decimate_m", "textures"}
     if unknown:
         raise ConfigError(f"{where}: 未知字段 {', '.join(sorted(unknown))}")
     file = raw.get("file")
@@ -88,10 +92,18 @@ def _parse_web(raw: dict, base: Path, where: str) -> WebAsset:
     converter = raw.get("converter")
     if not isinstance(converter, str) or not converter:
         raise ConfigError(f"{where}.converter 必须是非空字符串")
+    decimate = _number(raw, "decimate_m", where, required=False)
+    if decimate is not None and decimate <= 0.0:
+        raise ConfigError(f"{where}.decimate_m 必须是正数（0 表示不抽稀）")
+    textures = raw.get("textures", False)
+    if not isinstance(textures, bool):
+        raise ConfigError(f"{where}.textures 必须是布尔值")
     return WebAsset(
         source=_path(base, raw.get("source"), f"{where}.source"),
         file=file,
         converter=converter,
+        decimate_m=decimate or None,
+        textures=textures,
     )
 
 

@@ -64,28 +64,52 @@ def _three_vertex(p):
 
 
 def _write_obj(path: Path, pts, faces, name: str, canopy_faces=None,
-               store_faces=None) -> None:
-    """写 three.js 用 OBJ；canopy_faces / store_faces 是 faces 的归组面序号。"""
+               store_faces=None, uv_faces=None) -> None:
+    """写 three.js 用 OBJ；canopy_faces / store_faces 是 faces 的归组面序号。
+
+    uv_faces 与 faces 一一对应时写 `vt` 与 `f v/vt`（角点 UV 来自原始模型，
+    抽稀只改顶点位置，UV 按面逐角保留，不会在接缝处被平均成一片）。
+    """
     groups = {"body": [], "canopy": [], "stores": []}
     canopy_faces = canopy_faces or set()
     store_faces = store_faces or set()
+    uv_ids: dict[tuple[float, float], int] = {}
+    uv_defs: list[tuple[float, float]] = []
+
+    def vt_index(uv) -> int:
+        key = (round(uv[0], 5), round(uv[1], 5))
+        idx = uv_ids.get(key)
+        if idx is None:
+            uv_defs.append(key)
+            idx = len(uv_defs) - 1
+            uv_ids[key] = idx
+        return idx
+
     for n, (idx, _material) in enumerate(faces):
         if n in store_faces:
-            groups["stores"].append(idx)
+            target = groups["stores"]
         elif n in canopy_faces:
-            groups["canopy"].append(idx)
+            target = groups["canopy"]
         else:
-            groups["body"].append(idx)
+            target = groups["body"]
+        corner = uv_faces[n] if uv_faces is not None else None
+        if (corner is not None and len(corner) == len(idx)
+                and all(uv is not None for uv in corner)):
+            target.append("f " + " ".join(
+                f"{i + 1}/{vt_index(uv) + 1}" for i, uv in zip(idx, corner)))
+        else:
+            target.append("f " + " ".join(str(i + 1) for i in idx))
     lines = [f"# dogfight web {MODEL_TAG}", f"o {name}"]
     for x, y, z in pts:
         lines.append(f"v {x:.3f} {y:.3f} {z:.3f}")
+    for u, v in uv_defs:
+        lines.append(f"vt {u:.5f} {v:.5f}")
     for kind in ("body", "canopy", "stores"):
         group = groups[kind]
         if not group:
             continue
         lines.append(f"usemtl {kind}")
-        for idx in group:
-            lines.append("f " + " ".join(str(i + 1) for i in idx))
+        lines.extend(group)
     tmp = path.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(tmp, path)
@@ -121,7 +145,7 @@ def _export_missile(path: Path, length: float):
         return tuple((v[k] - centers[j]) * scale for j, k in enumerate(others)) + (z,)
 
     pts = [conv(v) for v in verts]
-    pts, faces = view.cluster(pts, faces, max(0.004, length / 300.0))
+    pts, faces, _uv = view.cluster(pts, faces, max(0.004, length / 300.0))
     return pts, faces
 
 
@@ -131,6 +155,82 @@ def _exported_ok(path: Path) -> bool:
             return fh.readline().strip() == f"# dogfight web {MODEL_TAG}"
     except OSError:
         return False
+
+
+# 贴图烘焙：原始 DDS 是 4096² 未压缩 RGBA（单张 67 MB），浏览器既不能直接
+# 用也不需要这个分辨率；统一缩到 2048 再压成 WebP。
+TEXTURE_MAX = 2048
+
+
+def _mtl_map(mtl: Path, material: str, key: str) -> Path | None:
+    """取 MTL 里某个材质的贴图路径（如 map_Kd）。"""
+    current = None
+    try:
+        lines = mtl.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "newmtl":
+            current = line.split(None, 1)[1].strip() if len(parts) > 1 else None
+        elif parts[0] == key and current == material and len(parts) > 1:
+            path = mtl.parent / parts[1]
+            return path if path.exists() else None
+    return None
+
+
+def _bake_textures(source: Path, material: str, stem: str) -> dict | None:
+    """把机体材质的颜色/法线 DDS 烘焙成 WebP，返回 meta 里的贴图地址。
+
+    法线图按 `xxx_c.dds` → `xxx_n.dds` 的命名约定找；没有对应文件时只出颜色图。
+    输出与源文件同样放在 static/models 下，随模型版本号一起缓存。
+    """
+    if not material:
+        return None
+    mtl = source.with_suffix(".mtl")
+    color_src = _mtl_map(mtl, material, "map_Kd")
+    if color_src is None:
+        # 原始 DDS 可能已从 assets 里清掉；只要烘焙结果还在就继续沿用，
+        # 避免别的机型因为贴图源缺失而丢掉已有涂装。
+        kept = {
+            kind: f"/api/models/{stem}_{kind}.webp"
+            for kind in ("color", "normal")
+            if (MODEL_DIR / f"{stem}_{kind}.webp").exists()
+        }
+        return kept or None
+    normal_src = color_src.with_name(color_src.name.replace("_c.dds", "_n.dds"))
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[models] 未安装 Pillow，跳过贴图烘焙（改用程序化涂装）")
+        return None
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    out = {}
+    for kind, path, quality in (("color", color_src, 88), ("normal", normal_src, 92)):
+        if not path.exists():
+            continue
+        dst = MODEL_DIR / f"{stem}_{kind}.webp"
+        if dst.exists() and dst.stat().st_mtime >= path.stat().st_mtime:
+            out[kind] = f"/api/models/{dst.name}"
+            continue
+        try:
+            with Image.open(path) as im:
+                rgb = im.convert("RGB")
+                if max(rgb.size) > TEXTURE_MAX:
+                    scale = TEXTURE_MAX / max(rgb.size)
+                    rgb = rgb.resize(
+                        (max(1, round(rgb.width * scale)),
+                         max(1, round(rgb.height * scale))),
+                        Image.LANCZOS,
+                    )
+                rgb.save(dst, "WEBP", quality=quality, method=6)
+        except (OSError, ValueError) as exc:
+            print(f"[models] 贴图烘焙失败 {path.name}: {exc}")
+            continue
+        out[kind] = f"/api/models/{dst.name}"
+    return out or None
 
 
 def export_models() -> dict:
@@ -154,16 +254,43 @@ def export_models() -> dict:
         geo = view.convert_model(
             asset.web.source, asset.web.converter, asset.length_m,
         )
+        uv_faces = geo.get("uv_faces") if asset.web.textures else None
+        if asset.web.decimate_m:
+            # 高模按体素聚类抽稀：只在导出副本上做，原始 OBJ 不动。
+            # quadric=True 用二次误差把代表点放到局部主平面上，平板不会
+            # 被体素中心拽出一层层台阶。
+            pts_c, cf, uv_c = view.cluster(
+                geo["pts"], geo["faces"], asset.web.decimate_m,
+                geo["canopy"], geo.get("stores") or set(),
+                quadric=True, uv_faces=uv_faces,
+            )
+            geo = {
+                **geo,
+                "pts": pts_c,
+                "faces": [(idx, "body") for idx, _kind in cf],
+                "canopy": {n for n, (_idx, kind) in enumerate(cf) if kind == "canopy"},
+                "stores": {n for n, (_idx, kind) in enumerate(cf) if kind == "stores"},
+            }
+            uv_faces = uv_c
         pts = [_three_vertex(p) for p in geo["pts"]]
         _write_obj(
             MODEL_DIR / asset.web.file, pts, geo["faces"],
             name.lower().replace("-", ""), geo["canopy"], geo.get("stores"),
+            uv_faces,
         )
-        aircraft[name] = {
+        entry = {
             "url": f"/api/models/{asset.web.file}",
             "length": asset.length_m,
             "engines": [[*_three_vertex(e)] for e in geo["engines"]],
         }
+        if asset.web.textures:
+            baked = _bake_textures(
+                asset.web.source, geo.get("body_material") or "",
+                Path(asset.web.file).stem,
+            )
+            if baked:
+                entry["textures"] = baked
+        aircraft[name] = entry
     missiles = {}
     for name, asset in _CATALOG.missiles.items():
         pts, faces = _export_missile(asset.source, asset.length_m)

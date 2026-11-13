@@ -1,0 +1,68 @@
+# J-16：双座双发重型多用途，苏-27 系气动 + 国产 AESA；偏能量战与中距压制。
+id: J-16
+name: J-16
+
+airframe:
+  # 空机 17,700 + 半油 4,700 ≈ 22,400，取整 22,500（含第二名飞行员与设备）。
+  base_mass_kg: 22500
+  wing_area_m2: 62.0
+  cl_max: 1.55
+  n_struct_g: 9
+  thrust_max_kn: 270        # WS-10B 双发加力（135 kN × 2）
+  thrust_mil_kn: 180        # 双发军用推力（90 kN × 2）
+  cd0: 0.044
+  aspect_ratio: 3.49        # 翼展 14.7 m / 面积 62.0 m²
+  oswald: 0.80
+  cl_alpha: 3.90
+  cruise_mach: 0.95
+  fuel_capacity_kg: 9400
+  lapse_exp: 0.68
+  ram_r0: 0.18
+  ram_r1: 0.12
+  derate_z_m: 17000
+  derate_H_m: 5500
+  eta_install: 0.96
+  hp_max: 110
+  # 30 mm GSh-30-1，备弹量按同型炮常见 150 发估计。
+  gun_range_m: 1000
+  gun_dps: 30
+  ammo_max: 150
+  rounds_per_sec: 25
+  length_m: 21.9
+  muzzle_speed: 900
+  bullet_mass_kg: 0.390
+  bullet_diameter_m: 0.030
+  gun_spread: 0.003
+  # 无推力矢量。
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  # 主翼后缘襟副翼（约 6.2 m²，0.10 S）参与俯仰配平与机动；
+  # 平尾是全动平尾，由默认俯仰通道承担，不做成鸭翼。
+  elevon_area_ratio: 0.10
+  elevon_arm_ratio: 0.30
+  elevon_deflect_max_deg: 20
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.6
+  elevon_cl_max: 1.0
+  # 垂尾为固定结构 + 方向舵，不启用全动垂尾通道。
+  all_moving_fin: false
+  cn_dr: 0.09
+
+sensors:
+  # 非隐身平台，RCS 与 F-15E 同量级（外挂多时略大）。
+  rcs: 6.0
+  rcs_front: 6.0
+  rcs_side: 15.0
+  rcs_back: 10.0
+  radar_range_km: 180        # 国产机载 AESA（估计值）
+  side_array: false
+  lband: false
+  irst_range_km: 60          # OLS-30 系光电球
+
+agent:
+  aggression: 0.78
+  energy_pref: 0.62
+  lure: false
+  style: energy

@@ -208,14 +208,34 @@
     return tex;
   })();
 
-  const ambient = new THREE.AmbientLight(0xffffff, 0.42);
+  // 观战视角采用舞台布光：环境光压到很低，机体主要靠跟随的聚光灯打亮；
+  // 检视模式仍用原来的近距离三点布光（见下面的 inspectLights）。
+  const ambient = new THREE.AmbientLight(0xffffff, INSPECT !== null ? 0.42 : 0.05);
   scene.add(ambient);
-  const keyLight = new THREE.DirectionalLight(0xdfe8ff, 0.86);
+  const keyLight = new THREE.DirectionalLight(0xdfe8ff, INSPECT !== null ? 0.86 : 0.06);
   keyLight.position.copy(w2t([-0.35, -0.55, 0.76]).multiplyScalar(1e6));
   scene.add(keyLight);
-  const fillLight = new THREE.DirectionalLight(0xffd8c0, 0.24);
+  const fillLight = new THREE.DirectionalLight(0xffd8c0, INSPECT !== null ? 0.24 : 0.03);
   fillLight.position.copy(w2t([0.42, 0.36, -0.80]).multiplyScalar(1e6));
   scene.add(fillLight);
+
+  // 每架飞机两盏跟随聚光灯：主光从相机一侧斜上方打下来，保证看得见的那面
+  // 有明确的亮部；轮廓光从反侧擦过来勾边。decay 取 0 是为了让光斑大小只跟
+  // 机体有关——远距观战时机体被按屏幕尺寸放大，灯也必须同步放大，否则光斑
+  // 只有真实尺寸那么大，远远看去飞机仍然是一团灰影。
+  const stageLights = [];
+  if (INSPECT === null) {
+    for (let i = 0; i < 2; i += 1) {
+      const key = new THREE.SpotLight(0xf4f8ff, 3.0, 0.0, 0.50, 0.88, 0.0);
+      const rim = new THREE.SpotLight(0x9fc4ff, 1.8, 0.0, 0.54, 0.92, 0.0);
+      for (const light of [key, rim]) {
+        light.visible = false;
+        scene.add(light);
+        scene.add(light.target);
+      }
+      stageLights.push({ key, rim });
+    }
+  }
 
   // 检视模式补光：正常观战距离远，靠轮廓光即可；近距看材质时暗色蒙皮
   // 需要方向明确的主光/侧光，否则曲面与高光都看不出来。
@@ -503,16 +523,16 @@
         float r = tex.r, g = tex.g, b = tex.b;
         float sea = clamp((min(g, b) - r - 12.0) / 36.0, 0.0, 1.0);
         float luma = dot(tex, vec3(0.30, 0.59, 0.11));
-        vec3 landCol = mix(vec3(0.075, 0.115, 0.170),
-                           vec3(0.235, 0.305, 0.390),
+        vec3 landCol = mix(vec3(0.035, 0.055, 0.082),
+                           vec3(0.105, 0.140, 0.180),
                            smoothstep(0.55, 0.97, luma));
-        col = mix(landCol, vec3(0.028, 0.052, 0.088), sea);
-        col += vec3(0.055, 0.075, 0.100) * smoothstep(0.86, 1.0, luma) * (1.0 - sea);
+        col = mix(landCol, vec3(0.013, 0.024, 0.040), sea);
+        col += vec3(0.026, 0.036, 0.048) * smoothstep(0.86, 1.0, luma) * (1.0 - sea);
       } else {
         float lum = dot(tex, vec3(0.22, 0.42, 0.16));
         // 先去色，再压成冷蓝灰阶，橙色建成区变成浅色斑块
-        vec3 deep = vec3(0.032, 0.058, 0.094);
-        vec3 land = vec3(0.195, 0.265, 0.345);
+        vec3 deep = vec3(0.014, 0.026, 0.043);
+        vec3 land = vec3(0.090, 0.125, 0.165);
         col = mix(deep, land, clamp(lum * 1.02, 0.0, 1.0));
         col += vec3(0.004, 0.012, 0.024) * smoothstep(0.35, 1.0, lum);
       }
@@ -529,7 +549,7 @@
 
       // 远处混入冷灰雾
       float dist = length(vP - uCam);
-      col = mix(col, vec3(0.115, 0.16, 0.20),
+      col = mix(col, vec3(0.055, 0.078, 0.100),
                 smoothstep(uMapM * 0.75, uSlabM, dist) * 0.55);
 
       // 图幅边缘羽化
@@ -812,8 +832,8 @@
         uTone: { value: 0.0 },
         uFeather: { value: 0.018 },
         uAlpha: { value: 0.92 },
-        uCoast: { value: 0.80 },
-        uLightGain: { value: 0.38 },
+        uCoast: { value: 0.62 },
+        uLightGain: { value: 0.16 },
       },
       vertexShader: floorMapVert,
       fragmentShader: floorMapFrag,
@@ -843,8 +863,8 @@
           uTone: { value: 1.0 },
           uFeather: { value: 0.05 },
           uAlpha: { value: 0.97 },
-          uCoast: { value: 0.18 },
-          uLightGain: { value: 0.22 },
+          uCoast: { value: 0.70 },
+          uLightGain: { value: 0.39 },
         },
         vertexShader: floorMapVert,
         fragmentShader: floorMapFrag,
@@ -1100,6 +1120,9 @@
   const MODEL_URLS = {};
   // 导弹模型由服务端按真实弹长导出：弹头在局部原点、弹体沿 +Z 向弹尾延伸。
   const MISSILE_URLS = {};
+  // 带烘焙贴图的机体：{ color, normal } 两个 URL，来自服务端 meta.json。
+  const MODEL_TEXTURES = {};
+  let MODEL_VER = "";
   const MODEL_GEOS = {};
   const MISSILE_GEOS = {};
   const MODELS_READY = (async () => {
@@ -1108,10 +1131,14 @@
     let ver = "";
     try {
       const meta = await (await fetch("/api/models/meta.json", { cache: "no-store" })).json();
-      if (meta && meta.version) ver = `?v=${encodeURIComponent(meta.version)}`;
+      if (meta && meta.version) {
+        ver = `?v=${encodeURIComponent(meta.version)}`;
+        MODEL_VER = ver;
+      }
       const models = (meta && meta.models) || {};
       for (const [name, entry] of Object.entries(models.aircraft || {})) {
         MODEL_URLS[name] = entry.url;
+        if (entry.textures) MODEL_TEXTURES[name] = entry.textures;
       }
       for (const [name, entry] of Object.entries(models.missiles || {})) {
         MISSILE_URLS[name] = entry.url;
@@ -1128,7 +1155,9 @@
       ...Object.entries(MISSILE_URLS).map(async ([name, url]) => {
         const res = await fetch(url + ver, { cache: "no-store" });
         const text = await res.text();
-        const geo = parseOBJ(text, 80);
+        // 导弹模型的绕向混用最严重（薄翼面正反两片），加载时统一绕向；
+        // 同时用 8 mm 焊接尺度把格栅翼面上的微凹坑并平。
+        const geo = parseOBJ(text, 80, true, 8);
         assignMissileUV(geo.body);
         missileShared.add(geo.body);
         missileShared.add(geo.canopy);
@@ -1143,11 +1172,13 @@
   // 全平面着色：机身曲面碎成一块块棱面，远看就像一层蒙皮网格。这里先按 1 mm
   // 量化焊接顶点，再按夹角阈值平均法线，既让曲面连续，又保住进气道唇口、
   // 翼前缘这类真实硬边。
-  function weldAndSmooth(rawGeo, angleDeg) {
+  function weldAndSmooth(rawGeo, angleDeg, weldMm, uvSrc) {
     const pos = rawGeo.attributes.position.array;
     const n = pos.length / 3;
     if (!n) return rawGeo;
-    const q = 1e3; // 1 mm
+    // 焊接尺度默认 1 mm；导弹的格栅翼面由 5 mm 量级的微凹坑拼成，需要更粗的
+    // 尺度把这些凹坑并成一个平面，否则每个坑的侧壁各算各的法线，近看是一片点阵。
+    const q = 1000 / (weldMm || 1);
     const map = new Map();
     const verts = [];
     const index = new Int32Array(n);
@@ -1163,9 +1194,27 @@
       index[i] = id;
     }
     const triCount = n / 3;
-    const fn = new Float32Array(triCount * 3);
+    // 去掉重合三角形并丢掉退化面：原始模型里纸一样薄的翼面（导弹尾翼、
+    // 平尾前缘）是正反两片顶点完全重合的三角形。装配后两片处在同一深度，
+    // DoubleSide 下逐像素互抢，近看就是黑底点阵。合并成一片后背面交给
+    // DoubleSide 渲染，既没有 z-fighting，法线也不会互相抵消。
+    const tris = [];
+    const srcTri = [];
+    const seenTri = new Set();
     for (let t = 0; t < triCount; t += 1) {
-      const a = index[t * 3] * 3, b = index[t * 3 + 1] * 3, c = index[t * 3 + 2] * 3;
+      const ia = index[t * 3], ib = index[t * 3 + 1], ic = index[t * 3 + 2];
+      if (ia === ib || ib === ic || ia === ic) continue;
+      const s = [ia, ib, ic].sort((x, y) => x - y);
+      const key = `${s[0]}|${s[1]}|${s[2]}`;
+      if (seenTri.has(key)) continue;
+      seenTri.add(key);
+      tris.push(ia, ib, ic);
+      srcTri.push(t);
+    }
+    const kept = tris.length / 3;
+    const fn = new Float32Array(kept * 3);
+    for (let t = 0; t < kept; t += 1) {
+      const a = tris[t * 3] * 3, b = tris[t * 3 + 1] * 3, c = tris[t * 3 + 2] * 3;
       const ax = verts[b] - verts[a], ay = verts[b + 1] - verts[a + 1], az = verts[b + 2] - verts[a + 2];
       const bx = verts[c] - verts[a], by = verts[c + 1] - verts[a + 1], bz = verts[c + 2] - verts[a + 2];
       let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
@@ -1176,21 +1225,22 @@
     }
     // 顶点 → 相邻面
     const adj = new Map();
-    for (let t = 0; t < triCount; t += 1) {
+    for (let t = 0; t < kept; t += 1) {
       for (let k = 0; k < 3; k += 1) {
-        const v = index[t * 3 + k];
+        const v = tris[t * 3 + k];
         let list = adj.get(v);
         if (!list) { list = []; adj.set(v, list); }
         list.push(t);
       }
     }
     const cosLim = Math.cos((angleDeg * Math.PI) / 180);
-    const outPos = new Float32Array(n * 3);
-    const outNrm = new Float32Array(n * 3);
-    for (let t = 0; t < triCount; t += 1) {
+    const outPos = new Float32Array(kept * 9);
+    const outNrm = new Float32Array(kept * 9);
+    const outUV = uvSrc ? new Float32Array(kept * 6) : null;
+    for (let t = 0; t < kept; t += 1) {
       const fx = fn[t * 3], fy = fn[t * 3 + 1], fz = fn[t * 3 + 2];
       for (let k = 0; k < 3; k += 1) {
-        const vi = index[t * 3 + k];
+        const vi = tris[t * 3 + k];
         const list = adj.get(vi);
         let sx = 0, sy = 0, sz = 0;
         for (let j = 0; j < list.length; j += 1) {
@@ -1219,17 +1269,125 @@
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(outPos, 3));
     geo.setAttribute("normal", new THREE.BufferAttribute(outNrm, 3));
+    if (outUV) {
+      for (let t = 0; t < kept; t += 1) {
+        const src = srcTri[t];
+        for (let k = 0; k < 3; k += 1) {
+          const o = (t * 3 + k) * 2;
+          const s = (src * 3 + k) * 2;
+          outUV[o] = uvSrc[s];
+          outUV[o + 1] = uvSrc[s + 1];
+        }
+      }
+      geo.setAttribute("uv", new THREE.BufferAttribute(outUV, 2));
+    }
     geo.computeBoundingBox();
     geo.computeBoundingSphere();
     return geo;
   }
 
-  function parseOBJ(text, bodyAngle) {
+  // 原始模型的三角形绕向是混着来的：R-77 尾段 314 个面里有 94 个朝内。
+  // DoubleSide 只按 gl_FrontFacing 翻法线，朝内的面在正面被看到时法线仍
+  // 指向机内，光照算出接近 0 的亮度，于是弹翼上出现一层“黑底点阵”。
+  // 这里按共享边做广度优先，把每个连通片统一成同一绕向。
+  function unifyWinding(pos, uv) {
+    const triCount = pos.length / 9;
+    if (!triCount) return;
+    const q = 1e3;
+    const map = new Map();
+    const id = new Int32Array(triCount * 3);
+    for (let i = 0; i < triCount * 3; i += 1) {
+      const k = `${Math.round(pos[i * 3] * q)}|${Math.round(pos[i * 3 + 1] * q)}|${Math.round(pos[i * 3 + 2] * q)}`;
+      let v = map.get(k);
+      if (v === undefined) { v = map.size; map.set(k, v); }
+      id[i] = v;
+    }
+    const edges = new Map();
+    for (let t = 0; t < triCount; t += 1) {
+      for (let k = 0; k < 3; k += 1) {
+        const a = id[t * 3 + k];
+        const b = id[t * 3 + (k + 1) % 3];
+        if (a === b) continue;
+        const key = a < b ? a * 1e7 + b : b * 1e7 + a;
+        let list = edges.get(key);
+        if (!list) { list = []; edges.set(key, list); }
+        list.push(t);
+      }
+    }
+    const dirOf = (t, lo, hi) => {
+      for (let k = 0; k < 3; k += 1) {
+        const a = id[t * 3 + k];
+        const b = id[t * 3 + (k + 1) % 3];
+        if (a === lo && b === hi) return 1;
+        if (a === hi && b === lo) return -1;
+      }
+      return 0;
+    };
+    const flip = new Uint8Array(triCount);
+    const seen = new Uint8Array(triCount);
+    const stack = [];
+    for (let seed = 0; seed < triCount; seed += 1) {
+      if (seen[seed]) continue;
+      // 种子面先朝外：面法线与“离弹轴方向”同向。
+      const a = seed * 9;
+      const ax = pos[a + 3] - pos[a], ay = pos[a + 4] - pos[a + 1], az = pos[a + 5] - pos[a + 2];
+      const bx = pos[a + 6] - pos[a], by = pos[a + 7] - pos[a + 1], bz = pos[a + 8] - pos[a + 2];
+      const nx = ay * bz - az * by, ny = az * bx - ax * bz;
+      const cx = (pos[a] + pos[a + 3] + pos[a + 6]) / 3;
+      const cy = (pos[a + 1] + pos[a + 4] + pos[a + 7]) / 3;
+      if (nx * cx + ny * cy < 0) flip[seed] = 1;
+      seen[seed] = 1;
+      stack.length = 0;
+      stack.push(seed);
+      while (stack.length) {
+        const t = stack.pop();
+        for (let k = 0; k < 3; k += 1) {
+          const va = id[t * 3 + k];
+          const vb = id[t * 3 + (k + 1) % 3];
+          if (va === vb) continue;
+          const lo = Math.min(va, vb);
+          const hi = Math.max(va, vb);
+          const list = edges.get(lo * 1e7 + hi);
+          if (!list || list.length !== 2) continue;
+          const nb = list[0] === t ? list[1] : list[0];
+          if (nb === t) continue;
+          const d0 = dirOf(t, lo, hi) * (flip[t] ? -1 : 1);
+          const d1 = dirOf(nb, lo, hi);
+          if (seen[nb]) continue;
+          seen[nb] = 1;
+          flip[nb] = d0 === d1 ? 1 : 0;
+          stack.push(nb);
+        }
+      }
+    }
+    for (let t = 0; t < triCount; t += 1) {
+      if (!flip[t]) continue;
+      const o = t * 9;
+      for (let k = 0; k < 3; k += 1) {
+        const tmp = pos[o + 3 + k];
+        pos[o + 3 + k] = pos[o + 6 + k];
+        pos[o + 6 + k] = tmp;
+      }
+      // 绕向翻转会把第 2、3 个角点对调，UV 必须跟着换，否则贴图错位。
+      if (uv) {
+        const u = t * 6;
+        const tu = uv[u + 2];
+        const tv = uv[u + 3];
+        uv[u + 2] = uv[u + 4];
+        uv[u + 3] = uv[u + 5];
+        uv[u + 4] = tu;
+        uv[u + 5] = tv;
+      }
+    }
+  }
+
+  function parseOBJ(text, bodyAngle, fixWinding, weldMm) {
     const verts = [];
+    const uvs = [];
     const groups = {
-      body: { pos: [], count: 0 },
-      canopy: { pos: [], count: 0 },
-      stores: { pos: [], count: 0 },
+      body: { pos: [], uv: [], hasUV: false, count: 0 },
+      canopy: { pos: [], uv: [], hasUV: false, count: 0 },
+      stores: { pos: [], uv: [], hasUV: false, count: 0 },
     };
     let material = "body";
     const lines = text.split(/\r?\n/);
@@ -1239,19 +1397,36 @@
       if (kind === "v ") {
         const parts = raw.trim().split(/\s+/);
         verts.push([+parts[1], +parts[2], +parts[3]]);
+      } else if (raw.startsWith("vt ")) {
+        const parts = raw.trim().split(/\s+/);
+        uvs.push([+parts[1], +(parts[2] || 0)]);
       } else if (raw.startsWith("usemtl ")) {
         const name = raw.slice(7).trim();
         material = (name === "canopy" || name === "stores") ? name : "body";
       } else if (kind === "f ") {
-        const idx = raw.trim().split(/\s+/).slice(1)
-          .map((tok) => parseInt(tok.split("/")[0], 10) - 1);
+        const toks = raw.trim().split(/\s+/).slice(1);
+        const idx = toks.map((tok) => parseInt(tok.split("/")[0], 10) - 1);
         if (idx.length < 3) continue;
+        // OBJ 的 vt 按角点给：同一个顶点在不同面上可以指向不同 UV。
+        const corner = toks.map((tok) => {
+          const bits = tok.split("/");
+          const t = bits.length > 1 && bits[1] ? parseInt(bits[1], 10) - 1 : -1;
+          return t >= 0 && uvs[t] ? uvs[t] : null;
+        });
         const g = groups[material];
         for (let t = 1; t < idx.length - 1; t += 1) {
-          for (const i of [idx[0], idx[t], idx[t + 1]]) {
+          for (const k of [0, t, t + 1]) {
+            const i = idx[k];
             const p = verts[i];
             if (!p) continue;
             g.pos.push(p[0], p[1], p[2]);
+            const uv = corner[k];
+            if (uv) {
+              g.uv.push(uv[0], uv[1]);
+              g.hasUV = true;
+            } else {
+              g.uv.push(0, 0);
+            }
             g.count += 1;
           }
         }
@@ -1259,11 +1434,13 @@
     }
     const out = {};
     for (const key of ["body", "canopy", "stores"]) {
+      const g = groups[key];
+      if (fixWinding && g.pos.length) unifyWinding(g.pos, g.uv);
       const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.Float32BufferAttribute(groups[key].pos, 3));
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(g.pos, 3));
       // 座舱玻璃尺寸小、需要更硬的边界；机体/挂架用较大角度让蒙皮连续。
       const angle = key === "canopy" ? 34 : key === "stores" ? 60 : (bodyAngle || 72);
-      out[key] = weldAndSmooth(geo, angle);
+      out[key] = weldAndSmooth(geo, angle, weldMm, g.hasUV ? g.uv : null);
       out[key].computeBoundingSphere();
     }
     return out;
@@ -1608,6 +1785,21 @@
       tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
       mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
       markLateral: [1.55, 2.00] },
+    // J-16：空军低可视灰，翼根略深、翼尖略浅；垂尾“八一”军徽。
+    // markCenter 取自模型垂尾包围盒（three.js 坐标：z 沿机身、y 向上）。
+    "J-16": { gradient: ["#5f666e", "#8a9199"], halfSpan: 7.35,
+      tile: 8.4, len: 21.9, seed: 86, base: [255, 255, 255],
+      nose: [62, 66, 72], noseAmt: 1.0, noseEdge: RADOME_EDGE,
+      tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      mark: "cn", markCenter: [6.75, 1.80], markSize: 0.50,
+      markLateral: [2.00, 2.30] },
+    // J-15T：海军灰蓝，翼根偏深；同样带“八一”军徽。
+    "J-15T": { gradient: ["#58616c", "#828c98"], halfSpan: 7.35,
+      tile: 8.4, len: 21.9, seed: 97, base: [255, 255, 255],
+      nose: [58, 63, 71], noseAmt: 1.0, noseEdge: RADOME_EDGE,
+      tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      mark: "cn", markCenter: [7.25, 1.70], markSize: 0.50,
+      markLateral: [2.08, 2.38] },
   };
   const camoTextures = {};
   const camoMaterials = {};
@@ -1639,32 +1831,92 @@
     return camoTextures[name];
   }
 
+  // 烘焙涂装纹理：颜色图按 sRGB 解码，法线图保持线性；与模型共用版本号缓存。
+  const aircraftTexCache = {};
+  function aircraftTextures(name) {
+    const info = MODEL_TEXTURES[name];
+    if (!info) return null;
+    if (aircraftTexCache[name] !== undefined) return aircraftTexCache[name];
+    const loader = new THREE.TextureLoader();
+    const maxAniso = renderer.capabilities.getMaxAnisotropy();
+    const load = (url, srgb) => {
+      if (!url) return null;
+      const tex = loader.load(url + MODEL_VER);
+      tex.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+      tex.anisotropy = Math.min(8, maxAniso);
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      return tex;
+    };
+    const set = { color: load(info.color, true), normal: load(info.normal, false) };
+    aircraftTexCache[name] = set;
+    return set;
+  }
+
   function camoMaterial(team, name) {
     const key = `${team}|${name}`;
     const cached = camoMaterials[key];
-    if (cached) return cached;
+    if (cached) {
+      // 贴图在 meta 之后才可用：若材质是首帧提前建好的，这里补挂一次。
+      const ref = cached.userData && cached.userData.texRef;
+      if (ref && !ref.color && MODEL_TEXTURES[name]) {
+        const tex = aircraftTextures(name);
+        if (tex && tex.color) {
+          ref.color = tex.color;
+          ref.normal = tex.normal || null;
+          cached.color.set(0xffffff);
+          cached.map = tex.color;
+          if (tex.normal) {
+            cached.normalMap = tex.normal;
+            cached.normalScale.set(0.65, 0.65);
+          }
+          cached.needsUpdate = true;
+        }
+      }
+      return cached;
+    }
     const part = CAMO_SPECS[name] || CAMO_SPECS["SU-57"];
+    // 模型自带烘焙涂装时直接采样贴图，程序化迷彩只作兜底。
+    const texRef = { color: null, normal: null };
     // neutral：该机不叠加任何队伍色（涂装按真实配色呈现）。
     const neutral = part.neutral === true;
     const tint = neutral ? 0.0 : Math.min(0.34, part.tint);
     const rimColor = new THREE.Color(rgbHex(
       neutral ? [214, 219, 225] : mix(RGB.TEAM[team], [255, 255, 255], 0.35)
     ));
-    // 低可视度金属漆：中等金属度 + 偏高粗糙度，薄清漆层只提供一层高光；
-    // 纯漫反射在暗背景下会显得像塑料，金属度与清漆让蒙皮有真实反光。
+    // 低可视度金属漆：涂装本身是电介质薄膜（金属度≈0，见 fragment 注入），
+    // 靠清漆层与中等粗糙度给出漆面高光；金属度只由尾喷段/掉漆处的注入覆盖。
     const mat = new THREE.MeshPhysicalMaterial({
       color: new THREE.Color(rgbHex(mix(part.base || [255, 255, 255], RGB.TEAM[team], tint))),
-      roughness: 0.62,
-      metalness: 0.34,
-      clearcoat: 0.06,
-      clearcoatRoughness: 0.85,
-      envMapIntensity: 0.45,
+      roughness: 0.50,
+      metalness: 0.04,
+      clearcoat: 0.16,
+      clearcoatRoughness: 0.40,
+      // 观战视角压暗环境反射，让机体明暗主要由跟随聚光灯决定；
+      // 检视模式仍保留摄影棚环境，便于看材质。
+      envMapIntensity: INSPECT !== null ? 0.55 : 0.16,
       emissive: new THREE.Color(rgbHex(
         neutral ? [0, 0, 0] : mix(RGB.TEAM[team], [255, 255, 255], part.glow ?? 0.5)
       )),
       emissiveIntensity: neutral ? 0.0 : 0.05,
       side: THREE.DoubleSide,
     });
+    // 有烘焙贴图：底色交给贴图（白色不染色），并挂上法线图补面板线细节。
+    mat.userData.texRef = texRef;
+    const applyTextures = () => {
+      const tex = aircraftTextures(name);
+      if (!tex || !tex.color) return;
+      texRef.color = tex.color;
+      texRef.normal = tex.normal || null;
+      mat.color.set(0xffffff);
+      mat.map = tex.color;
+      if (tex.normal) {
+        mat.normalMap = tex.normal;
+        mat.normalScale.set(0.65, 0.65);
+      }
+      mat.needsUpdate = true;
+    };
+    applyTextures();
     const noseVec = new THREE.Vector3(
       part.nose[0] / 255, part.nose[1] / 255, part.nose[2] / 255
     );
@@ -1679,6 +1931,7 @@
       shader.uniforms.uCamoScale = { value: 1.0 / part.tile };
       shader.uniforms.uCamoLen = { value: part.len };
       shader.uniforms.uCamoMode = { value: part.gradient ? 1.0 : 0.0 };
+      shader.uniforms.uUseMap = { value: texRef.color ? 1.0 : 0.0 };
       shader.uniforms.uGradCenter = { value: gradA };
       shader.uniforms.uGradEdge = { value: gradB };
       shader.uniforms.uHalfSpan = { value: part.halfSpan || 6.5 };
@@ -1713,6 +1966,7 @@ uniform sampler2D uCamoTex;
 uniform float uCamoScale;
 uniform float uCamoLen;
 uniform float uCamoMode;
+uniform float uUseMap;
 uniform vec3 uGradCenter;
 uniform vec3 uGradEdge;
 uniform float uHalfSpan;
@@ -1753,6 +2007,29 @@ float camoQuad(vec2 p, vec2 a, vec2 b, vec2 c, vec2 d) {
   return max(max(dot(p - a, normalize(n0)), dot(p - b, normalize(n1))),
              max(dot(p - c, normalize(n2)), dot(p - d, normalize(n3))));
 }
+// 值噪声：给掉漆斑块与漆面粗糙度起伏用，避免整块蒙皮同一个高光。
+float camoHash(vec3 p) {
+  p = fract(p * 0.3183099 + vec3(0.11, 0.47, 0.73));
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float camoNoise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(camoHash(i), camoHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+        mix(camoHash(i + vec3(0.0, 1.0, 0.0)), camoHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+    mix(mix(camoHash(i + vec3(0.0, 0.0, 1.0)), camoHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+        mix(camoHash(i + vec3(0.0, 1.0, 1.0)), camoHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),
+    f.z);
+}
+// 金属底材掩码：只有尾喷段是钛合金本色（限机体中线附近，别把垂尾/平尾
+// 后缘也涂成裸金属）。蒙皮不做“掉漆露铝”——环境是暗色摄影棚，
+// 裸露金属只会变成一片黑点，反而比涂装更假。
+float camoMetalMask(vec3 p, float fz) {
+  return smoothstep(0.33, 0.42, fz) * (1.0 - smoothstep(1.05, 1.55, abs(p.x)));
+}
 ${shader.fragmentShader}`;
       shader.fragmentShader = shader.fragmentShader.replace(
         "#include <map_fragment>",
@@ -1771,12 +2048,19 @@ ${shader.fragmentShader}`;
     float camoT = smoothstep(0.10, 1.0, clamp(abs(vCamoPos.x) / uHalfSpan, 0.0, 1.0));
     camoBody = mix(uGradCenter, uGradEdge, camoT);
   }
+  // 模型自带涂装贴图时，albedo 全部来自贴图（含雷达罩、军徽、面板线），
+  // 不再叠加程序化迷彩、机头压深与垂尾军徽。
+  float camoMap = step(0.5, uUseMap);
+  if (camoMap > 0.5) {
+    camoBody = diffuseColor.rgb;
+  }
   float camoFz = vCamoPos.z / uCamoLen;
-  float camoNose = (1.0 - smoothstep(uNoseEdge0, uNoseEdge1, camoFz)) * uNoseAmt;
+  float camoNose = (1.0 - smoothstep(uNoseEdge0, uNoseEdge1, camoFz))
+    * uNoseAmt * (1.0 - camoMap);
   diffuseColor.rgb = mix(camoBody, uNoseColor, camoNose);
 
   // 垂尾国籍标识：仅画在垂尾外侧的平面上。
-  if (uMarkKind > 0.5) {
+  if (uMarkKind > 0.5 && camoMap < 0.5) {
     vec2 mp = (vec2(vCamoPos.z, vCamoPos.y) - uMarkCenter) / uMarkSize;
     float latGate = smoothstep(uMarkLat.x - 0.08, uMarkLat.x + 0.08, abs(vCamoPos.x))
       * (1.0 - smoothstep(uMarkLat.y - 0.08, uMarkLat.y + 0.08, abs(vCamoPos.x)));
@@ -1834,7 +2118,25 @@ ${shader.fragmentShader}`;
       }
       diffuseColor.rgb = mix(diffuseColor.rgb, mk, gate);
     }
-  }`
+  }
+
+  // 金属底材：尾喷段整块露出钛合金本色（久高温后偏暗、略带紫铜色）。
+  float camoFzM = vCamoPos.z / uCamoLen;
+  float camoMetal = camoMetalMask(vCamoPos, camoFzM) * (1.0 - camoMap);
+  vec3 camoBare = mix(vec3(0.46, 0.48, 0.51),
+                      vec3(0.28, 0.25, 0.26), smoothstep(0.40, 0.50, camoFzM));
+  diffuseColor.rgb = mix(diffuseColor.rgb, camoBare, camoMetal * 0.9);`
+      );
+      // 涂装是覆盖在铝蒙皮上的电介质薄膜：漆面金属度接近 0、粗糙度中等；
+      // 只有尾喷段与掉漆处改走金属（高金属度 + 低粗糙度），由环境贴图给出反射。
+      shader.fragmentShader = shader.fragmentShader.replace(
+        "#include <metalnessmap_fragment>",
+        `#include <metalnessmap_fragment>
+  metalnessFactor = mix(0.04, 0.90, camoMetal);
+  roughnessFactor = mix(0.50, 0.33, camoMetal);
+  // 漆面的细微粗糙度起伏，近距看得到蒙皮不是一块平板。
+  roughnessFactor += (camoNoise(vCamoPos * 24.0) - 0.5) * 0.08;
+  roughnessFactor = clamp(roughnessFactor, 0.05, 1.0);`
       );
       // 掠射边缘的 Fresnel 轮廓光：任何背景下机体边缘都有一圈队伍色亮边。
       shader.fragmentShader = shader.fragmentShader.replace(
@@ -1851,23 +2153,20 @@ ${shader.fragmentShader}`;
     return mat;
   }
 
-  // 镀膜座舱玻璃：薄壳透射 + 强清漆高光，带一点金色吸收；
-  // 沿用模型自带的 canopy 分组，只换材质，不改它的位置与形状。
+  // 座舱玻璃：模型里的 canopy 分组就是机背蒙皮本身、不是独立薄壳，
+  // 用 transmission 会把同一层蒙皮的背面采样进来，出现黑色噪点与拉丝。
+  // 改成半透明染色玻璃 + 强清漆高光，既有镀膜反光又不会露出座舱内部。
   const canopyMat = new THREE.MeshPhysicalMaterial({
-    color: new THREE.Color("#e9e5db").convertSRGBToLinear(),
-    metalness: 0.0,
-    roughness: 0.02,
-    transmission: 0.94,
-    thickness: 0.10,
-    ior: 1.52,
-    attenuationColor: new THREE.Color("#cfae74").convertSRGBToLinear(),
-    attenuationDistance: 0.9,
+    color: new THREE.Color("#2f343b").convertSRGBToLinear(),
+    metalness: 0.10,
+    roughness: 0.05,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.03,
+    clearcoatRoughness: 0.04,
     transparent: true,
+    opacity: 0.62,
     depthWrite: false,
     side: THREE.DoubleSide,
-    envMapIntensity: 1.15,
+    envMapIntensity: 1.10,
     polygonOffset: true,
     polygonOffsetFactor: -2,
     polygonOffsetUnits: -2,
@@ -1878,14 +2177,15 @@ ${shader.fragmentShader}`;
     metalness: 0.05,
     side: THREE.DoubleSide,
   });
-  // 外挂物（导弹/副油箱/挂架）：统一的中性浅灰金属色，与机体迷彩区分开。
+  // 外挂物（导弹/副油箱/挂架）：挂架与弹体多为裸金属或浅灰金属漆，
+  // 金属度比机体涂装高，靠环境贴图给出挂架的高光。
   const storesMat = new THREE.MeshPhysicalMaterial({
     color: 0xd3d7db,
-    roughness: 0.50,
-    metalness: 0.30,
-    clearcoat: 0.10,
-    clearcoatRoughness: 0.80,
-    envMapIntensity: 0.50,
+    roughness: 0.42,
+    metalness: 0.45,
+    clearcoat: 0.18,
+    clearcoatRoughness: 0.40,
+    envMapIntensity: 0.60,
     side: THREE.DoubleSide,
   });
 
@@ -1902,9 +2202,10 @@ ${shader.fragmentShader}`;
     "AIM-120C": { base: "#cdd1d4", nose: "#343940", band: "#c7a04d",
       bandAt: [0.17, 0.21], stripeAt: [0.46, 0.48] },
   };
-  const MISSILE_TEX_W = 128;
+  const MISSILE_TEX_W = 512;
   const MISSILE_TEX_H = 512;
   const missileTextures = {};
+  const missileMRTextures = {};
 
   function missileTexture(name) {
     if (missileTextures[name]) return missileTextures[name];
@@ -1917,20 +2218,8 @@ ${shader.fragmentShader}`;
     const H = MISSILE_TEX_H;
     g.fillStyle = spec.base;
     g.fillRect(0, 0, W, H);
-    // 纵向漆面磨损（贴图 x 为周向、y 为轴向，竖线即纵向条痕）
-    const rnd = camoRng(CAMO_SEED + 977 + name.length * 131);
-    for (let i = 0; i < 80; i += 1) {
-      const light = rnd() < 0.5;
-      g.fillStyle = light
-        ? `rgba(255,255,255,${0.03 + rnd() * 0.05})`
-        : `rgba(36,40,46,${0.03 + rnd() * 0.06})`;
-      g.fillRect(rnd() * W, rnd() * H, 1 + rnd() * 2, 40 + rnd() * 220);
-    }
-    for (let i = 0; i < 1600; i += 1) {
-      const v = 150 + Math.floor(rnd() * 90);
-      g.fillStyle = `rgba(${v},${v + 2},${v + 4},${0.05 + rnd() * 0.08})`;
-      g.fillRect(rnd() * W, rnd() * H, 1, 1 + rnd() * 3);
-    }
+    // 漆面不做细颗粒/条痕：弹翼是柱面 UV 的极窄扇区，任何 1px 级噪声到了
+    // 翼面上都会被放大成一层规则点阵（近看就是“黑底点阵”）。
     // 导引头罩
     g.fillStyle = spec.nose;
     g.fillRect(0, 0, W, H * 0.11);
@@ -1941,18 +2230,51 @@ ${shader.fragmentShader}`;
     g.fillRect(0, H * spec.bandAt[0], W, H * (spec.bandAt[1] - spec.bandAt[0]));
     g.fillStyle = "#2c3035";
     g.fillRect(0, H * spec.stripeAt[0], W, H * (spec.stripeAt[1] - spec.stripeAt[0]));
-    // 尾喷口金属段
-    g.fillStyle = "#585c61";
-    g.fillRect(0, H * 0.905, W, H * 0.095);
+    // 尾喷口金属段：只占弹尾最后 2.5%。R-77 的格栅尾翼整片都压在 v≈0.959
+    // 上，金属段只要从 0.958 开始就会把整片尾翼染成深灰金属，暗环境里只剩
+    // 零星高光，近看就是一层黑底点阵。收到 0.975 后尾翼回到弹体漆色。
+    g.fillStyle = "#6b7075";
+    g.fillRect(0, H * 0.975, W, H * 0.025);
     g.fillStyle = "rgba(28,31,36,0.85)";
-    g.fillRect(0, H * 0.895, W, H * 0.008);
+    g.fillRect(0, H * 0.970, W, H * 0.006);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.flipY = false;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    // 弹翼几乎是斜着被看的，各向异性过滤要开满，否则周向压缩的花纹会摩尔纹。
+    tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    tex.needsUpdate = true;
+    missileTextures[name] = tex;
+    return tex;
+  }
+
+  // 导弹的金属度/粗糙度贴图：G 通道是粗糙度、B 通道是金属度（three 的约定）。
+  // 弹体是浅灰漆面（电介质），只有导引头接缝环与尾喷口段是裸金属，
+  // 这样弹身仍是涂装色，接缝与喷口能反射环境光。
+  function missileMRTexture(name) {
+    if (missileMRTextures[name]) return missileMRTextures[name];
+    const cv = document.createElement("canvas");
+    cv.width = MISSILE_TEX_W;
+    cv.height = MISSILE_TEX_H;
+    const g = cv.getContext("2d");
+    const W = MISSILE_TEX_W;
+    const H = MISSILE_TEX_H;
+    const band = (y0, y1, rough, metal) => {
+      const v = Math.round(rough * 255);
+      const b = Math.round(metal * 255);
+      g.fillStyle = `rgb(${v},${v},${b})`;
+      g.fillRect(0, H * y0, W, H * (y1 - y0));
+    };
+    band(0.0, 1.0, 0.46, 0.05);
+    band(0.100, 0.126, 0.34, 0.55);
+    band(0.975, 1.0, 0.45, 0.55);
     const tex = new THREE.CanvasTexture(cv);
     tex.flipY = false;
     tex.wrapS = THREE.ClampToEdgeWrapping;
     tex.wrapT = THREE.ClampToEdgeWrapping;
     tex.anisotropy = 4;
     tex.needsUpdate = true;
-    missileTextures[name] = tex;
+    missileMRTextures[name] = tex;
     return tex;
   }
 
@@ -1971,14 +2293,20 @@ ${shader.fragmentShader}`;
     const key = `${team}|${name}`;
     let mat = missileMats[key];
     if (mat) return mat;
+    const mr = missileMRTexture(name);
     mat = new THREE.MeshPhysicalMaterial({
       map: missileTexture(name),
+      metalnessMap: mr,
+      roughnessMap: mr,
       color: new THREE.Color(rgbHex(mix([255, 255, 255], RGB.TEAM[team], 0.10))),
-      roughness: 0.46,
-      metalness: 0.26,
-      clearcoat: 0.12,
-      clearcoatRoughness: 0.80,
-      envMapIntensity: 0.50,
+      // 金属度/粗糙度全部由上面那张贴图给出，材质上的系数保持 1。
+      roughness: 1.0,
+      metalness: 1.0,
+      // 弹翼是几百个小三角面拼的薄片，清漆层太强时每个面片的镜面高光各算
+      // 各的，会在翼面上留下规则的明暗点阵；压到 0.08、环境光降到 0.60。
+      clearcoat: 0.08,
+      clearcoatRoughness: 0.45,
+      envMapIntensity: 0.60,
       side: THREE.DoubleSide,
     });
     missileMats[key] = mat;
@@ -4456,6 +4784,7 @@ ${shader.fragmentShader}`;
     "SU-57": "su57_top.png", "F-16V": "f16_top.png",
     "J-20A": "j20a_top.png", "J-20S": "j20a_top.png",
     "F-15C": "f15c_top.png", "F-15E": "f15ex_top.png", "F-15EX": "f15ex_top.png",
+    "J-16": "j16_top.png", "J-15T": "j15t_top.png",
   })) {
     const img = new Image();
     img.src = `/assets/silhouettes/${file}`;
@@ -4834,6 +5163,36 @@ ${shader.fragmentShader}`;
   let camPos = new THREE.Vector3();
   let camTarget = new THREE.Vector3();
 
+  const STAGE_UP = new THREE.Vector3(0, 1, 0);
+  const stageDir = new THREE.Vector3();
+
+  // 聚光灯跟随机体：位置按“机体世界长度”缩放，而不是按相机距离，
+  // 这样无论拉多远看，光斑都恰好罩住飞机。
+  function updateStageLights(snap) {
+    for (let i = 0; i < stageLights.length; i += 1) {
+      const rig = stageLights[i];
+      const view = aircraftViews[i];
+      const ac = snap.acs[i];
+      const on = !!ac && ac.alive && view.group.visible;
+      rig.key.visible = on;
+      rig.rim.visible = on;
+      if (!on) continue;
+      const p = view.group.position;
+      const len = Math.max(1.0, (view.modelLen || REF_LENGTH) * view.group.scale.x);
+      stageDir.copy(camera.position).sub(p);
+      if (stageDir.lengthSq() < 1e-6) stageDir.set(0, 0, 1);
+      stageDir.normalize();
+      rig.key.position.copy(p)
+        .addScaledVector(stageDir, len * 2.2)
+        .addScaledVector(STAGE_UP, len * 2.6);
+      rig.key.target.position.copy(p);
+      rig.rim.position.copy(p)
+        .addScaledVector(stageDir, -len * 2.0)
+        .addScaledVector(STAGE_UP, len * 1.2);
+      rig.rim.target.position.copy(p);
+    }
+  }
+
   function updateScene(snap) {
     buildFloor(snap.arena, snap.z_floor);
     const cameraPos = w2t(snap.camera.eye);
@@ -4844,6 +5203,7 @@ ${shader.fragmentShader}`;
       const depth = Math.max(1.0, cameraPos.distanceTo(w2t(ac.pos)));
       view.update(ac, depth, snap.t);
     }
+    if (stageLights.length) updateStageLights(snap);
     // 检视模式只保留被检视的机体/陈列，弹道、尾迹、炮火等叠加层全部跳过。
     if (INSPECT === null) {
       updateTrails(snap);

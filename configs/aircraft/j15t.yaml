@@ -1,0 +1,85 @@
+# J-15T：单座重型舰载机，弹射起飞、满油满弹；结构与气动同侧卫家族。
+id: J-15T
+name: J-15T
+
+airframe:
+  # 空机 17,000 + 半油 4,700 ≈ 21,700，取整 21,700（舰载型结构加强的增重
+  # 与折叠翼作动已包含在内）。
+  base_mass_kg: 21700
+  wing_area_m2: 62.0
+  cl_max: 1.60
+  n_struct_g: 8.5           # 舰载起降按 8.5 g 设计过载
+  thrust_max_kn: 270        # WS-10B 双发加力（135 kN × 2）
+  thrust_mil_kn: 180
+  cd0: 0.045                # 舰载型外挂与结构增阻
+  aspect_ratio: 3.49
+  oswald: 0.80
+  cl_alpha: 3.90
+  cruise_mach: 0.95
+  fuel_capacity_kg: 9400
+  lapse_exp: 0.68
+  ram_r0: 0.18
+  ram_r1: 0.12
+  derate_z_m: 17000
+  derate_H_m: 5500
+  eta_install: 0.96
+  hp_max: 108
+  gun_range_m: 1000
+  gun_dps: 30
+  ammo_max: 150
+  rounds_per_sec: 25
+  length_m: 21.9
+  muzzle_speed: 900
+  bullet_mass_kg: 0.390
+  bullet_diameter_m: 0.030
+  gun_spread: 0.003
+  tvc_deg: 0
+  tvc_alpha_max_deg: 0
+  tvc_cl_bonus: 0.0
+  # 固定式鸭翼：侧卫舰载型在进气道上方保留一对小鸭翼，只做增升与涡控制，
+  # 铰链不可全动（canard_deflect_max=0），俯仰仍由全动平尾承担。
+  # 面积按两片合计约 3.1 m²（0.05 S），弦长 1.15 m，力臂约一个平均气动弦。
+  canard: true
+  canard_area_ratio: 0.05
+  canard_arm_ratio: 1.00
+  canard_chord_m: 1.15
+  canard_deflect_max_deg: 0
+  canard_rate_max_deg_s: 0
+  canard_tau_s: 0.12
+  canard_cl_alpha: 3.30
+  canard_cl_max: 1.10
+  canard_alpha_stall_deg: 14
+  canard_alpha_max_deg: 18
+  canard_downwash: 0.08
+  canard_hinge_coeff: 0.20
+  canard_actuator_torque_knm: 1
+  # 固定鸭翼不提供过失速配平能力。
+  canard_post_stall_alpha_deg: 0
+  canard_cl_bonus: 0.05
+  canard_stall_shift_deg: 2
+  elevon_area_ratio: 0.10
+  elevon_arm_ratio: 0.30
+  elevon_deflect_max_deg: 20
+  elevon_rate_max_deg_s: 55
+  elevon_tau_s: 0.08
+  elevon_cl_alpha: 2.6
+  elevon_cl_max: 1.0
+  all_moving_fin: false
+  cn_dr: 0.09
+
+sensors:
+  # 舰载型外挂与加强结构更多，RCS 略大于 J-16。
+  rcs: 8.0
+  rcs_front: 8.0
+  rcs_side: 18.0
+  rcs_back: 12.0
+  radar_range_km: 170        # 换装国产 AESA（估计值）
+  side_array: false
+  lband: false
+  irst_range_km: 50
+
+agent:
+  aggression: 0.80
+  energy_pref: 0.58
+  lure: false
+  style: energy
