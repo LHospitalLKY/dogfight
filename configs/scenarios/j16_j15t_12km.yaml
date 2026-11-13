@@ -1,0 +1,45 @@
+# 1v1 近距对抗：J-16 vs J-15T，12 km 对头，双方只挂近距弹（PL-10）。
+# 无中距弹、无预警机，雷达 auto；开局即进入目视/近距格斗，600 s 时限。
+id: j16-j15t-12km
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 6000           # 每架距空域中心 6 km，总间距 12 km
+  altitude_m: 9000
+  y_offset_m: 100
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    aircraft: J-16
+    loadout:
+      ir:
+        weapon: PL-10
+        count: 4                # 全近距挂载：4 枚 PL-10
+      radar:
+        weapon: PL-15
+        count: 0                # 不挂中距弹
+      countermeasures:
+        chaff: 30
+        flare: 24
+    radar_policy: auto
+  - name: blue
+    aircraft: J-15T
+    loadout:
+      ir:
+        weapon: PL-10
+        count: 4
+      radar:
+        weapon: PL-15
+        count: 0
+      countermeasures:
+        chaff: 30
+        flare: 24
+    radar_policy: auto
+
+awacs: false
+# seed 由实验脚本/命令行逐局传入；不在场景里固定，避免覆盖随机化。

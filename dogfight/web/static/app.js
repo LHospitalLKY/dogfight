@@ -121,6 +121,16 @@
     return Number.isFinite(idx) ? clamp(idx, 0, 1) : null;
   })();
 
+  // 真实时间录制：?rec=1 时用 canvas.captureStream + MediaRecorder 直接录
+  // WebGL 画布（不逐帧编码上传），时长 = frames / fps 秒，结束后服务端转码。
+  // 逐帧上传在软件光栅下每帧要等 JPEG 编码，只能做成延时；录制模式是 1 倍速。
+  const REC = new URLSearchParams(window.location.search).get("rec") === "1";
+
+  // 离线逐帧渲染（严格 1 倍速）：?step=1 时暂停服务端的墙钟推进，每采一帧
+  // 让服务端按 1/fps 秒定量步进一次仿真，再渲染并上传该帧。成片速度只由
+  // 帧率决定，与浏览器渲染/编码快慢无关，因此不会变成延时。
+  const STEP = new URLSearchParams(window.location.search).get("step") === "1";
+
   // ---------- three.js 场景 ----------
   const canvas = document.getElementById("scene");
   const renderer = new THREE.WebGLRenderer({
@@ -128,6 +138,9 @@
     // 采集模式用软件光栅（无 GPU 环境），关掉 MSAA 可显著降低填充开销。
     antialias: !CAPTURE,
     alpha: false,
+    // 采集时保留绘制缓冲：readPixels/toBlob 直接读现成内容，避免每帧
+    // 重新触发一次绘制缓冲的同步与解析。
+    preserveDrawingBuffer: !!CAPTURE,
     powerPreference: "high-performance",
   });
   const VIEW_W = CAPTURE ? CAPTURE.w : window.innerWidth;
@@ -1167,6 +1180,10 @@
     ];
     await Promise.all(jobs).catch((err) => console.error("模型加载失败", err));
   })();
+
+  // 采集/检视都要求模型解析完成：此时相机才被快照定位，机体也才真正可画。
+  let modelsLoaded = false;
+  MODELS_READY.then(() => { modelsLoaded = true; });
 
   // 服务端导出的 OBJ 每个三角形都是独立顶点，直接 computeVertexNormals 会得到
   // 全平面着色：机身曲面碎成一块块棱面，远看就像一层蒙皮网格。这里先按 1 mm
@@ -5264,11 +5281,6 @@ ${shader.fragmentShader}`;
   let inspectPauseSent = false;
   let missileShowcase = null;
 
-  // 模型是并行异步加载的，第一帧快照可能早于最后一枚导弹的解析完成。
-  // 陈列只创建一次，必须等全部模型就绪，否则会永远少几枚。
-  let modelsLoaded = false;
-  MODELS_READY.then(() => { modelsLoaded = true; });
-
   // 导弹独立陈列：直接用主程序加载的导弹几何与导弹材质，横排展示。
   function ensureMissileShowcase(base) {
     if (missileShowcase) return missileShowcase;
@@ -5352,8 +5364,11 @@ ${shader.fragmentShader}`;
       camTarget.copy(target);
       cameraReady = true;
     } else {
-      camPos.lerp(eye, 0.12);
-      camTarget.lerp(target, 0.12);
+      // 实时观战按 60fps 逐帧平滑；离线步进每帧代表 1/fps 秒仿真时间，
+      // 用等效时间常数换算，保持与实时观看一致的运镜手感。
+      const k = STEP ? 0.26 : 0.12;
+      camPos.lerp(eye, k);
+      camTarget.lerp(target, k);
     }
     camera.position.copy(camPos);
     camera.lookAt(camTarget);
@@ -5453,11 +5468,20 @@ ${shader.fragmentShader}`;
   });
 
   // ---------- SSE ----------
+  let lastSceneAt = 0;
   const stream = new EventSource("/api/stream");
   stream.onmessage = (ev) => {
+    // 离线逐帧渲染时快照由 stepCapture 主动拉取，忽略 SSE 推送，避免
+    // 与步进结果竞争、覆盖掉刚刚应用的帧。
+    if (STEP) return;
     try {
       snapshot = JSON.parse(ev.data);
       capReady = true;
+      // 采集时场景更新没必要跟着服务端快照的最高频率跑：刷新场景会占住
+      // 主线程，直接压低采集帧率。这里限到 10Hz，画面仍然连续。
+      const now = performance.now();
+      if (CAPTURE && now - lastSceneAt < 100) return;
+      lastSceneAt = now;
       MODELS_READY.then(() => {
         updateScene(snapshot);
         updateHud(snapshot);
@@ -5472,14 +5496,17 @@ ${shader.fragmentShader}`;
   };
 
   // ---------- 1080p 采集 ----------
-  // 每帧渲染完成后按目标帧率把 WebGL 画面拷贝到离屏 2D 画布，
-  // 以 PNG 二进制 POST 给服务端；帧序列由服务端 ffmpeg 统一编码成 MP4。
-  // 采集只包含 3D 场景（HUD 是 DOM，不参与离屏合成）。
+  // 每帧渲染完成后把 WebGL 画面拷贝到离屏 2D 画布，以 JPEG 二进制 POST 给
+  // 服务端（PNG 在软件光栅下编码太慢，JPEG 能让采集跟上真实时间）。
+  // 帧序列由服务端 ffmpeg 统一编码成 MP4，采集只包含 3D 场景（HUD 是 DOM）。
   let capReady = false;
-  const capState = { t0: 0, next: 0, i: 0, done: false };
+  const capState = { t0: 0, next: 0, i: 0, done: false, times: [] };
 
   function captureTick() {
-    if (!capReady || capState.done) return;
+    if (REC) return;
+    // 模型未就绪时相机还没被快照定位，采到的会是空场景；先等模型解析完，
+    // 再把 delay 的计时起点放在这一刻（delay 表示“画面稳定后再等多久”）。
+    if (!capReady || !modelsLoaded || capState.done) return;
     const now = performance.now();
     if (capState.t0 === 0) {
       capState.t0 = now + CAPTURE.delay * 1000;
@@ -5495,24 +5522,29 @@ ${shader.fragmentShader}`;
     off.height = renderer.domElement.height;
     off.getContext("2d").drawImage(renderer.domElement, 0, 0);
     const idx = String(capState.i).padStart(4, "0");
+    capState.times.push(performance.now());
     off.toBlob((blob) => {
       if (!blob) return;
-      fetch(`/api/capture?name=${encodeURIComponent(CAPTURE.name)}&i=${idx}`, {
+      fetch(`/api/capture?name=${encodeURIComponent(CAPTURE.name)}&i=${idx}&ext=jpg`, {
         method: "POST",
         body: blob,
       }).catch((err) => console.error("帧上传失败", err));
-    }, "image/png");
+    }, "image/jpeg", 0.92);
 
     capState.i += 1;
     if (capState.i >= CAPTURE.frames) {
       capState.done = true;
       if (CAPTURE.frames > 1 && CAPTURE.encode) {
+        // 按实际采集节奏编码：相机/仿真都按真实时间推进，实测帧间隔
+        // 换算出的 fps 才能让成片保持 1 倍速，而不是随渲染快慢变成延时。
+        const span = capState.times[capState.times.length - 1] - capState.times[0];
+        const realFps = span > 0 ? (capState.times.length - 1) * 1000 / span : CAPTURE.fps;
         // 等最后几帧传完再请求编码
         setTimeout(() => {
           fetch("/api/capture/encode", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: CAPTURE.name, fps: CAPTURE.fps }),
+            body: JSON.stringify({ name: CAPTURE.name, fps: realFps }),
           }).then((r) => r.json())
             .then((d) => console.log("采集完成", d))
             .catch((err) => console.error("编码请求失败", err));
@@ -5521,15 +5553,148 @@ ${shader.fragmentShader}`;
     }
   }
 
+  // ---------- 实时录制（MediaRecorder） ----------
+  // 录制时长由 frames / fps 决定；停止后把 webm 交给服务端转成 mp4。
+  let recStarted = false;
+  let recTrack = null;
+  function maybeStartRec() {
+    if (!REC || recStarted || !capReady || !modelsLoaded) return;
+    recStarted = true;
+    const seconds = Math.max(1, CAPTURE.frames / CAPTURE.fps);
+    setTimeout(() => {
+      // captureStream(0) + 手动 requestFrame：不依赖合成器呈现，
+      // 每次渲染后主动推一帧，headless 下也能录到画面。
+      const stream = canvas.captureStream(0);
+      recTrack = stream.getVideoTracks()[0];
+      const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9" : "video/webm";
+      const chunks = [];
+      const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size) chunks.push(e.data);
+      };
+      rec.onstop = async () => {
+        recTrack = null;
+        const blob = new Blob(chunks, { type: "video/webm" });
+        console.log("录制字节 " + blob.size);
+        try {
+          await fetch(`/api/capture/upload?name=${encodeURIComponent(CAPTURE.name)}`, {
+            method: "POST", body: blob,
+          });
+          const r = await fetch("/api/capture/encode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: CAPTURE.name }),
+          });
+          console.log("录制完成 " + JSON.stringify(await r.json()));
+        } catch (err) {
+          console.error("录制上传失败", err);
+        }
+      };
+      rec.start(1000);
+      setTimeout(() => rec.stop(), seconds * 1000);
+    }, CAPTURE.delay * 1000);
+  }
+
+  // ---------- 离线逐帧步进渲染（严格 1 倍速） ----------
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  async function stepCapture() {
+    // 等模型解析完，否则相机还没被快照定位、采到的是空场景。
+    for (let guard = 0; guard < 1200 && !modelsLoaded; guard += 1) {
+      await sleep(100);
+    }
+    if (!snapshot) {
+      try {
+        snapshot = await fetch("/api/state").then((r) => r.json());
+      } catch (err) {
+        console.error("初始快照获取失败", err);
+        return;
+      }
+    }
+    capReady = true;
+    // 暂停服务端墙钟推进，改由本循环按帧定量步进。
+    await postControl({ action: "pause" });
+    if (CAPTURE.delay > 0) await sleep(CAPTURE.delay * 1000);
+
+    const dt = 1.0 / CAPTURE.fps;
+    const off = document.createElement("canvas");
+    off.width = renderer.domElement.width;
+    off.height = renderer.domElement.height;
+    const ctx = off.getContext("2d", { willReadFrequently: true });
+
+    for (let i = 0; i < CAPTURE.frames; i += 1) {
+      let snap;
+      try {
+        snap = await fetch("/api/capture/step", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dt, reset: i === 0 }),
+        }).then((r) => r.json());
+      } catch (err) {
+        console.error("步进失败", err);
+        break;
+      }
+      if (!snap || !snap.acs) {
+        console.error("步进无快照", snap);
+        break;
+      }
+      snapshot = snap;
+      updateScene(snapshot);
+      updateCameraFrame();
+      // 渲染与读回必须在同一个同步任务里完成：渲染器未开
+      // preserveDrawingBuffer，跨任务画布内容会被清空。
+      renderFrame();
+      ctx.drawImage(renderer.domElement, 0, 0);
+      const blob = await new Promise((res) => off.toBlob(res, "image/jpeg", 0.92));
+      if (blob) {
+        try {
+          await fetch(
+            `/api/capture?name=${encodeURIComponent(CAPTURE.name)}`
+            + `&i=${String(i).padStart(4, "0")}&ext=jpg`,
+            { method: "POST", body: blob },
+          );
+        } catch (err) {
+          console.error("帧上传失败", err);
+        }
+      }
+      if ((i + 1) % 50 === 0) {
+        console.log(`步进采集 ${i + 1}/${CAPTURE.frames}`);
+      }
+    }
+    try {
+      const r = await fetch("/api/capture/encode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: CAPTURE.name, fps: CAPTURE.fps }),
+      });
+      console.log("步进采集完成 " + JSON.stringify(await r.json()));
+    } catch (err) {
+      console.error("编码请求失败", err);
+    }
+  }
+
+  if (STEP) stepCapture();
+
   // ---------- 渲染循环 ----------
   function animate() {
-    requestAnimationFrame(animate);
+    // 离线步进由 stepCapture 驱动渲染，主循环不参与。
+    if (STEP) {
+      requestAnimationFrame(animate);
+      return;
+    }
+    // 逐帧采集时不等合成器呈现；实时录制则保持正常的 rAF 节奏。
+    if (CAPTURE && !REC) setTimeout(animate, 0);
+    else requestAnimationFrame(animate);
     updateCameraFrame();
     updateFloor(performance.now() / 1000.0);
-    renderFloorReflection();
+    // 采集时跳过地面反射：它要把整个场景再渲染一遍，软件光栅下代价翻倍。
+    if (!CAPTURE || REC) renderFloorReflection();
     renderFrame();
+    if (REC && recTrack) recTrack.requestFrame();
     if (!CAPTURE) drawLabels();
-    if (CAPTURE) captureTick();
+    if (REC) maybeStartRec();
+    if (CAPTURE && !REC) captureTick();
   }
 
   layoutAll();

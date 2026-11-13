@@ -398,7 +398,7 @@ class CameraState:
         self.span_factor = 1.25
         self.ready = False
 
-    def update(self, world) -> None:
+    def update(self, world, instant: bool = False) -> None:
         follow_ac = None if self.follow is None else world.acs[self.follow]
         alive = [ac for ac in world.acs if ac.alive] or world.acs
         if follow_ac is not None:
@@ -413,7 +413,7 @@ class CameraState:
             sep_xy = math.hypot(b.x - a.x, b.y - a.y)
             span = max(sep_xy, abs(b.z - a.z) * 2.0, 1400.0)
             target_dist = clamp(span * self.span_factor, 2200.0, 320000.0)
-        if self.ready:
+        if self.ready and not instant:
             self.dist += (target_dist - self.dist) * 0.06
             self.cam[0] += (cx - self.cam[0]) * 0.10
             self.cam[1] += (cy - self.cam[1]) * 0.10
@@ -425,14 +425,21 @@ class CameraState:
 
         if follow_ac is not None:
             desired = follow_ac.psi + math.pi
-            self.yaw += clamp(wrap_pi(desired - self.yaw), -0.06, 0.06)
-            self.pitch += (math.radians(16.0) - self.pitch) * 0.02
+            if instant:
+                self.yaw = desired
+                self.pitch = math.radians(16.0)
+            else:
+                self.yaw += clamp(wrap_pi(desired - self.yaw), -0.06, 0.06)
+                self.pitch += (math.radians(16.0) - self.pitch) * 0.02
         else:
             a, b = world.acs
             sep_xy = math.hypot(b.x - a.x, b.y - a.y)
             if sep_xy > 500.0:
                 desired = math.atan2(b.y - a.y, b.x - a.x) + math.pi / 2.0 - 0.35
-                self.yaw += clamp(wrap_pi(desired - self.yaw), -0.03, 0.03)
+                if instant:
+                    self.yaw = desired
+                else:
+                    self.yaw += clamp(wrap_pi(desired - self.yaw), -0.03, 0.03)
 
         cp, sp = math.cos(self.pitch), math.sin(self.pitch)
         self.eye = (
@@ -843,6 +850,9 @@ class SimEngine:
         self.paused = False
         self.follow = None
         self.stop = False
+        # 离线逐帧渲染：置位后 _run 线程不再按墙钟推进，仿真只在
+        # advance_by() 里按固定仿真时长定量前进（用于 1 倍速录制）。
+        self.offline = False
         self.recorder = TrailRecorder(self)
         self.camera = CameraState()
         self._disp = {}
@@ -1037,35 +1047,69 @@ class SimEngine:
             frame_dt = now - last
             last = now
             with self.lock:
-                world = self.world
-                if not self.paused and world.result is None:
-                    self.accumulator += min(frame_dt, 0.1)
-                    while self.accumulator >= world.dt:
-                        if self.steps % self.steps_per_decision == 0:
-                            self.actions = [
-                                ag.act(world.observe(i))
-                                for i, ag in enumerate(self.agents)
-                            ]
-                        world.step(self.actions)
-                        self.recorder.record(world, self.agents)
-                        self.accumulator -= world.dt
-                        self.steps += 1
-                        if world.result is not None:
-                            break
-                self.camera.update(world)
-                if now >= next_snap:
-                    self.snapshot = self._build_snapshot(
-                        min(max(frame_dt, 0.0), 0.10)
-                    )
-                    self.version += 1
-                    self.lock.notify_all()
-                    next_snap = now + 1.0 / SNAPSHOT_HZ
+                if not self.offline:
+                    world = self.world
+                    if not self.paused and world.result is None:
+                        self.accumulator += min(frame_dt, 0.1)
+                        while self.accumulator >= world.dt:
+                            if self.steps % self.steps_per_decision == 0:
+                                self.actions = [
+                                    ag.act(world.observe(i))
+                                    for i, ag in enumerate(self.agents)
+                                ]
+                            world.step(self.actions)
+                            self.recorder.record(world, self.agents)
+                            self.accumulator -= world.dt
+                            self.steps += 1
+                            if world.result is not None:
+                                break
+                    self.camera.update(world)
+                    if now >= next_snap:
+                        self.snapshot = self._build_snapshot(
+                            min(max(frame_dt, 0.0), 0.10)
+                        )
+                        self.version += 1
+                        self.lock.notify_all()
+                        next_snap = now + 1.0 / SNAPSHOT_HZ
             time.sleep(0.004)
 
     def set_paused(self, paused: bool) -> None:
         with self.lock:
             self.paused = bool(paused)
+            if not self.paused:
+                self.offline = False
             self.snapshot = self._build_snapshot(0.0)
+            self.version += 1
+            self.lock.notify_all()
+
+    def advance_by(self, dt: float, reset: bool = False) -> None:
+        """离线逐帧渲染：按仿真时长 dt 定量推进，与墙钟无关。
+
+        暂停墙钟推进后由采集端每渲染一帧调用一次；服务端按 dt 折算成
+        固定数目的物理步长，因此成片速度只取决于帧率，不受浏览器渲染/
+        编码耗时影响（严格 1 倍速，而不是延时）。reset=True 时从 t=0
+        重新开局（第一帧用），保证录制从同一初始态确定性开始。
+        """
+        with self.lock:
+            if reset:
+                self._new_world()
+            self.offline = True
+            self.paused = True
+            world = self.world
+            steps = max(0, int(round(dt / world.dt)))
+            for _ in range(steps):
+                if world.result is not None:
+                    break
+                if self.steps % self.steps_per_decision == 0:
+                    self.actions = [
+                        ag.act(world.observe(i))
+                        for i, ag in enumerate(self.agents)
+                    ]
+                world.step(self.actions)
+                self.recorder.record(world, self.agents)
+                self.steps += 1
+            self.camera.update(world, instant=True)
+            self.snapshot = self._build_snapshot(steps * world.dt)
             self.version += 1
             self.lock.notify_all()
 
@@ -1081,6 +1125,7 @@ class SimEngine:
         with self.lock:
             self._new_world()
             self.paused = False
+            self.offline = False
             self.snapshot = self._build_snapshot(0.0)
             self.version += 1
             self.lock.notify_all()
@@ -1233,10 +1278,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def _capture_frame(self) -> None:
-        """接收一帧 PNG（binary body）并按 name_0000.png 落盘。"""
+        """接收一帧画面（binary body）并按 name_0000.png/.jpg 落盘。"""
         query = self.path.split("?", 1)[1] if "?" in self.path else ""
         params = dict((k, v[0]) for k, v in urllib.parse.parse_qs(query).items())
         name = _safe_name(params.get("name", "shot"))
+        ext = "jpg" if params.get("ext", "").lower() in ("jpg", "jpeg") else "png"
         try:
             idx = max(0, int(params.get("i", "0")))
         except ValueError:
@@ -1248,12 +1294,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = self.rfile.read(length)
         CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-        target = CAPTURE_DIR / f"{name}_{idx:04d}.png"
+        target = CAPTURE_DIR / f"{name}_{idx:04d}.{ext}"
         target.write_bytes(data)
         self._json({"ok": True, "path": f"/captures/{target.name}", "bytes": len(data)})
 
+    def _capture_upload(self) -> None:
+        """接收浏览器 MediaRecorder 录制的 webm（binary body）。"""
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict((k, v[0]) for k, v in urllib.parse.parse_qs(query).items())
+        name = _safe_name(params.get("name", "rec"))
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0 or length > 800_000_000:
+            self._json({"ok": False, "error": "bad length"}, 400)
+            return
+        data = self.rfile.read(length)
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        target = CAPTURE_DIR / f"{name}.webm"
+        target.write_bytes(data)
+        self._json({"ok": True, "path": f"/captures/{target.name}", "bytes": len(data)})
+
+    def _capture_step(self) -> None:
+        """离线逐帧渲染：body {"dt": 秒}，按仿真时长前进并返回最新快照。
+
+        前端每渲染一帧调用一次，dt 取 1/fps，因此成片严格 1 倍速。
+        """
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            dt = float(body.get("dt", 1.0 / 10.0))
+            reset = bool(body.get("reset"))
+        except (ValueError, json.JSONDecodeError):
+            self._json({"ok": False, "error": "invalid json"}, 400)
+            return
+        ENGINE.advance_by(dt, reset=reset)
+        _v, snap = ENGINE.latest()
+        self._json(snap)
+
     def _capture_encode(self) -> None:
-        """把 name_*.png 帧序列编码成 MP4（服务端 ffmpeg，恒定帧率）。"""
+        """把 name_*.png|jpg 帧序列编码成 MP4（服务端 ffmpeg，恒定帧率）。"""
         length = int(self.headers.get("Content-Length", "0") or 0)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -1265,19 +1343,41 @@ class Handler(BaseHTTPRequestHandler):
             fps = max(1.0, float(body.get("fps", 30.0)))
         except (TypeError, ValueError):
             fps = 30.0
-        frames = sorted(CAPTURE_DIR.glob(f"{name}_*.png"))
-        if not frames:
-            self._json({"ok": False, "error": "no frames"}, 400)
-            return
+        webm = CAPTURE_DIR / f"{name}.webm"
         ffmpeg = _ffmpeg_bin()
         if not ffmpeg:
             self._json({"ok": False, "error": "ffmpeg not found"}, 500)
             return
         out = CAPTURE_DIR / f"{name}.mp4"
+        if webm.exists():
+            # 实时录制：直接用真实时间戳转码，保持 1 倍速。
+            cmd = [
+                ffmpeg, "-y", "-i", str(webm),
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
+            ]
+            try:
+                subprocess.run(cmd, check=True, timeout=600,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._json({"ok": False, "error": str(exc)}, 500)
+                return
+            self._json({
+                "ok": True,
+                "path": f"/captures/{out.name}",
+                "source": "webm",
+                "bytes": out.stat().st_size,
+            })
+            return
+        frames = sorted(CAPTURE_DIR.glob(f"{name}_*.png")) + sorted(CAPTURE_DIR.glob(f"{name}_*.jpg"))
+        if not frames:
+            self._json({"ok": False, "error": "no frames"}, 400)
+            return
+        ext = frames[0].suffix
         cmd = [
             ffmpeg, "-y", "-framerate", f"{fps:.3f}",
             "-start_number", "0",
-            "-i", str(CAPTURE_DIR / f"{name}_%04d.png"),
+            "-i", str(CAPTURE_DIR / f"{name}_%04d{ext}"),
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", str(out),
         ]
@@ -1298,6 +1398,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/capture":
             self._capture_frame()
+            return
+        if path == "/api/capture/upload":
+            self._capture_upload()
+            return
+        if path == "/api/capture/step":
+            self._capture_step()
             return
         if path == "/api/capture/encode":
             self._capture_encode()
