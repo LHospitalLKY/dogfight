@@ -20,7 +20,7 @@ burnout_mass_kg: 65
 cd0: 0.9
 cd0_wave: 1.0
 cn_max: 10
-warhead_damage: 100
+warhead_damage: 55
 lethal_radius_m: 11
 pk_decay: 0.35
 induced_k: 0.04

@@ -34,6 +34,13 @@ MAX_GAMMA_DOT = math.radians(20.0)
 # 换算成数 g 的横向过载，飞机压坡度 → 过冲 → 反向压坡度，形成约 1 s
 # 周期的摆振（15 km 近距场景里 J-20 看起来一直在抖）。
 RATE_DAMP = 0.8
+# 推杆滞回：a = cosγ + v·γ̇/G 在 Ps 边界附近会在 0 上下抖动，相邻决策
+# 一帧拉满、一帧推杆，视觉上就是飞机发抖。门槛取 -0.8 g（280 m/s 下约
+# 对应 4°/s 的下降需求）：视线只比航迹低零点几度时不会整帧翻成推杆。
+# 一旦进入推杆就锁定 3 个决策周期（10 Hz 下约 0.3 s），期间 a 回正也
+# 不立刻拉回，避免在门槛上来回切。
+PUSH_ENTER = -0.80
+PUSH_HOLD_DECISIONS = 3
 # 能量-高度约束：爬升角上限由比剩余功率 Ps 决定，高速时才允许额外 zoom。
 ZOOM_ALLOWANCE = math.radians(25.0)
 GAMMA_CAP = math.radians(55.0)
@@ -208,6 +215,7 @@ def aim_action(
     el_error: float,
     gain: float = 2.2,
     throttle: float = 1.0,
+    state: dict | None = None,
 ) -> Action:
     """把“想指向的方位/仰角偏差”反解成滚转角与过载指令。
 
@@ -215,6 +223,8 @@ def aim_action(
     过载超限时由 World 统一裁剪，裁剪后转弯/爬升比例保持不变。
     同时做能量-高度约束：目标航迹角不会超过当前 Ps 允许的爬升角，
     只有富余速度时才把动能短暂换成高度（zoom climb）。
+
+    `state` 是可选的每机可变字典，用来记录推杆滞回（见 PUSH_ENTER）。
     """
     v = max(obs.own_speed, 40.0)
     cg = max(math.cos(obs.own_gamma), 0.25)
@@ -225,7 +235,11 @@ def aim_action(
         -chi_max, chi_max,
     )
 
-    ps_climb = math.asin(clamp(obs.own_ps / v, -0.95, 0.95))
+    # 爬升能力看 1 g 平飞的 Ps，而不是当前过载下的 Ps：后者已经把本机的
+    # 诱导阻力算进去了，拉杆 → Ps 掉 → 上限压低 → 判定必须推杆 → 推杆后
+    # Ps 又反弹，形成“拉-推”自激振荡。平飞 Ps 不随当前指令变化，正好切断
+    # 这条反馈，只反映飞机真实还有多少剩余功率可以换成高度。
+    ps_climb = math.asin(clamp(obs.own_ps_level / v, -0.95, 0.95))
     zoom = clamp(obs.own_speed_frac - 1.6, 0.0, 1.0) * ZOOM_ALLOWANCE
     gamma_cap = clamp(ps_climb + zoom, GAMMA_FLOOR, GAMMA_CAP)
     target_gamma = clamp(obs.own_gamma + el_error, GAMMA_FLOOR, gamma_cap)
@@ -240,10 +254,27 @@ def aim_action(
     # 迎角分量。大迎角时目标即使正好在航迹上，el_error 也会是 -20° 左右，
     # 用它的符号去判断“要不要推杆”会让正常盘旋也反复推拉。
     vel_el_error = obs.los_el - obs.own_gamma
-    if a < 0.0 and (
-        obs.own_gamma > math.radians(8.0)
-        or vel_el_error < math.radians(-20.0)
-    ):
+    # 推杆判定带滞回：只有需求明显为负（a < PUSH_ENTER）才进入推杆，并锁定
+    # PUSH_HOLD_DECISIONS 个决策周期。门限取 0 时，a 在 Ps 边界附近抖动一下
+    # 就整帧翻到推杆，连续两帧又翻回来，J-15T 在纯追踪里就是这样抖的。
+    hold = state.get("push_hold", 0) if state is not None else 0
+    pushing = (
+        a < PUSH_ENTER
+        and (
+            obs.own_gamma > math.radians(8.0)
+            or vel_el_error < math.radians(-20.0)
+        )
+    ) or hold > 0
+    if state is not None:
+        if pushing:
+            state["push_hold"] = PUSH_HOLD_DECISIONS if a < PUSH_ENTER else max(
+                hold - 1, 0
+            )
+            state["push_frames"] = state.get("push_frames", 0) + 1
+        else:
+            state["push_hold"] = 0
+            state["push_frames"] = 0
+    if pushing:
         # 机头已经抬高、或目标明显在下方：此时必须推杆。旧实现只在
         # gamma>30° 时才肯推杆，目标在正下方而 gamma 还只有 20–30° 时
         # 会被下面的 max(a, 0.12) 强制拉成正升力，飞机只能一路抬头
@@ -286,6 +317,7 @@ def pursuit_action(
     el: float,
     gain: float = 1.2,
     throttle: float = 1.0,
+    state: dict | None = None,
 ) -> Action:
     """追踪类原语（纯追踪/提前量/滞后追踪）：带阻尼的指向控制。
 
@@ -296,10 +328,13 @@ def pursuit_action(
     这里对俯仰误差限幅、总过载按可维持过载收口，并在需要大推杆时翼平。
     """
     el = clamp(el, -math.radians(4.0), math.radians(4.0))
-    act = aim_action(obs, az, el, gain=gain, throttle=throttle)
+    act = aim_action(obs, az, el, gain=gain, throttle=throttle, state=state)
     if act.n < 1.2 and abs(act.bank) > 0.6:
         # 卸载/推杆时翼平：坡度没有意义，只会把残存升力甩到侧面。
-        act.bank = 0.0
+        # 但推杆判定本身可能只需要一帧（见 PUSH_ENTER），单帧就把 60° 坡度
+        # 打回 0° 会让飞机在滚转上来回抽；连续两帧确认推杆后才翼平。
+        if state is None or state.get("push_frames", 0) >= 2:
+            act.bank = 0.0
     cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.25, 2.0)), 1.0)
     if act.n > cap:
         act.n = cap
@@ -903,6 +938,8 @@ class TacticalAgent:
         # 第 2 层执行表：机动名 → 具体动作函数。选择逻辑不在这一层。
         self._maneuvers = self._build_maneuver_table()
         self._hold = 0.0
+        # 指向控制的推杆滞回状态（见 aim_action 的 PUSH_ENTER）：跨决策保持。
+        self._aim_state: dict = {}
         self._phase = 0
         self._phase_t = 0.0
         self._scissor_sign = 1.0
@@ -1301,6 +1338,10 @@ class TacticalAgent:
             return
         engaged = (
             obs.dist < 20000.0
+            # 恢复段本来就是在补能量：这时双方往往已经拉开到 20 km 以外，
+            # “未交战就收油门”的规则会让飞机挂着军推在 3 km 高度飞 300 m/s，
+            # 平飞 Ps 只有 0~10 m/s，爬 1 km 要 100 s，速度还一路掉。
+            or self.tactic == "RECOVER"
             # 收到发射告警（中距弹最远几十公里）就开始加速，为后续的
             # F-pole / 规避攒能量，而不是等弹飞到 16 km 才反应。
             or obs.incoming_missile_dist < 40000.0
@@ -2633,10 +2674,14 @@ class TacticalAgent:
             "HIGH_G_BARREL": self._high_g_barrel,
             "BEAM": self._beam,
             "PURE": lambda o: pursuit_action(
-                o, o.off_az, o.los_el - o.own_gamma,
+                o, o.off_az, o.los_el - o.own_gamma, state=self._aim_state,
             ),
-            "LEAD": lambda o: pursuit_action(o, *lead_point(o, 1.0)),
-            "LAG": lambda o: pursuit_action(o, *lead_point(o, -0.6)),
+            "LEAD": lambda o: pursuit_action(
+                o, *lead_point(o, 1.0), state=self._aim_state,
+            ),
+            "LAG": lambda o: pursuit_action(
+                o, *lead_point(o, -0.6), state=self._aim_state,
+            ),
             "GUN_LEAD": self._gun_lead_action,
             "GUN_PRESS": self._gun_press,
             "BREAK": self._break,
@@ -2665,7 +2710,10 @@ class TacticalAgent:
             return self._press_turn(obs)
         fn = self._maneuvers.get(primitive)
         if fn is None:
-            return aim_action(obs, obs.off_az, obs.los_el - obs.own_gamma)
+            return aim_action(
+                obs, obs.off_az, obs.los_el - obs.own_gamma,
+                state=self._aim_state,
+            )
         return fn(obs)
 
     def _press_turn(self, obs: Observation) -> Action:
@@ -2679,7 +2727,7 @@ class TacticalAgent:
         """
         act = aim_action(
             obs, obs.off_az, obs.los_el - obs.own_gamma,
-            gain=3.0, throttle=1.0,
+            gain=3.0, throttle=1.0, state=self._aim_state,
         )
         cap = min(obs.own_n_avail, max(obs.own_n_sustain * 1.6, 4.0))
         if act.n > cap:
@@ -2733,7 +2781,10 @@ class TacticalAgent:
         减速到角点速度附近再拉满瞬时过载，用真实的转弯性能差把角度抢
         回来。这不是放宽炮口门限，而是改变进入炮口解的几何。
         """
-        act = pursuit_action(obs, *self._gun_lead(obs), gain=1.6, throttle=0.45)
+        act = pursuit_action(
+            obs, *self._gun_lead(obs), gain=1.6, throttle=0.45,
+            state=self._aim_state,
+        )
         if act.n > 0.0:
             # pursuit_action 已经给出推杆（负过载）时不要再按最大过载覆盖，
             # 否则“机头高抬 + 低速”的压炮会继续把航迹往上拽。
@@ -2743,6 +2794,11 @@ class TacticalAgent:
 
     def _recover(self, obs: Observation) -> Action:
         """边界/高度安全优先：先转向空域中心，再修正高度。
+
+        只有**真的接近空域边界**时才朝中心转；仅仅高度余量不足时翼平拉起，
+        不再附带一次朝中心的大坡度盘旋——那个盘旋是纯能量支出（见下方
+        3.2 g 那段的说明）。高度也不紧张时，恢复的动作就是“翼平 1 g 加速，
+        速度回到角点速度后 +2° 浅爬升”，先把动能补回来再把高度补回来。
 
         低空大俯角时必须先把机头拉起来：只给一个 +12° 的目标航迹角，
         在 −70° 俯冲里等于没救（飞机在 1 s 内就掉 250 m），会直接撞地。
@@ -2776,15 +2832,30 @@ class TacticalAgent:
         sign = 0.0
         if self._rec_turning:
             sign = 1.0 if heading > 0.0 else -1.0
-        if obs.edge_margin < max(2000.0, 20.0 * speed):
-            # 离边界太近：转回空域中心。用 6 g 的协调盘旋——6 g 正好是
-            # 持续耐受上限，长时间拉也不会累积疲劳；高度余量同时不足时
-            # 顺带 5° 浅爬升。
+        if obs.edge_margin < max(3000.0, 45.0 * speed):
+            # 真的接近边界（与 _tactic_recover 同一口径）：转回空域中心。
+            # 用 6 g 的协调盘旋——6 g 正好是持续耐受上限，长时间拉也不会
+            # 累积疲劳；高度余量同时不足时顺带 5° 浅爬升。
             climb = math.radians(5.0) if urgent else 0.0
             n = min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN)
             return level_turn(obs, sign, n, gamma_target=climb)
-        # 只是离地余量不足：3 g 左右的浅爬升盘旋就够，不需要压满坡度。
-        return level_turn(obs, sign, 3.2, gamma_target=math.radians(2.0))
+        if urgent:
+            # 高度余量不足但离边界还很远：翼平拉起，不把升力分给方位。
+            # 转弯的侧向分量换不来高度，只会让拉起更慢、掉速更多。
+            n = min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN)
+            return level_turn(obs, 0.0, n, gamma_target=math.radians(5.0))
+        # 边界还远、只是高度余量不足：仍然朝空域中心转（不转的话双方会
+        # 各自直线飞散，几十秒内谁都不再交战），但把过载从 3.2 g 收到
+        # 2 g，并让目标航迹角由能量状态决定。
+        # 盘旋的能量代价 ∝ n²/√(n²−1)：3.2 g 每弧度比 2 g 多三成，转 90°
+        # 大约要付 30 kJ/kg，而 +2° 浅爬升 100 s 才换来 1 km 高度
+        # （约 10 kJ/kg）。原来在 2–3 km 上“恢复”几十秒，速度反而从
+        # 430 m/s 掉到 300。速度低于角点速度时先平飞加速，回到角点速度
+        # 再以 +2° 补高度。
+        climb = 0.0 if obs.own_speed_frac < self.BRAKE_CORNER_FRAC else (
+            math.radians(2.0)
+        )
+        return level_turn(obs, sign, 2.0, gamma_target=climb)
 
     def _lure(self, obs: Observation) -> Action:
         """迎头诱导：机头对准目标、不做偏置，把交汇几何留给自己。
@@ -2798,6 +2869,7 @@ class TacticalAgent:
         """
         return pursuit_action(
             obs, obs.off_az, obs.off_el, gain=1.2, throttle=self.LURE_THROTTLE,
+            state=self._aim_state,
         )
 
     def _flank_hard_turn(self, obs: Observation, off: float) -> Action:
@@ -3687,7 +3759,9 @@ class TacticalAgent:
         if abs(el) < math.radians(6.0) or self._phase_t >= 3.5:
             self._maneuver_done = True
             self._yoyo_cd = 6.0
-        return pursuit_action(obs, az, err, gain=1.2, throttle=0.7)
+        return pursuit_action(
+            obs, az, err, gain=1.2, throttle=0.7, state=self._aim_state,
+        )
 
     def _low_yoyo(self, obs: Observation) -> Action:
         """低 Yo-Yo：距离拉开、速度不足时，向目标转弯内侧俯冲增速，再把
@@ -3720,7 +3794,7 @@ class TacticalAgent:
         if abs(el) < math.radians(6.0) or self._phase_t >= 3.5:
             self._maneuver_done = True
             self._yoyo_cd = 5.0
-        return pursuit_action(obs, az, err, gain=1.2)
+        return pursuit_action(obs, az, err, gain=1.2, state=self._aim_state)
 
     def _extend(self, obs: Observation) -> Action:
         """脱离：掉头背离对手，满油门拉开距离。"""

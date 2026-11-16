@@ -8,8 +8,8 @@ physics_dt_s: 0.008333333333333333   # 1/120 s
 decision_hz: 10
 
 initial:
-  spacing_m: 60000          # 每架距空域中心 60 km，总间距 120 km
-  altitude_m: 9000
+  spacing_m: 40000          # 每架距空域中心 40 km，总间距 80 km
+  altitude_m: 10000
   y_offset_m: 100
   floor_m: 1500
   ceiling_m: 30000

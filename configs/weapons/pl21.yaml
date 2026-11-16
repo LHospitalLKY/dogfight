@@ -21,7 +21,7 @@ burnout_mass_kg: 150
 cd0: 0.40
 cd0_wave: 0.60
 cn_max: 8
-warhead_damage: 150
+warhead_damage: 82
 lethal_radius_m: 12
 life_s: 120
 cooldown_s: 4.0
