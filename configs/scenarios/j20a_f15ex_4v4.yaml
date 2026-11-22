@@ -1,0 +1,103 @@
+# 4v4 多机对抗：红方 J-20A 四机攻势扫荡，蓝方 F-15EX 四机要地防空。
+# 四机设一名中队长（flight_lead，兼第一双机小队长），第 3 机为第二双机小队长
+# （element_lead），两架僚机各随一名小队长：flight_lead / wingman / element_lead / wingman。
+id: j20a-f15ex-4v4
+brief: 红方四机自 40 km 外向空域中心发起攻势扫荡；蓝方四机担任要地防空，依托超视距拦射与盒形警戒展开。
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 40000
+  altitude_m: 10000
+  y_offset_m: 100
+  lane_m: 2500
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    side: attacker
+    formation_group: [echelon, finger_four, fluid_four, wedge]
+    mission: sweep
+    radar_policy: auto
+    aircraft:
+      - id: J-20A
+        callsign: Dragon1
+        role: fighter
+        rank: flight_lead
+        loadout:
+          ir: {weapon: PL-10, count: 2}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-20A
+        callsign: Dragon2
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 2}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-20A
+        callsign: Dragon3
+        role: fighter
+        rank: element_lead
+        loadout:
+          ir: {weapon: PL-10, count: 2}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-20A
+        callsign: Dragon4
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 2}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+  - name: blue
+    side: defender
+    formation_group: [echelon, box, arrowhead]
+    mission: intercept
+    radar_policy: auto
+    aircraft:
+      - id: F-15EX
+        callsign: Eagle1
+        role: fighter
+        rank: flight_lead
+        loadout:
+          ir: {weapon: AIM-9X, count: 2}
+          radar: {weapon: AIM-120C, count: 4}
+          countermeasures: {chaff: 30, flare: 60}
+      - id: F-15EX
+        callsign: Eagle2
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: AIM-9X, count: 2}
+          radar: {weapon: AIM-120C, count: 4}
+          countermeasures: {chaff: 30, flare: 60}
+      - id: F-15EX
+        callsign: Eagle3
+        role: fighter
+        rank: element_lead
+        loadout:
+          ir: {weapon: AIM-9X, count: 2}
+          radar: {weapon: AIM-120C, count: 4}
+          countermeasures: {chaff: 30, flare: 60}
+      - id: F-15EX
+        callsign: Eagle4
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: AIM-9X, count: 2}
+          radar: {weapon: AIM-120C, count: 4}
+          countermeasures: {chaff: 30, flare: 60}
+
+awacs: false
+
+rules:
+  roe: weapons_free
+  team_brain: true
+  no_fire_zones: []
+# seed 由实验脚本逐局传入；不在场景里固定，避免覆盖随机化。

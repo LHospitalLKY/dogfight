@@ -382,6 +382,19 @@ class Action:
     radar_on: bool | None = None
 
 
+@dataclass(frozen=True)
+class Contact:
+    """一条敌方接触：P2 的接触列表元素，`foe_*` 由主目标回填。"""
+
+    index: int                   # 目标在 World.acs 中的下标
+    dist: float
+    los_az: float                # 视线水平方位（世界系）
+    aspect: float                # 目标机尾与视线的夹角：0=咬尾，180=对头
+    contact: int                 # 对该目标的接触等级 0/1/2/3
+    alive: bool
+    hp_frac: float
+
+
 @dataclass
 class Observation:
     """给 Agent 的观测，不含任何未来状态。"""
@@ -533,6 +546,22 @@ class Observation:
     foe_radar_on: bool = False     # 对方雷达是否开机（RWR 可推断）
     gun_accuracy: float = 1.0      # 机炮散布倍率；无目视接触时 >1
 
+    # 多机接触列表：1v1 时退化为单元素；`foe_*` 是其中主目标的兼容视图。
+    contacts: tuple[Contact, ...] = ()
+    foe_index: int = -1
+    # 团队队形/角色指令（TeamBrain 写入；1v1 恒为 0 / 空）。
+    team_offset_az: float = 0.0
+    team_alt_offset_rad: float = 0.0
+    team_role: str = ""
+    team_weapons: str = "free"
+    # 能量态势（比能量 J/kg，含高度与速度）：团队决策与超时裁决共用。
+    own_energy: float = 0.0
+    foe_energy: float = 0.0
+    energy_adv: float = 0.0
+    alt_adv: float = 0.0
+    team_min_alt: float = 0.0
+    team_disengage: bool = False
+
 
 @dataclass
 class Aircraft:
@@ -623,6 +652,26 @@ class Aircraft:
     rwr_search_az: float = 0.0     # 全向 RWR 截获的辐射方位（相对本机机头）
     last_known: tuple[float, float, float] | None = None   # 最后已知目标位置
     last_known_t: float = -1e9     # 最后接触时刻
+    # ---- 多机状态 ----
+    team: int = 0                  # 所属阵营下标（0/1）
+    callsign: str = ""             # 呼号
+    primary: int = -1              # 当前主目标（World.acs 下标）
+    contacts: tuple = ()           # 本步全部敌方接触（Contact 元组）
+    locked_target: int = -1        # 红外通道已锁定的目标下标
+    radar_locked_target: int = -1  # 雷达通道已锁定的目标下标
+    # ---- 团队决策（TeamBrain 写入，World 只读取） ----
+    assigned_target: int = -1      # 团队分配的主目标；有效时优先于传感器选择
+    order_role: str = ""           # 编队角色：engaged / support / bait / cover / egress
+    weapons_state: str = "free"    # free / tight / hold
+    formation_offset_m: float = 0.0   # 队形横向偏移：+右 / -左
+    formation_alt_m: float = 0.0      # 队形高度偏移：+高 / -低
+    # 垂直分工：高于该高度才允许投入低空缠斗（0 = 不启用，1v1 恒为 0）。
+    team_min_alt: float = 0.0
+    # 团队脱离重整：置位时单机优先拉开距离并爬升，而不是继续追目标。
+    team_disengage: bool = False
+    # ---- 军阶/职务：长僚机分工依据，与血量无关 ----
+    rank: str = "wingman"
+    slot_index: int = 0
 
     @property
     def energy(self) -> float:
@@ -988,11 +1037,25 @@ class World:
         y_offset: float = 100.0,
         x_offset: float = 1500.0,
         awacs: bool | tuple[bool, bool] = True,
-        headings: tuple[float | None, float | None] = (None, None),
+        headings: tuple[float | None, ...] = (None, None),
         seed: int | None = 20261027,
+        team_of: list[int] | None = None,
+        spawns: list[tuple[float | None, float | None, float | None,
+                           float | None, float | None]] | None = None,
+        callsigns: list[str] | None = None,
+        ranks: list[str] | None = None,
+        team_names: tuple[str, str] = ("red", "blue"),
+        roe: str = "weapons_free",
+        no_fire_zones: tuple[tuple[float, float, float], ...] = (),
     ) -> None:
         if dof not in (2, 3, 6):
             raise ValueError("dof 只支持 2、3 或 6")
+        if team_of is None:
+            if len(specs) != 2:
+                raise ValueError("多机场景必须显式给出 team_of")
+            team_of = [0, 1]
+        if len(team_of) != len(specs):
+            raise ValueError("team_of 长度必须与 specs 一致")
         self.dof = dof
         self.dt = dt
         self.arena = arena
@@ -1012,6 +1075,21 @@ class World:
         # 一方被击落后若还有导弹在飞，先把判负结果挂起，等弹落地/命中再结算。
         self._pending_finish: tuple[int, str, str] | None = None
         self.events: list[tuple[float, str]] = []
+        n = len(specs)
+        self.team_of = list(team_of)
+        self.team_names = team_names
+        self.roe = roe
+        self.no_fire_zones = tuple(no_fire_zones)
+        self.callsigns = (
+            list(callsigns) if callsigns is not None
+            else [spec.name for spec in specs]
+        )
+        self.ranks = (
+            list(ranks) if ranks is not None
+            else ["flight_lead"] + ["wingman"] * (n - 1)
+        )
+        if len(self.ranks) != n:
+            raise ValueError("ranks 长度必须与 specs 一致")
         self.stats = {
             "min_v": math.inf,
             "max_v": 0.0,
@@ -1022,16 +1100,16 @@ class World:
             "rounds_fired": 0.0,
             "bullets_fired": 0,
             "bullet_hits": 0,
-            "damage_dealt": [0.0, 0.0],
+            "damage_dealt": [0.0] * n,
             "missiles_fired": 0.0,
             "missile_hits": 0,
-            "missiles_launched": [0, 0],
-            "missiles_hit": [0, 0],
+            "missiles_launched": [0] * n,
+            "missiles_hit": [0] * n,
         }
         # 感知层实验用的时间戳：首次获得稳定跟踪、首次开火。
-        self.first_track_t: list[float | None] = [None, None]
-        self.first_fire_contact_t: list[float | None] = [None, None]
-        self.first_fire_t: list[float | None] = [None, None]
+        self.first_track_t: list[float | None] = [None] * n
+        self.first_fire_contact_t: list[float | None] = [None] * n
+        self.first_fire_t: list[float | None] = [None] * n
         # 在飞格斗弹；命中/寿命结束后 alive=False，保留在身上供渲染层读数。
         self.missiles: list[Missile] = []
         # 在飞机炮弹丸：按真实初速/散布/阻力飞行，线段-球判定命中。
@@ -1052,34 +1130,63 @@ class World:
         sonic = speed_of_sound(start_z)
         v0s = [sonic * spec.cruise_mach for spec in specs]
         rigid = dof == 6
-        specs_trim = [
-            _trim_rigid(spec, start_z, v0s[i], spec.mass) if rigid else (v0s[i], 0.0)
-            for i, spec in enumerate(specs)
-        ]
         # 开局航向：每队可单独指定（弧度），None 时走默认对头几何
         # （红方朝东 0、蓝方朝西 π）。
-        psi0 = math.radians(headings[0]) if headings[0] is not None else 0.0
-        psi1 = math.radians(headings[1]) if headings[1] is not None else math.pi
-        self.acs = [
-            Aircraft(specs[0], x=-x_offset, y=0.0, z=start_z, psi=psi0, v=v0s[0],
-                     hp=specs[0].hp_max, ammo=specs[0].ammo_max,
-                     mass=specs[0].mass, missiles=specs[0].missile_count,
-                     radar_missiles=specs[0].radar_missile_count,
-                     chaff=specs[0].chaff_count, flares=specs[0].flare_count,
-                     fuel=specs[0].fuel_capacity,
-                     throttle=_cruise_throttle(specs[0], start_z, v0s[0]),
-                     rigid=rigid, u=specs_trim[0][0], wb=specs_trim[0][1],
-                     theta=math.atan2(specs_trim[0][1], specs_trim[0][0])),
-            Aircraft(specs[1], x=x_offset, y=y_offset, z=start_z, psi=psi1, v=v0s[1],
-                     hp=specs[1].hp_max, ammo=specs[1].ammo_max,
-                     mass=specs[1].mass, missiles=specs[1].missile_count,
-                     radar_missiles=specs[1].radar_missile_count,
-                     chaff=specs[1].chaff_count, flares=specs[1].flare_count,
-                     fuel=specs[1].fuel_capacity,
-                     throttle=_cruise_throttle(specs[1], start_z, v0s[1]),
-                     rigid=rigid, u=specs_trim[1][0], wb=specs_trim[1][1],
-                     theta=math.atan2(specs_trim[1][1], specs_trim[1][0])),
-        ]
+        team_psi = (
+            math.radians(headings[0]) if headings[0] is not None else 0.0,
+            math.radians(headings[1]) if len(headings) > 1 and headings[1] is not None
+            else math.pi,
+        )
+        # 同队多机的默认横向间隔：按队伍内序号居中排开。
+        counts: dict[int, int] = {}
+        for t in self.team_of:
+            counts[t] = counts.get(t, 0) + 1
+        seen: dict[int, int] = {}
+        lane = 3000.0
+        if spawns is None:
+            spawns = []
+            for i, _spec in enumerate(specs):
+                t = self.team_of[i]
+                k = seen.get(t, 0)
+                seen[t] = k + 1
+                y = (k - 0.5 * (counts[t] - 1)) * lane
+                if t == 1:
+                    y += y_offset
+                spawns.append((
+                    -x_offset if t == 0 else x_offset,
+                    y, start_z, None, None,
+                ))
+
+        self.acs: list[Aircraft] = []
+        for i, spec in enumerate(specs):
+            sx, sy, sz, spsi, sv = spawns[i]
+            z_i = start_z if sz is None else float(sz)
+            psi_i = team_psi[0] if self.team_of[i] == 0 else team_psi[1]
+            if spsi is not None:
+                psi_i = math.radians(float(spsi))
+            v_i = v0s[i] if sv is None else float(sv)
+            u_i, wb_i = (
+                _trim_rigid(spec, z_i, v_i, spec.mass) if rigid else (v_i, 0.0)
+            )
+            ac = Aircraft(
+                spec,
+                x=-x_offset if sx is None else float(sx),
+                y=0.0 if sy is None else float(sy),
+                z=z_i, psi=psi_i, v=v_i,
+                hp=spec.hp_max, ammo=spec.ammo_max,
+                mass=spec.mass, missiles=spec.missile_count,
+                radar_missiles=spec.radar_missile_count,
+                chaff=spec.chaff_count, flares=spec.flare_count,
+                fuel=spec.fuel_capacity,
+                throttle=_cruise_throttle(spec, z_i, v_i),
+                rigid=rigid, u=u_i, wb=wb_i,
+                theta=math.atan2(wb_i, u_i),
+            )
+            ac.team = self.team_of[i]
+            ac.callsign = self.callsigns[i]
+            ac.rank = self.ranks[i]
+            ac.slot_index = i
+            self.acs.append(ac)
         self.stats["min_z"] = start_z
         self.stats["max_z"] = start_z
         # 6DOF 的姿态状态只有四元数：用初始欧拉角（含配平迎角）合成一次。
@@ -1095,131 +1202,206 @@ class World:
 
     # ---------- 感知层 ----------
 
+    def _sense_pair(self, i: int, j: int) -> tuple[int, bool, bool, float, bool, float,
+                                                    float, float]:
+        """单对（本机 i，目标 j）的传感结果。
+
+        返回 (quality, tally, rwr, rwr_az, rwr_search, rwr_search_az, dist, los_az)。
+        """
+        ac, foe = self.acs[i], self.acs[j]
+        dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist < 1e-6:
+            return CONTACT_NONE, False, False, 0.0, False, 0.0, dist, 0.0
+        ux, uy, uz = dx / dist, dy / dist, dz / dist
+        nx, ny, nz = nose_direction(ac)
+        nose_ang = math.acos(clamp(ux * nx + uy * ny + uz * nz, -1.0, 1.0))
+        nose_az = math.atan2(ny, nx)
+        los_az = math.atan2(dy, dx)
+
+        rwr = False
+        rwr_az = 0.0
+        rwr_search = False
+        rwr_search_az = 0.0
+        # ---- RWR：对方雷达辐射告警 ----
+        if foe.radar_on and foe.spec.radar_range > 0.0:
+            # 全向 RWR：只要对方雷达在发射，本机就能截获到辐射方位，
+            # 不论对方机头是否指向本机（搜索/跟踪模式都算）。
+            rwr_search = True
+            rwr_search_az = wrap_pi(los_az - nose_az)
+            # 火控级照射：对方机头雷达正对着本机（落在火控照射锥内），
+            # 意味着可能已经锁定，告警级别更高。
+            fnx, fny, fnz = nose_direction(foe)
+            bx, by, bz = -ux, -uy, -uz
+            foe_ang = math.acos(clamp(bx * fnx + by * fny + bz * fnz, -1.0, 1.0))
+            if foe_ang <= RADAR_FIRE_FOV:
+                rwr = True
+                rwr_az = wrap_pi(los_az - nose_az)
+
+        quality = CONTACT_NONE
+        # ---- 本机机头雷达（主动）----
+        if ac.radar_on and ac.spec.radar_range > 0.0:
+            rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+            reach = (
+                ac.spec.radar_range
+                * rcs_scale(rcs)
+                * radar_visibility(ac, foe)
+            )
+            if dist <= reach:
+                if nose_ang <= RADAR_FIRE_FOV:
+                    quality = CONTACT_FIRE
+                elif nose_ang <= RADAR_DETECT_FOV:
+                    quality = CONTACT_DETECT
+        # ---- 侧阵：±35°–145°，0.55×，只 track ----
+        if ac.spec.side_array and (
+            SIDE_ARRAY_MIN <= nose_ang <= SIDE_ARRAY_MAX
+        ):
+            rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+            reach = (
+                ac.spec.radar_range * SIDE_ARRAY_SCALE
+                * rcs_scale(rcs) * radar_visibility(ac, foe)
+            )
+            if dist <= reach:
+                quality = max(quality, CONTACT_TRACK)
+        # ---- L 波段襟翼雷达：±45°，200 km，只 detect ----
+        if ac.spec.lband and nose_ang <= LBAND_FOV:
+            rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
+            reach = LBAND_RANGE_REF * rcs_scale(rcs)
+            if dist <= reach:
+                quality = max(quality, CONTACT_DETECT)
+        # ---- IRST / 光电吊舱（被动）----
+        irst = max(ac.spec.irst_range, ac.spec.pod_irst_range)
+        if irst > 0.0 and nose_ang <= IRST_FOV:
+            reach = irst * (IRST_AB_BOOST if foe.ab > 0.05 else 1.0)
+            if dist <= reach:
+                quality = max(quality, CONTACT_TRACK)
+        # ---- 目视：全向，给 tally ----
+        fnx, fny, fnz = nose_direction(foe)
+        # 对方机头与“对方→本机”视线的夹角：0/180 为迎头/尾后，90 为侧向。
+        foe_off = math.acos(clamp(
+            (fnx * -ux + fny * -uy + fnz * -uz), -1.0, 1.0
+        ))
+        visual = (
+            VISUAL_HEAD_TAIL
+            if (foe_off < math.radians(45.0) or foe_off > math.radians(135.0))
+            else VISUAL_SIDE
+        )
+        tally = False
+        if dist <= visual:
+            tally = True
+            quality = max(quality, CONTACT_TRACK)
+        # ---- 预警机（track，不能火控）----
+        # awacs 是按阵营的：只有本方有预警机支援时，本机才能拿到
+        # 预警机提供的目标跟踪数据。
+        if self.awacs[self.team_of[i]]:
+            # 预警机大多从侧上方看目标，取侧向/尾向里较大的值。
+            rcs = max(
+                directional_rcs(foe, (ac.x, ac.y, ac.z)),
+                foe.spec.rcs,
+            )
+            reach = AWACS_RANGE_REF * rcs_scale(rcs)
+            if dist <= reach:
+                quality = max(quality, CONTACT_TRACK)
+        return quality, tally, rwr, rwr_az, rwr_search, rwr_search_az, dist, los_az
+
     def _update_sensors(self) -> None:
-        """每个物理步更新双方的接触等级、RWR 与最后已知位置。
+        """每个物理步更新全部敌方接触、RWR 与最后已知位置。
 
         传感器是“被动/主动”的混合：
         - 机头雷达（主动，需 radar_on）：火控级（可发中距弹），受分向 RCS
           与多普勒盲区约束；
         - 侧阵/L 波段（Su-57 专有）：只做 track/detect，不能火控；
         - IRST/光电吊舱（被动）：track，不受 RCS 影响，但受视场与距离限制；
-        - 目视：tally，迎头/尾后 9 km、侧向 11 km；
+        - 目视：迎头/尾后 9 km、侧向 11 km；
         - 预警机：400 km 级 track（按 RCS 缩放），不能当火控。
         RWR 只给“被谁照射”的方位，没有距离。
+
+        多机时逐对计算接触，`contact` 取其中最高等级，`primary` 取等级最高
+        且距离最近的目标；1v1 下与旧实现完全一致。
         """
         for i, ac in enumerate(self.acs):
-            foe = self.acs[1 - i]
             ac.contact = CONTACT_NONE
             ac.tally = False
             ac.rwr = False
             ac.rwr_az = 0.0
             ac.rwr_search = False
             ac.rwr_search_az = 0.0
-            if not ac.alive or not foe.alive:
+            ac.contacts = ()
+            ac.primary = -1
+            if not ac.alive:
                 continue
 
-            dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
-            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if dist < 1e-6:
-                continue
-            ux, uy, uz = dx / dist, dy / dist, dz / dist
-            nx, ny, nz = nose_direction(ac)
-            nose_ang = math.acos(clamp(ux * nx + uy * ny + uz * nz, -1.0, 1.0))
-            nose_az = math.atan2(ny, nx)
-            los_az = math.atan2(dy, dx)
-
-            # ---- RWR：对方雷达辐射告警 ----
-            if foe.radar_on and foe.spec.radar_range > 0.0:
-                # 全向 RWR：只要对方雷达在发射，本机就能截获到辐射方位，
-                # 不论对方机头是否指向本机（搜索/跟踪模式都算）。
-                ac.rwr_search = True
-                ac.rwr_search_az = wrap_pi(los_az - nose_az)
-                # 火控级照射：对方机头雷达正对着本机（落在火控照射锥内），
-                # 意味着可能已经锁定，告警级别更高。
+            contacts: list[Contact] = []
+            best: tuple[int, float] | None = None
+            best_enemy = -1
+            for j, foe in enumerate(self.acs):
+                if j == i or foe.team == ac.team or not foe.alive:
+                    continue
+                (quality, tally, rwr, rwr_az,
+                 rwr_search, rwr_search_az, dist, los_az) = self._sense_pair(i, j)
                 fnx, fny, fnz = nose_direction(foe)
-                bx, by, bz = -ux, -uy, -uz
-                foe_ang = math.acos(clamp(bx * fnx + by * fny + bz * fnz, -1.0, 1.0))
-                if foe_ang <= RADAR_FIRE_FOV:
+                if dist > 1e-6:
+                    aspect = math.acos(clamp(
+                        ((foe.x - ac.x) * fnx + (foe.y - ac.y) * fny
+                         + (foe.z - ac.z) * fnz) / dist, -1.0, 1.0
+                    ))
+                else:
+                    aspect = 0.0
+                contacts.append(Contact(
+                    index=j, dist=dist, los_az=los_az, aspect=aspect,
+                    contact=quality, alive=foe.alive,
+                    hp_frac=foe.hp / foe.spec.hp_max,
+                ))
+                if tally:
+                    ac.tally = True
+                if rwr:
                     ac.rwr = True
-                    ac.rwr_az = wrap_pi(los_az - nose_az)
+                    ac.rwr_az = rwr_az
+                if rwr_search:
+                    ac.rwr_search = True
+                    ac.rwr_search_az = rwr_search_az
+                # 主目标：接触等级优先，其次距离。
+                key = (quality, -dist)
+                if best is None or key > best:
+                    best = key
+                    best_enemy = j
 
-            quality = CONTACT_NONE
-            # ---- 本机机头雷达（主动）----
-            if ac.radar_on and ac.spec.radar_range > 0.0:
-                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
-                reach = (
-                    ac.spec.radar_range
-                    * rcs_scale(rcs)
-                    * radar_visibility(ac, foe)
-                )
-                if dist <= reach:
-                    if nose_ang <= RADAR_FIRE_FOV:
-                        quality = CONTACT_FIRE
-                    elif nose_ang <= RADAR_DETECT_FOV:
-                        quality = CONTACT_DETECT
-            # ---- 侧阵：±35°–145°，0.55×，只 track ----
-            if ac.spec.side_array and (
-                SIDE_ARRAY_MIN <= nose_ang <= SIDE_ARRAY_MAX
-            ):
-                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
-                reach = (
-                    ac.spec.radar_range * SIDE_ARRAY_SCALE
-                    * rcs_scale(rcs) * radar_visibility(ac, foe)
-                )
-                if dist <= reach:
-                    quality = max(quality, CONTACT_TRACK)
-            # ---- L 波段襟翼雷达：±45°，200 km，只 detect ----
-            if ac.spec.lband and nose_ang <= LBAND_FOV:
-                rcs = directional_rcs(foe, (ac.x, ac.y, ac.z))
-                reach = LBAND_RANGE_REF * rcs_scale(rcs)
-                if dist <= reach:
-                    quality = max(quality, CONTACT_DETECT)
-            # ---- IRST / 光电吊舱（被动）----
-            irst = max(ac.spec.irst_range, ac.spec.pod_irst_range)
-            if irst > 0.0 and nose_ang <= IRST_FOV:
-                reach = irst * (IRST_AB_BOOST if foe.ab > 0.05 else 1.0)
-                if dist <= reach:
-                    quality = max(quality, CONTACT_TRACK)
-            # ---- 目视：全向，给 tally ----
-            fnx, fny, fnz = nose_direction(foe)
-            # 对方机头与“对方→本机”视线的夹角：0/180 为迎头/尾后，90 为侧向。
-            foe_off = math.acos(clamp(
-                (fnx * -ux + fny * -uy + fnz * -uz), -1.0, 1.0
-            ))
-            visual = (
-                VISUAL_HEAD_TAIL
-                if (foe_off < math.radians(45.0) or foe_off > math.radians(135.0))
-                else VISUAL_SIDE
-            )
-            if dist <= visual:
-                ac.tally = True
-                quality = max(quality, CONTACT_TRACK)
-            # ---- 预警机（track，不能火控）----
-            # awacs 是按阵营的：只有本方有预警机支援时，本机才能拿到
-            # 预警机提供的目标跟踪数据。
-            if self.awacs[i]:
-                # 预警机大多从侧上方看目标，取侧向/尾向里较大的值。
-                rcs = max(
-                    directional_rcs(foe, (ac.x, ac.y, ac.z)),
-                    foe.spec.rcs,
-                )
-                reach = AWACS_RANGE_REF * rcs_scale(rcs)
-                if dist <= reach:
-                    quality = max(quality, CONTACT_TRACK)
-
-            ac.contact = quality
-            if quality >= CONTACT_TRACK:
+            ac.contacts = tuple(contacts)
+            ac.primary = best_enemy
+            ac.contact = best[0] if best is not None else CONTACT_NONE
+            if ac.contact >= CONTACT_TRACK and best_enemy >= 0:
+                foe = self.acs[best_enemy]
                 ac.last_known = (foe.x, foe.y, foe.z)
                 ac.last_known_t = self.t
                 if self.first_track_t[i] is None:
                     self.first_track_t[i] = self.t
-            if quality >= CONTACT_FIRE and self.first_fire_contact_t[i] is None:
+            if ac.contact >= CONTACT_FIRE and self.first_fire_contact_t[i] is None:
                 # 火控级接触（本机机头雷达照射）：才允许发射雷达中距弹。
                 self.first_fire_contact_t[i] = self.t
 
     # ---------- 对外接口 ----------
 
     # ---------- 中距弹发射决策：命中概率 / 不可逃逸区估计 ----------
+
+    def _primary(self, i: int) -> int:
+        """当前主目标：优先沿用团队分配目标，其次传感器选择，最后最近敌机。"""
+        ac = self.acs[i]
+        j = ac.assigned_target
+        if 0 <= j < len(self.acs):
+            foe = self.acs[j]
+            if j != i and foe.team != ac.team and foe.alive:
+                return j
+        if 0 <= ac.primary < len(self.acs) and self.acs[ac.primary].alive:
+            return ac.primary
+        best, best_d = -1, math.inf
+        for j, foe in enumerate(self.acs):
+            if j == i or foe.team == ac.team or not foe.alive:
+                continue
+            d = math.sqrt((foe.x - ac.x) ** 2 + (foe.y - ac.y) ** 2
+                          + (foe.z - ac.z) ** 2)
+            if d < best_d:
+                best, best_d = j, d
+        return best
 
     def _intercept_estimate(self, i: int) -> tuple[float, bool]:
         """估计现在发射中距弹的命中概率，以及目标是否已在不可逃逸区。
@@ -1233,7 +1415,11 @@ class World:
         - 命中概率是以 NEZ 为中心的 logistic 曲线：进 NEZ 迅速逼近 1，
           远于 NEZ 时快速衰减。
         """
-        me, foe = self.acs[i], self.acs[1 - i]
+        me = self.acs[i]
+        j = self._primary(i)
+        if j < 0:
+            return 0.0, False
+        foe = self.acs[j]
         spec = me.spec.radar_missile
         if spec is None or me.radar_missiles <= 0 or not foe.alive:
             return 0.0, False
@@ -1259,7 +1445,10 @@ class World:
 
     def observe(self, i: int) -> Observation:
         me = self.acs[i]
-        foe = self.acs[1 - i]
+        j = self._primary(i)
+        if j < 0:
+            j = (i + 1) % len(self.acs)
+        foe = self.acs[j]
         dx, dy, dz = foe.x - me.x, foe.y - me.y, foe.z - me.z
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
         dist_h = math.hypot(dx, dy)
@@ -1581,6 +1770,22 @@ class World:
             radar_on=me.radar_on,
             foe_radar_on=foe.radar_on,
             gun_accuracy=1.0 if me.tally else GUN_NO_TALLY_SPREAD,
+            contacts=me.contacts,
+            foe_index=j,
+            team_offset_az=math.atan2(
+                me.formation_offset_m, max(dist_h, 500.0)
+            ),
+            team_alt_offset_rad=math.atan2(
+                me.formation_alt_m, max(dist_h, 1000.0)
+            ),
+            team_role=me.order_role,
+            team_weapons=me.weapons_state,
+            own_energy=me.energy,
+            foe_energy=foe.energy,
+            energy_adv=me.energy - foe.energy,
+            alt_adv=me.z - foe.z,
+            team_min_alt=me.team_min_alt,
+            team_disengage=me.team_disengage,
         )
 
         # ---- 感知层降级：没有稳定跟踪时，不给真实几何 ----
@@ -2513,10 +2718,17 @@ class World:
         for i, ac in enumerate(self.acs):
             ac.launch_cd = max(0.0, ac.launch_cd - self.dt)
             ac.radar_cd = max(0.0, ac.radar_cd - self.dt)
-            foe = self.acs[1 - i]
-            if not ac.alive or not foe.alive:
+            j = self._primary(i)
+            if not ac.alive or j < 0:
                 ac.locked = ac.radar_locked = False
                 ac.lock_timer = ac.radar_lock_timer = 0.0
+                ac.locked_target = ac.radar_locked_target = -1
+                continue
+            foe = self.acs[j]
+            if not foe.alive:
+                ac.locked = ac.radar_locked = False
+                ac.lock_timer = ac.radar_lock_timer = 0.0
+                ac.locked_target = ac.radar_locked_target = -1
                 continue
 
             dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
@@ -2565,6 +2777,16 @@ class World:
                 )
                 ac.radar_locked = ac.radar_lock_timer >= rspec.lock_time
 
+            # 把锁定目标固化下来：发射时按这个下标找目标，而不是再猜一次。
+            ac.locked_target = j if ac.locked else -1
+            ac.radar_locked_target = j if ac.radar_locked else -1
+
+    def _in_no_fire_zone(self, x: float, y: float) -> bool:
+        for zx, zy, zr in self.no_fire_zones:
+            if (x - zx) ** 2 + (y - zy) ** 2 <= zr * zr:
+                return True
+        return False
+
     def _weapons(self, actions: list[Action]) -> None:
         """机炮按射速生成弹丸；命中由后续的外弹道积分判定。
 
@@ -2580,8 +2802,18 @@ class World:
                 ac.gun_pending = 0.0
                 continue
             spec = ac.spec
-            foe = self.acs[1 - i]
+            j = self._primary(i)
+            if j < 0:
+                ac.firing = False
+                ac.gun_pending = 0.0
+                continue
+            foe = self.acs[j]
             if not foe.alive:
+                ac.firing = False
+                ac.gun_pending = 0.0
+                continue
+            # ROE：禁射令 / 目标位于禁射区时，机炮同样不允许开火。
+            if self.roe == "weapons_hold" or self._in_no_fire_zone(foe.x, foe.y):
                 ac.firing = False
                 ac.gun_pending = 0.0
                 continue
@@ -2672,7 +2904,7 @@ class World:
             b.z = z0 + sz
 
             for j, ac in enumerate(self.acs):
-                if j == b.owner or not ac.alive:
+                if j == b.owner or self.team_of[j] == self.team_of[b.owner] or not ac.alive:
                     continue
                 r = max(3.0, 0.35 * ac.spec.length)
                 l2 = sx * sx + sy * sy + sz * sz
@@ -2795,8 +3027,14 @@ class World:
             return
         if not radar and ac.contact < CONTACT_TRACK:
             return
-        foe = self.acs[1 - i]
+        target_idx = ac.radar_locked_target if radar else ac.locked_target
+        if not 0 <= target_idx < len(self.acs):
+            return
+        foe = self.acs[target_idx]
         if not foe.alive:
+            return
+        # ROE：禁射令 / 目标位于禁射区时拒绝发射。
+        if self.roe == "weapons_hold" or self._in_no_fire_zone(foe.x, foe.y):
             return
         dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
         dist = math.sqrt(dx * dx + dy * dy + dz * dz)
@@ -2827,7 +3065,7 @@ class World:
             Missile(
                 spec=mspec,
                 owner=i,
-                target=1 - i,
+                target=target_idx,
                 x=lx,
                 y=ly,
                 z=lz,
@@ -2853,7 +3091,6 @@ class World:
         if self.first_fire_t[i] is None:
             self.first_fire_t[i] = self.t
         self.events.append((self.t, f"{ac.spec.name} 发射 {mspec.name}"))
-
     def _update_countermeasures(self) -> None:
         """干扰物投放、飘落与对在飞导弹的诱骗。
 
@@ -3426,12 +3663,38 @@ class World:
             if m.z <= self.z_floor or abs(m.x) > self.arena / 2 or abs(m.y) > self.arena / 2:
                 m.alive = False
 
+    def _team_alive(self, team: int) -> bool:
+        return any(
+            ac.alive and ac.hp > 0.0 for ac in self.acs if ac.team == team
+        )
+
+    def _team_hp_ratio(self, team: int) -> float:
+        members = [ac for ac in self.acs if ac.team == team]
+        total = sum(ac.spec.hp_max for ac in members)
+        return sum(ac.hp for ac in members) / max(total, 1e-9)
+
+    def _team_energy(self, team: int) -> float:
+        """存活飞机的平均比能量 (J/kg)，用于超时裁决。"""
+        members = [
+            ac for ac in self.acs
+            if ac.team == team and ac.alive and ac.hp > 0.0
+        ]
+        if not members:
+            return 0.0
+        return sum(ac.energy for ac in members) / len(members)
+
+    def _team_endurance(self, team: int) -> float:
+        return sum(
+            military_endurance(ac.spec, ac.fuel)
+            for ac in self.acs if ac.team == team
+        )
+
     def _referee(self) -> None:
         # 一方被击落时若仍有导弹在飞，先不结算：双方在超视距阶段几乎同时
         # 发射，先被打掉的一方可能已经有一枚弹在飞向对手。等这些弹全部
         # 落地/命中后再判定，避免“先被击落就直接输掉”忽略掉后到的命中。
         if self._pending_finish is not None:
-            both_dead = self.acs[0].hp <= 0.0 and self.acs[1].hp <= 0.0
+            both_dead = not self._team_alive(0) and not self._team_alive(1)
             if both_dead:
                 for ac in self.acs:
                     ac.hp = 0.0
@@ -3447,34 +3710,44 @@ class World:
                 self._finish(winner, reason, code)
             return
 
-        if self.acs[0].hp <= 0.0 and self.acs[1].hp <= 0.0:
-            for ac in self.acs:
+        for ac in self.acs:
+            if ac.hp <= 0.0:
                 ac.hp = 0.0
                 ac.alive = False
+
+        if not self._team_alive(0) and not self._team_alive(1):
             self.result = "draw"
             self.reason = "同归于尽"
             self.reason_code = "kill"
             self.events.append((self.t, self.reason))
             return
+
+        eliminated = [t for t in (0, 1) if not self._team_alive(t)]
+        if eliminated:
+            loser = eliminated[0]
+            winner = 1 - loser
+            names = [ac.spec.name for ac in self.acs if ac.team == loser]
+            reason = (
+                f"{names[0]} 被击落" if len(names) == 1
+                else f"{self.team_names[loser]} 方全灭"
+            )
+            if any(m.alive for m in self.missiles):
+                self._pending_finish = (winner, reason, "kill")
+                self.events.append((self.t, f"{reason}，等待在飞导弹落地"))
+            else:
+                self._finish(winner, reason, "kill")
+            return
+
         for i, ac in enumerate(self.acs):
-            if ac.hp <= 0.0:
-                ac.hp = 0.0
-                ac.alive = False
-                reason = f"{ac.spec.name} 被击落"
-                if any(m.alive for m in self.missiles):
-                    self._pending_finish = (1 - i, reason, "kill")
-                    self.events.append((self.t, f"{reason}，等待在飞导弹落地"))
-                else:
-                    self._finish(1 - i, reason, "kill")
-                return
-        for i, ac in enumerate(self.acs):
+            if not ac.alive:
+                continue
+            boundary_reason = ""
             if self.dof >= 3:
                 if ac.z <= self.z_floor:
                     ac.z = self.z_floor
                     ac.alive = False
-                    self._finish(1 - i, f"{ac.spec.name} 低于最低高度坠机", "boundary")
-                    return
-                if ac.z >= self.z_ceiling:
+                    boundary_reason = f"{ac.spec.name} 低于最低高度坠机"
+                elif ac.z >= self.z_ceiling:
                     # 不再判定“解体”：ISA 只建模到 32 km，推力悬崖已经让飞机
                     # 在升限附近自然失去剩余功率。这里只记录一次越界事件，
                     # 保留诊断价值而不干扰对局结果。
@@ -3485,32 +3758,34 @@ class World:
                             f"{ac.spec.name} 超过验证高度上限 "
                             f"{self.z_ceiling / 1000.0:.0f} km",
                         ))
-            if abs(ac.x) > self.arena / 2 or abs(ac.y) > self.arena / 2:
+            if not boundary_reason and (
+                abs(ac.x) > self.arena / 2 or abs(ac.y) > self.arena / 2
+            ):
                 ac.alive = False
-                self._finish(1 - i, f"{ac.spec.name} 飞出交战空域", "boundary")
+                boundary_reason = f"{ac.spec.name} 飞出交战空域"
+            if boundary_reason and not self._team_alive(ac.team):
+                self._finish(1 - ac.team, boundary_reason, "boundary")
                 return
 
         if self.t >= self.time_limit:
-            # 按血量比例比较，避免初始 HP 不同导致的重机默认占优。
-            r_ratio = self.acs[0].hp / self.acs[0].spec.hp_max
-            b_ratio = self.acs[1].hp / self.acs[1].spec.hp_max
+            # 按队伍总血量比例比较，避免初始 HP 不同导致的重机默认占优。
+            r_ratio = self._team_hp_ratio(0)
+            b_ratio = self._team_hp_ratio(1)
             if r_ratio > b_ratio:
                 self._finish(0, "超时判定：血量优势", "timeout")
             elif b_ratio > r_ratio:
                 self._finish(1, "超时判定：血量优势", "timeout")
-            elif (
-                abs(
-                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
-                    - military_endurance(self.acs[1].spec, self.acs[1].fuel)
-                )
-                > 5.0
-            ):
+            elif abs(self._team_energy(0) - self._team_energy(1)) > 3000.0:
+                # 血量打平就比能量：比能量同时计入高度与速度，高位/高速一方
+                # 掌握“可以选择打或不打”的主动权，判其占优。
+                if self._team_energy(0) > self._team_energy(1):
+                    self._finish(0, "超时判定：能量优势", "timeout")
+                else:
+                    self._finish(1, "超时判定：能量优势", "timeout")
+            elif abs(self._team_endurance(0) - self._team_endurance(1)) > 5.0:
                 # 血量打平就比“还能打多久”：剩余军推续航长的一方掌握主动权，
                 # 续航短的一方按 Bingo 规则本来就必须退出交战，判其失利。
-                if (
-                    military_endurance(self.acs[0].spec, self.acs[0].fuel)
-                    > military_endurance(self.acs[1].spec, self.acs[1].fuel)
-                ):
+                if self._team_endurance(0) > self._team_endurance(1):
                     self._finish(0, "超时判定：续航优势", "timeout")
                 else:
                     self._finish(1, "超时判定：续航优势", "timeout")
@@ -3527,22 +3802,33 @@ class World:
         self.events.append((self.t, reason))
 
     def summary(self) -> str:
-        r, b = self.acs
-        return (
-            f"t={self.t:6.2f}s  dof={self.dof}  result={self.result or 'running':8s}  {self.reason}\n"
-            f"  {r.spec.name:>8s}  alt={r.z:6.0f}m  v={r.v:6.1f} m/s  g={r.n:4.1f}  "
-            f"gam={math.degrees(r.gamma):+6.1f}deg  hp={r.hp:5.1f}  ammo={r.ammo:5.0f}  "
-            f"msl={r.missiles}+{r.radar_missiles}  mass={r.mass:6.0f}kg  "
-            f"ps={r.spec.specific_power(r.v, r.z, max(r.n, 1.0), mass=r.mass):+5.0f} m/s\n"
-            f"  {b.spec.name:>8s}  alt={b.z:6.0f}m  v={b.v:6.1f} m/s  g={b.n:4.1f}  "
-            f"gam={math.degrees(b.gamma):+6.1f}deg  hp={b.hp:5.1f}  ammo={b.ammo:5.0f}  "
-            f"msl={b.missiles}+{b.radar_missiles}  mass={b.mass:6.0f}kg  "
-            f"ps={b.spec.specific_power(b.v, b.z, max(b.n, 1.0), mass=b.mass):+5.0f} m/s\n"
+        teams = "  ".join(
+            f"{self.team_names[t]}={sum(1 for ac in self.acs if ac.team == t and ac.alive)}"
+            for t in (0, 1)
+        )
+        lines = [
+            f"t={self.t:6.2f}s  dof={self.dof}  result={self.result or 'running':8s}  "
+            f"{self.reason}  [{teams}]"
+        ]
+        for ac in self.acs:
+            lines.append(
+                f"  {ac.callsign or ac.spec.name:>8s}  alt={ac.z:6.0f}m  "
+                f"v={ac.v:6.1f} m/s  g={ac.n:4.1f}  "
+                f"gam={math.degrees(ac.gamma):+6.1f}deg  hp={ac.hp:5.1f}  "
+                f"ammo={ac.ammo:5.0f}  msl={ac.missiles}+{ac.radar_missiles}  "
+                f"mass={ac.mass:6.0f}kg  "
+                f"ps={ac.spec.specific_power(ac.v, ac.z, max(ac.n, 1.0), mass=ac.mass):+5.0f} m/s"
+            )
+        hits = " / ".join(
+            f"{self.callsigns[i]} {self.stats['missiles_hit'][i]}"
+            for i in range(len(self.acs))
+        )
+        lines.append(
             f"  speed [{self.stats['min_v']:.1f}, {self.stats['max_v']:.1f}] m/s  "
             f"alt [{self.stats['min_z']:.0f}, {self.stats['max_z']:.0f}] m  "
             f"max g={self.stats['max_n']:.1f}  max |gam|={self.stats['max_climb']:.0f}deg  "
             f"rounds={self.stats['rounds_fired']:.0f}  "
             f"msl fired={self.stats['missiles_fired']:.0f}  "
-            f"hit={self.stats['missile_hits']} (R {self.stats['missiles_hit'][0]} / "
-            f"B {self.stats['missiles_hit'][1]})"
+            f"hit={self.stats['missile_hits']} ({hits})"
         )
+        return "\n".join(lines)

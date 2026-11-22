@@ -1,0 +1,102 @@
+# 4v4 多机对抗：红方 J-16 四机攻势扫荡，蓝方 J-15T 四机舰队防空。
+# 四机设一名中队长（flight_lead，兼第一双机小队长），第 3 机为第二双机小队长
+# （element_lead），两架僚机各随一名小队长：flight_lead / wingman / element_lead / wingman。
+id: j16-j15t-4v4
+brief: 红方 J-16 四机前出扫荡，寻求在蓝方防区外完成超视距齐射；蓝方 J-15T 四机担任舰队防空，以拦截航线迎头展开。
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 40000
+  altitude_m: 10000
+  y_offset_m: 100
+  lane_m: 2500
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    side: attacker
+    formation_group: [echelon, finger_four, fluid_four, wedge]
+    mission: sweep
+    radar_policy: auto
+    aircraft:
+      - id: J-16
+        callsign: Flanker1
+        role: fighter
+        rank: flight_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-16
+        callsign: Flanker2
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-16
+        callsign: Flanker3
+        role: fighter
+        rank: element_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-16
+        callsign: Flanker4
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+  - name: blue
+    side: defender
+    formation_group: [echelon, box, arrowhead]
+    mission: intercept
+    radar_policy: auto
+    aircraft:
+      - id: J-15T
+        callsign: Shark1
+        role: interceptor
+        rank: flight_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-15T
+        callsign: Shark2
+        role: interceptor
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-15T
+        callsign: Shark3
+        role: interceptor
+        rank: element_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-15T
+        callsign: Shark4
+        role: interceptor
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+
+awacs: false
+
+rules:
+  roe: weapons_free
+  team_brain: true
+  no_fire_zones: []

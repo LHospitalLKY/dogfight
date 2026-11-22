@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
+import random
 from collections import Counter
 
 from dogfight.config import (
     ConfigBundle,
     DEFAULT_SCENARIO,
     Scenario,
+    formations,
     load_bundle,
 )
 from dogfight.core.sim import (
@@ -44,6 +46,69 @@ def resolve_scenario(name: str | None = None,
     return get_bundle(config_dir).scenario(name or DEFAULT_SCENARIO)
 
 
+def _slot_count(sc: Scenario) -> int:
+    return sc.aircraft_count
+
+
+def _roll_formations(sc: Scenario, seed: int | None) -> tuple[str, ...]:
+    """开局掷骰子：每队从自己的编队池里随机抽一种队形。
+
+    显式给 seed 时同一 seed 结果可复现；完全不给 seed 时按 0 固定，
+    保证库层调用（测试/批跑）仍然可复现。Web 端每开一局会显式传入
+    新的随机种子来完成“掷骰子”。
+    编队池为空（旧场景）时退化为横队，保持原几何。
+    """
+    rng = random.Random(0 if seed is None else seed)
+    picked: list[str] = []
+    for team in sc.teams:
+        n = len(team.slots)
+        pool = [f for f in team.formation_group if formations.supported(f, n)]
+        picked.append(rng.choice(pool) if pool else "line_abreast")
+    return tuple(picked)
+
+
+def _multi_spawns(sc: Scenario, swap: bool,
+                  formation_ids: tuple[str, ...] | None = None) -> list[tuple]:
+    """多机出生点：按队伍分侧，同队按抽到的编队排在队首后方。"""
+    init = sc.initial
+    spawns: list[tuple] = []
+    for ti, team in enumerate(sc.teams):
+        n = len(team.slots)
+        heading = team.heading_deg
+        if heading is None:
+            heading = 0.0 if ti == 0 else 180.0
+        side = -1.0 if ti == 0 else 1.0
+        fid = formation_ids[ti] if formation_ids else "line_abreast"
+        offs = formations.offsets(fid, n)
+        rad = math.radians(heading)
+        # 航向单位向量与其右侧单位向量；偏移都按 lane_m 换算成米。
+        fx, fy = math.cos(rad), math.sin(rad)
+        rx, ry = math.sin(rad), -math.cos(rad)
+        base_y = init.y_offset_m if ti == 1 else 0.0
+        for k, slot in enumerate(team.slots):
+            fwd, lat, up = offs[k]
+            x = side * init.spacing_m + (fwd * fx + lat * rx) * init.lane_m
+            y = base_y + (fwd * fy + lat * ry) * init.lane_m
+            z = init.altitude_m + up * init.lane_m
+            spawn = slot.spawn
+            psi = heading
+            v = None
+            if spawn is not None:
+                if spawn.x is not None:
+                    x = spawn.x
+                if spawn.y is not None:
+                    y = spawn.y
+                if spawn.z is not None:
+                    z = spawn.z
+                if spawn.psi is not None:
+                    psi = spawn.psi
+                v = spawn.v
+            spawns.append((x, y, z, psi, v))
+    if swap:
+        spawns.reverse()
+    return spawns
+
+
 def build_world(
     time_limit: float | None = None,
     dof: int = 6,
@@ -52,17 +117,79 @@ def build_world(
     awacs: bool | None = None,
     scenario: Scenario | None = None,
     seed: int | None = None,
+    formation_seed: int | None = None,
 ) -> World:
     sc = scenario or resolve_scenario()
-    specs = [team.aircraft.spec for team in sc.teams]
+    init = sc.initial
+    # 1v1 走原路径：两架飞机、默认对头几何，保证旧场景逐位复现。
+    if sc.is_duel:
+        specs = [team.aircraft.spec for team in sc.teams]
+        if swap:
+            specs.reverse()
+        headings = tuple(team.heading_deg for team in sc.teams)
+        if swap:
+            headings = (headings[1], headings[0])
+        ranks = [team.slots[0].rank for team in sc.teams]
+        if swap:
+            ranks.reverse()
+        extra = {} if seed is None else {"seed": seed}
+        sides = tuple(team.side for team in sc.teams)
+        if swap:
+            sides = (sides[1], sides[0])
+        world = World(
+            specs,
+            dt=sc.physics_dt,
+            arena=init.arena_m,
+            time_limit=sc.time_limit if time_limit is None else time_limit,
+            dof=dof,
+            y_offset=init.y_offset_m if y_offset is None else y_offset,
+            x_offset=init.spacing_m,
+            z0=init.altitude_m,
+            z_floor=init.floor_m,
+            z_ceiling=init.ceiling_m,
+            awacs=sc.awacs if awacs is None else awacs,
+            headings=headings,
+            ranks=ranks,
+            roe=sc.rules.roe,
+            no_fire_zones=sc.rules.no_fire_zones,
+            **extra,
+        )
+        world.formation_ids = ()
+        world.brief = sc.brief
+        world.sides = sides
+        return world
+
+    specs: list[AircraftSpec] = []
+    team_of: list[int] = []
+    callsigns: list[str] = []
+    ranks: list[str] = []
+    for ti, team in enumerate(sc.teams):
+        for slot in team.slots:
+            specs.append(slot.entry.spec)
+            team_of.append(ti)
+            callsigns.append(slot.callsign)
+            ranks.append(slot.rank)
+    headings = tuple(
+        team.heading_deg for team in sc.teams
+    )
     if swap:
         specs.reverse()
-    init = sc.initial
-    headings = tuple(team.heading_deg for team in sc.teams)
-    if swap:
+        team_of = [1 - t for t in team_of][::-1]
+        callsigns.reverse()
+        ranks.reverse()
         headings = (headings[1], headings[0])
     extra = {} if seed is None else {"seed": seed}
-    return World(
+    team_names = (sc.teams[0].name, sc.teams[1].name)
+    sides = tuple(team.side for team in sc.teams)
+    if swap:
+        team_names = (team_names[1], team_names[0])
+        sides = (sides[1], sides[0])
+    # 开场掷骰子选编队；显式 formation_seed 优先，其次沿用实验 seed。
+    roll_seed = formation_seed if formation_seed is not None else seed
+    formation_ids = _roll_formations(sc, roll_seed)
+    if swap:
+        formation_ids = (formation_ids[1], formation_ids[0])
+    world = World(
         specs,
         dt=sc.physics_dt,
         arena=init.arena_m,
@@ -75,8 +202,19 @@ def build_world(
         z_ceiling=init.ceiling_m,
         awacs=sc.awacs if awacs is None else awacs,
         headings=headings,
+        team_of=team_of,
+        spawns=_multi_spawns(sc, swap, formation_ids),
+        callsigns=callsigns,
+        ranks=ranks,
+        team_names=team_names,
+        roe=sc.rules.roe,
+        no_fire_zones=sc.rules.no_fire_zones,
         **extra,
     )
+    world.formation_ids = formation_ids
+    world.brief = sc.brief
+    world.sides = sides
+    return world
 
 
 def build_agents(
@@ -90,50 +228,56 @@ def build_agents(
     雷达策略优先级：radar_policy 覆盖 > 旧机型参数 > 场景配置。
     旧的 --f16-radar / --su57-radar 只是兼容别名，新场景请用 team 名覆盖。
     """
-    if baseline:
-        return [PurePursuit(), PurePursuit()]
     sc = scenario or resolve_scenario()
+    if baseline:
+        return [PurePursuit() for _ in range(_slot_count(sc))]
     overrides = radar_policy or {}
 
     def _front_rcs(spec: AircraftSpec) -> float:
         """有效前向 RCS：分向值为 0 时回退到全向 rcs。"""
         return spec.rcs_front if spec.rcs_front > 0.0 else spec.rcs
 
-    agents = []
-    for index, team in enumerate(sc.teams):
-        policy = (
-            overrides.get(team.name)
-            or overrides.get(team.aircraft.id)
-            or (f16_radar if team.aircraft.id == "F-16V" else None)
-            or (su57_radar if team.aircraft.id == "SU-57" else None)
+    def _policy(ti: int, slot, team) -> str:
+        return (
+            overrides.get(slot.callsign)
+            or overrides.get(team.name)
+            or overrides.get(slot.entry.id)
+            or (f16_radar if slot.entry.id == "F-16V" else None)
+            or (su57_radar if slot.entry.id == "SU-57" else None)
+            or slot.radar_policy
             or team.radar_policy
         )
-        persona = dataclasses.asdict(team.aircraft.agent)
-        # 场景里显式指定的 opening_tactic 优先级最高；否则按机体 persona 的
-        # 值走（auto 时由对阵自动选择 stealth_compress 或 default）。
-        if team.opening_tactic is not None:
-            persona["opening_tactic"] = team.opening_tactic
-        if persona.get("opening_tactic", "auto") == "auto":
-            own_spec = team.aircraft.spec
-            opp_index = 1 - index if len(sc.teams) == 2 else index
-            opp_spec = sc.teams[opp_index].aircraft.spec
-            own_front = _front_rcs(own_spec)
-            opp_front = _front_rcs(opp_spec)
-            has_radar_missile = own_spec.radar_missile_count > 0
-            if (
-                opp_front > 0.0
-                and own_front < opp_front * 0.5
-                and has_radar_missile
-            ):
-                persona["opening_tactic"] = "stealth_compress"
-            else:
-                persona["opening_tactic"] = "default"
-        team_seed = None if seed is None else seed + index
-        agents.append(TacticalAgent(
-            **persona,
-            seed=team_seed,
-            radar_policy=policy,
-        ))
+
+    def _opening(ti: int, slot, team) -> str:
+        tactic = slot.opening_tactic or team.opening_tactic
+        if tactic is None:
+            tactic = slot.entry.agent.opening_tactic
+        if tactic != "auto":
+            return tactic
+        own_spec = slot.entry.spec
+        opp_team = sc.teams[1 - ti]
+        opp_spec = opp_team.slots[0].entry.spec
+        if (
+            _front_rcs(opp_spec) > 0.0
+            and _front_rcs(own_spec) < _front_rcs(opp_spec) * 0.5
+            and own_spec.radar_missile_count > 0
+        ):
+            return "stealth_compress"
+        return "default"
+
+    agents = []
+    index = 0
+    for ti, team in enumerate(sc.teams):
+        for slot in team.slots:
+            persona = dataclasses.asdict(slot.entry.agent)
+            persona["opening_tactic"] = _opening(ti, slot, team)
+            team_seed = None if seed is None else seed + index
+            agents.append(TacticalAgent(
+                **persona,
+                seed=team_seed,
+                radar_policy=_policy(ti, slot, team),
+            ))
+            index += 1
     if swap:
         agents.reverse()
     return agents
@@ -186,9 +330,11 @@ def print_specs(scenario: Scenario | None = None) -> None:
         f"{air_density(20000.0):.3f} @20km"
     )
     for team in sc.teams:
-        spec = team.aircraft.spec
-        print(f"[{team.name}] 雷达策略 {team.radar_policy}")
-        _print_spec(spec)
+        print(f"[{team.name}] 任务 {team.mission} 雷达策略 {team.radar_policy}")
+        for slot in team.slots:
+            if len(team.slots) > 1:
+                print(f"  {slot.callsign}（{slot.role}）")
+            _print_spec(slot.entry.spec)
     print("=" * 76)
 
 
@@ -254,32 +400,52 @@ def _simulate(
     for ac, ag in zip(world.acs, agents):
         tactic = getattr(ag, "opening_tactic", "default")
         world.events.append((world.t, f"{ac.spec.name} 开局战术: {tactic}"))
+    # 多机场景启用团队决策；1v1 保持原样，避免改变既有平衡与基线。
+    brain = None
+    if sc.rules.team_brain and not sc.is_duel and not baseline:
+        from dogfight.tactics.team import TeamBrain
+
+        brain = TeamBrain(world)
     steps_per_decision = round(1.0 / (sc.decision_hz * sc.physics_dt))
     steps_per_second = max(1, round(1.0 / sc.physics_dt))
-    usage = [Counter() for _ in range(len(sc.teams))]
-    actions = [Action() for _ in range(len(sc.teams))]
+    usage = [Counter() for _ in range(len(world.acs))]
+    actions = [Action() for _ in range(len(world.acs))]
     steps = 0
 
     while world.result is None:
         if steps % steps_per_decision == 0:
+            if brain is not None:
+                brain.plan()
             actions = [ag.act(world.observe(i)) for i, ag in enumerate(agents)]
+            if brain is not None:
+                brain.filter_actions(actions)
             for i, ag in enumerate(agents):
                 usage[i][getattr(ag, "primitive", "PURE")] += 1
         world.step(actions)
         steps += 1
 
         if trace and steps % steps_per_second == 0:
-            r, b = world.acs
-            dist = math.sqrt((r.x - b.x) ** 2 + (r.y - b.y) ** 2 + (r.z - b.z) ** 2)
-            print(
-                f"t={world.t:5.1f}s d={dist:5.0f}m  "
-                f"{r.spec.name} alt={r.z:5.0f} v={r.v:5.1f} g={r.n:4.1f} hp={r.hp:5.1f} "
-                f"msl={r.missiles}+{r.radar_missiles} "
-                f"[{getattr(agents[0], 'situation', '-'):9s}/{getattr(agents[0], 'primitive', 'PURE'):9s}]  |  "
-                f"{b.spec.name} alt={b.z:5.0f} v={b.v:5.1f} g={b.n:4.1f} hp={b.hp:5.1f} "
-                f"msl={b.missiles}+{b.radar_missiles} "
-                f"[{getattr(agents[1], 'situation', '-'):9s}/{getattr(agents[1], 'primitive', 'PURE'):9s}]"
-            )
+            if len(world.acs) == 2:
+                r, b = world.acs
+                dist = math.sqrt(
+                    (r.x - b.x) ** 2 + (r.y - b.y) ** 2 + (r.z - b.z) ** 2
+                )
+                print(
+                    f"t={world.t:5.1f}s d={dist:5.0f}m  "
+                    f"{r.spec.name} alt={r.z:5.0f} v={r.v:5.1f} g={r.n:4.1f} hp={r.hp:5.1f} "
+                    f"msl={r.missiles}+{r.radar_missiles} "
+                    f"[{getattr(agents[0], 'situation', '-'):9s}/{getattr(agents[0], 'primitive', 'PURE'):9s}]  |  "
+                    f"{b.spec.name} alt={b.z:5.0f} v={b.v:5.1f} g={b.n:4.1f} hp={b.hp:5.1f} "
+                    f"msl={b.missiles}+{b.radar_missiles} "
+                    f"[{getattr(agents[1], 'situation', '-'):9s}/{getattr(agents[1], 'primitive', 'PURE'):9s}]"
+                )
+            else:
+                parts = [
+                    f"{ac.callsign} alt={ac.z:5.0f} v={ac.v:5.1f} hp={ac.hp:5.1f} "
+                    f"msl={ac.missiles}+{ac.radar_missiles}"
+                    for ac in world.acs
+                ]
+                print(f"t={world.t:5.1f}s  " + "  |  ".join(parts))
 
     return world, agents, usage
 

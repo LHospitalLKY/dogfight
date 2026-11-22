@@ -12,6 +12,15 @@
     return Math.max(lo, Math.min(hi, v));
   }
 
+  // 控制台默认静默：可恢复的错误（模型/场景/SSE/采集）不再写成 error，
+  // 避免页面预览因控制台出现错误而自动弹出日志面板。排查时在地址后加
+  // ?debug=1 即可恢复全部日志。
+  const DEBUG_LOG = new URLSearchParams(window.location.search).has("debug");
+  const con = window.console;
+  const logInfo = (...args) => { if (DEBUG_LOG) con.log(...args); };
+  const logWarn = (...args) => { if (DEBUG_LOG) con.warn(...args); };
+  const logError = (...args) => { if (DEBUG_LOG) con.error(...args); };
+
   // ---------- theme.py 颜色常量（前端照搬） ----------
   const RGB = {
     TEAM: [[255, 116, 96], [92, 178, 255]],
@@ -49,7 +58,29 @@
   const FONT = '"Fira Code", "SFMono-Regular", Consolas, monospace';
   const REF_LENGTH = 20.1;
   const TRAIL_FADE = 12.0;
+  // 机体模型的屏幕目标长度（px）与世界倍率上限：保证全程都能看清完整
+  // 模型，又不会在远处放大成互相穿插的巨物。检视模式仍用 1:1。
+  const MODEL_PX = 64.0;
+  const MODEL_MAX_SCALE = 40.0;
+  // 远距（BVR）阈值：模型投影短于该像素数时不再画 3D 模型，
+  // 改用细长的扁平箭头符号（见 drawAircraftArrow）。
+  const FAR_ARROW_PX = 12.0;
   const TAU = Math.PI * 2;
+
+  // 视深 → 每像素对应的世界长度换算用的焦距（像素）。
+  function focalPx(fovDeg) {
+    return (window.innerHeight / 2.0)
+      / Math.tan((fovDeg || 50.0) * Math.PI / 360.0);
+  }
+
+  // 把模型缩放到目标屏幕长度，并限制在 [1, MODEL_MAX_SCALE]：
+  // 近处不小于真实尺寸，远处也不无限放大，避免编队互相穿插或穿进镜头。
+  function modelScale(depth, ml, fovDeg) {
+    return clamp(
+      MODEL_PX * Math.max(depth, 1.0) / (focalPx(fovDeg) * (ml || REF_LENGTH)),
+      1.0, MODEL_MAX_SCALE,
+    );
+  }
   // 高过载特效阈值；干扰物寿命与 sim.py 的 CHAFF_LIFE / FLARE_LIFE 一致，
   // 前端只用于视觉包络，不参与物理。
   const HIGH_G_ON = 4.5;
@@ -108,8 +139,21 @@
       fps: Math.max(1.0, parseFloat(q.get("fps") || "30") || 30.0),
       name: (q.get("name") || "shot").replace(/[^\w.-]+/g, "_"),
       encode: q.get("encode") !== "0",
+      // 从第 t0 秒开始录：逐帧步进模式第一帧先定量推进 t0 秒（不采画面），
+      // 这样剪辑点可以落在交战最激烈的时段，而不用把前面几分钟也编码。
+      skip: Math.max(0.0, parseFloat(q.get("t0") || "0") || 0.0),
     };
   })();
+
+  // 采集进度（仅浏览器里可见，不进画面：逐帧模式只合成 WebGL 画布）。
+  const capStatus = CAPTURE ? document.createElement("div") : null;
+  if (capStatus) {
+    capStatus.style.cssText = "position:fixed;left:12px;top:12px;z-index:9999;"
+      + "font:600 15px/1.5 ui-monospace,monospace;color:#8ff;background:#000c;"
+      + "padding:8px 12px;border-radius:8px;white-space:pre;";
+    document.body.appendChild(capStatus);
+  }
+  const capLog = (s) => { if (capStatus) capStatus.textContent = s; };
 
   // 近距检视模式：/?inspect=0|1 把指定机体按真实尺寸放到相机前缓慢环绕，
   // 只用于核对材质/法线细节（正常观战不受影响）。
@@ -237,17 +281,20 @@
   // 机体有关——远距观战时机体被按屏幕尺寸放大，灯也必须同步放大，否则光斑
   // 只有真实尺寸那么大，远远看去飞机仍然是一团灰影。
   const stageLights = [];
-  if (INSPECT === null) {
-    for (let i = 0; i < 2; i += 1) {
-      const key = new THREE.SpotLight(0xf4f8ff, 3.0, 0.0, 0.50, 0.88, 0.0);
-      const rim = new THREE.SpotLight(0x9fc4ff, 1.8, 0.0, 0.54, 0.92, 0.0);
-      for (const light of [key, rim]) {
-        light.visible = false;
-        scene.add(light);
-        scene.add(light.target);
-      }
-      stageLights.push({ key, rim });
+  function addStageLight() {
+    // 亮度以深灰实机涂装为准：两盏灯合计压到 2.5 左右，机身顶面
+    // 才会呈中深灰而不是被灯光打白；座舱/喷口的镜面高光仍然保留。
+    const key = new THREE.SpotLight(0xf4f8ff, 1.6, 0.0, 0.50, 0.88, 0.0);
+    const rim = new THREE.SpotLight(0x9fc4ff, 0.85, 0.0, 0.54, 0.92, 0.0);
+    for (const light of [key, rim]) {
+      light.visible = false;
+      scene.add(light);
+      scene.add(light.target);
     }
+    stageLights.push({ key, rim });
+  }
+  if (INSPECT === null) {
+    for (let i = 0; i < 2; i += 1) addStageLight();
   }
 
   // 检视模式补光：正常观战距离远，靠轮廓光即可；近距看材质时暗色蒙皮
@@ -1178,7 +1225,7 @@
         MISSILE_GEOS[name] = geo;
       }),
     ];
-    await Promise.all(jobs).catch((err) => console.error("模型加载失败", err));
+    await Promise.all(jobs).catch((err) => logError("模型加载失败", err));
   })();
 
   // 采集/检视都要求模型解析完成：此时相机才被快照定位，机体也才真正可画。
@@ -1647,16 +1694,16 @@
     const cv = camoCanvas();
     const g = cv.getContext("2d");
     const S = CAMO_TEX_SIZE;
-    g.fillStyle = "#d0d5da";
+    g.fillStyle = "#8b929b";
     g.fillRect(0, 0, S, S);
     for (let i = 0; i < 4200; i += 1) {
-      const v = 165 + Math.floor(rnd() * 64);
+      const v = 118 + Math.floor(rnd() * 52);
       g.fillStyle = `rgba(${v},${v + 4},${v + 8},${0.04 + rnd() * 0.07})`;
       const w = 1 + rnd() * 4;
       g.fillRect(rnd() * S, rnd() * S, w, w);
     }
     // 数码像素迷彩：椭圆范围内按 8 px 网格铺色块，边缘呈阶梯状
-    const shades = ["#a9b3be", "#8d99a6", "#6f7b89"];
+    const shades = ["#8d959e", "#737b85", "#5b636d"];
     for (let i = 0; i < 24; i += 1) {
       const cx = rnd() * S;
       const cy = rnd() * S;
@@ -1766,7 +1813,8 @@
       rim: 0.42, glow: 0.75, mark: "us", markCenter: [6.8, 1.60],
       markSize: 0.72, markLateral: [0.0, 0.40] },
     "SU-57": { draw: su57CamoTexture, tile: 9.2, len: 20.1, seed: 17,
-      nose: [148, 156, 165], noseAmt: 0.85, tint: 0.26, rim: 0.85, glow: 0.5,
+      nose: [148, 156, 165], noseAmt: 0.85, tint: 0.26, rim: 0.22, glow: 0.5,
+      shade: 0.62,
       mark: "ru", markCenter: [5.95, 1.00], markSize: 0.80,
       markLateral: [2.60, 3.90] },
     // J-20：直接使用 assets/aircraft/J20涂装贴图.png 的软边块形，
@@ -1775,31 +1823,35 @@
     "J-20A": { image: "assets/aircraft/J20涂装贴图.png", tile: 9.0, len: 21.2,
       seed: 41, base: [255, 255, 255], nose: [58, 63, 70], noseAmt: 1.0,
       noseEdge: RADOME_EDGE, tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      shade: 0.62,
       mark: "cn", markCenter: [9.12, 1.28], markSize: 0.85,
       markLateral: [2.10, 3.40] },
     "J-20S": { image: "assets/aircraft/J20涂装贴图.png", tile: 9.0, len: 21.2,
       seed: 41, base: [255, 255, 255], nose: [58, 63, 70], noseAmt: 1.0,
       noseEdge: RADOME_EDGE, tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      shade: 0.62,
       mark: "cn", markCenter: [9.12, 1.28], markSize: 0.85,
       markLateral: [2.10, 3.40] },
     // F-15C：蓝灰空优双色（参考图二上）
     "F-15C": { draw: grayCamoTexture({ base: "#175c97ff", dark: "#212527ff",
         dark2: "#0f3654ff", light: "#040404ff" }), tile: 7.6, len: 19.43, seed: 52,
-      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.55, glow: 0.7,
+      nose: [52, 56, 62], noseAmt: 1.0, tint: 0.0, rim: 0.22, glow: 0.7,
+      shade: 0.62,
       mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
       markLateral: [1.55, 2.00] },
     // F-15E：深蓝灰打击型（参考图二中）
     "F-15E": { draw: grayCamoTexture({ base: "#175c97ff", dark: "#212527ff",
         dark2: "#0f3654ff", light: "#040404ff" }), tile: 7.6, len: 19.43, seed: 63,
-      nose: [42, 46, 52], noseAmt: 1.0, tint: 0.0, rim: 0.6, glow: 0.7,
+      nose: [42, 46, 52], noseAmt: 1.0, tint: 0.0, rim: 0.22, glow: 0.7,
+      shade: 0.62,
       mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
       markLateral: [1.55, 2.00] },
     // F-15EX：不用迷彩，机翼中央灰蓝 → 翼尖灰的横向渐变（整体压深）。
     // halfSpan 为机体半翼展（m），渐变按 three.js 局部 x（机体横向）计算。
-    "F-15EX": { gradient: ["#3d566e", "#5b6167"], halfSpan: 6.53,
+    "F-15EX": { gradient: ["#565c63", "#7a8086"], halfSpan: 6.53,
       tile: 7.6, len: 19.43, seed: 74, base: [255, 255, 255],
       nose: [52, 56, 62], noseAmt: 1.0, noseEdge: RADOME_EDGE,
-      tint: 0.0, rim: 0.55, glow: 0.7, neutral: true,
+      tint: 0.0, rim: 0.55, glow: 0.7, neutral: true, shade: 0.62,
       mark: "us", markCenter: [7.75, 1.45], markSize: 0.75,
       markLateral: [1.55, 2.00] },
     // J-16：空军低可视灰，翼根略深、翼尖略浅；垂尾“八一”军徽。
@@ -1881,7 +1933,7 @@
         if (tex && tex.color) {
           ref.color = tex.color;
           ref.normal = tex.normal || null;
-          cached.color.set(0xffffff);
+          cached.color.setScalar((CAMO_SPECS[name] && CAMO_SPECS[name].shade) ?? 1.0);
           cached.map = tex.color;
           if (tex.normal) {
             cached.normalMap = tex.normal;
@@ -1893,22 +1945,30 @@
       return cached;
     }
     const part = CAMO_SPECS[name] || CAMO_SPECS["SU-57"];
+    // 机体亮度系数：J-20 / F-15 / SU-57 在舞台布光下偏白，整体压暗。
+    const shade = part.shade ?? 1.0;
     // 模型自带烘焙涂装时直接采样贴图，程序化迷彩只作兜底。
     const texRef = { color: null, normal: null };
     // neutral：该机不叠加任何队伍色（涂装按真实配色呈现）。
     const neutral = part.neutral === true;
     const tint = neutral ? 0.0 : Math.min(0.34, part.tint);
+    // 中性涂装不要白色轮廓光：近白的边缘自发光会把深灰机身整体抬亮，
+    // 改为低亮度冷灰，仅在轮廓处留一点形体提示。
     const rimColor = new THREE.Color(rgbHex(
-      neutral ? [214, 219, 225] : mix(RGB.TEAM[team], [255, 255, 255], 0.35)
+      neutral ? [104, 112, 122] : mix(RGB.TEAM[team], [255, 255, 255], 0.35)
     ));
     // 低可视度金属漆：涂装本身是电介质薄膜（金属度≈0，见 fragment 注入），
     // 靠清漆层与中等粗糙度给出漆面高光；金属度只由尾喷段/掉漆处的注入覆盖。
     const mat = new THREE.MeshPhysicalMaterial({
-      color: new THREE.Color(rgbHex(mix(part.base || [255, 255, 255], RGB.TEAM[team], tint))),
-      roughness: 0.50,
+      color: new THREE.Color(
+        rgbHex(mix(part.base || [255, 255, 255], RGB.TEAM[team], tint)),
+      ).multiplyScalar(shade),
+      // 机体是哑光低可视涂装：粗糙度高、清漆很薄，镜面高光只留给
+      // 尾喷段（shader 里的金属掩码）与座舱盖。
+      roughness: 0.62,
       metalness: 0.04,
-      clearcoat: 0.16,
-      clearcoatRoughness: 0.40,
+      clearcoat: 0.05,
+      clearcoatRoughness: 0.55,
       // 观战视角压暗环境反射，让机体明暗主要由跟随聚光灯决定；
       // 检视模式仍保留摄影棚环境，便于看材质。
       envMapIntensity: INSPECT !== null ? 0.55 : 0.16,
@@ -1925,7 +1985,8 @@
       if (!tex || !tex.color) return;
       texRef.color = tex.color;
       texRef.normal = tex.normal || null;
-      mat.color.set(0xffffff);
+      // 贴图本身不做染色，只用亮度系数整体压暗。
+      mat.color.setScalar(shade);
       mat.map = tex.color;
       if (tex.normal) {
         mat.normalMap = tex.normal;
@@ -1949,8 +2010,8 @@
       shader.uniforms.uCamoLen = { value: part.len };
       shader.uniforms.uCamoMode = { value: part.gradient ? 1.0 : 0.0 };
       shader.uniforms.uUseMap = { value: texRef.color ? 1.0 : 0.0 };
-      shader.uniforms.uGradCenter = { value: gradA };
-      shader.uniforms.uGradEdge = { value: gradB };
+      shader.uniforms.uGradCenter = { value: gradA.clone().multiplyScalar(shade) };
+      shader.uniforms.uGradEdge = { value: gradB.clone().multiplyScalar(shade) };
       shader.uniforms.uHalfSpan = { value: part.halfSpan || 6.5 };
       shader.uniforms.uNoseColor = { value: noseVec };
       shader.uniforms.uNoseAmt = { value: part.noseAmt };
@@ -1961,7 +2022,9 @@
       shader.uniforms.uMarkSize = { value: part.markSize || 0.6 };
       shader.uniforms.uMarkLat = { value: new THREE.Vector2(markLat[0], markLat[1]) };
       shader.uniforms.uRimColor = { value: rimColor };
-      shader.uniforms.uRimAmt = { value: part.rim ?? 0.85 };
+      shader.uniforms.uRimAmt = {
+        value: (part.rim ?? 0.85) * (neutral ? 0.30 : 1.0),
+      };
       shader.vertexShader = `varying vec3 vCamoPos;
 varying vec3 vCamoNrm;
 varying vec3 vRimN;
@@ -2059,6 +2122,9 @@ ${shader.fragmentShader}`;
   vec3 camoCol = texture2D(uCamoTex, camoP.zy).rgb * camoW.x
     + texture2D(uCamoTex, camoP.xz).rgb * camoW.y
     + texture2D(uCamoTex, camoP.xy).rgb * camoW.z;
+  // 涂装画布存的是 sRGB 编码；自定义 sampler 不会被 three 自动解码，
+  // 不手动转线性就会把中灰当成亮灰用，机体整体发白。
+  camoCol = pow(max(camoCol, vec3(0.0)), vec3(2.2));
   vec3 camoBody = diffuseColor.rgb * camoCol;
   if (uCamoMode > 0.5) {
     // 翼展方向渐变：机体中线（|x| 小）灰蓝，翼尖灰。
@@ -2150,7 +2216,8 @@ ${shader.fragmentShader}`;
         "#include <metalnessmap_fragment>",
         `#include <metalnessmap_fragment>
   metalnessFactor = mix(0.04, 0.90, camoMetal);
-  roughnessFactor = mix(0.50, 0.33, camoMetal);
+  // 机体涂装是哑光面，只有尾喷段用低粗糙度保留金属反射。
+  roughnessFactor = mix(0.62, 0.33, camoMetal);
   // 漆面的细微粗糙度起伏，近距看得到蒙皮不是一块平板。
   roughnessFactor += (camoNoise(vCamoPos * 24.0) - 0.5) * 0.08;
   roughnessFactor = clamp(roughnessFactor, 0.05, 1.0);`
@@ -2995,16 +3062,17 @@ ${shader.fragmentShader}`;
     update(ac, cameraDepth, simT) {
       this.group.position.copy(w2t(ac.pos));
       this.group.quaternion.copy(bodyQuat(ac.psi, ac.theta, ac.phi));
-      const focal = (window.innerHeight / 2.0) / Math.tan((50.0 * Math.PI / 180.0) / 2.0);
-      const targetPx = 46.0 * clamp(8000.0 / cameraDepth, 2.0, 3.0);
-      // 检视模式按真实尺寸显示；正常观战仍做屏幕尺寸补偿，远距也看得清。
-      const k = (INSPECT !== null && INSPECT === this.team)
-        ? 1.0
-        : targetPx * cameraDepth / (focal * REF_LENGTH);
+      // 按视深把模型缩放到目标屏幕长度；检视模式保持 1:1。
+      const ml = this.modelLen || REF_LENGTH;
+      const k = INSPECT !== null ? 1.0 : modelScale(cameraDepth, ml);
       this.group.scale.setScalar(k);
+      // 投影长度低于阈值时（极端远距）不再画模型，改由 2D 箭头符号表示。
+      const pxLen = ml * k / Math.max(cameraDepth, 1.0) * focalPx(50.0);
+      this.farMarker = INSPECT === null && pxLen < FAR_ARROW_PX;
       // 检视模式只显示被检视的那一架；其余机体按真实尺寸必然巨大，
       // 会横穿近距镜头（导弹陈列里尤其明显），直接隐藏。
-      this.group.visible = !!ac.alive && (INSPECT === null || INSPECT === this.team);
+      this.group.visible = !!ac.alive && !this.farMarker
+        && (INSPECT === null || INSPECT === this.team);
 
       const t = simT || 0.0;
       if (this.effectLastT !== null && t < this.effectLastT) {
@@ -3017,7 +3085,6 @@ ${shader.fragmentShader}`;
 
       const level = ac.alive ? clamp(ac.flame, 0, 1) : 0;
       const ab = ac.alive ? clamp(ac.ab, 0, 1) : 0;
-      const ml = this.modelLen || REF_LENGTH;
       const len = ml * (0.10 + 0.18 * level + 0.20 * ab);
       const phase = (performance.now() / 1000.0) % 8.0;
       const sf = ml / REF_LENGTH;
@@ -3049,7 +3116,36 @@ ${shader.fragmentShader}`;
     }
   }
 
-  const aircraftViews = [new AircraftView(0), new AircraftView(1)];
+  // 机体视图按快照中的机体数量动态创建：1v1 仍只有 0/1，多机场景
+  // 会在第一次收到快照时补齐 2..N-1，颜色取该机的实际阵营。
+  const aircraftViews = [];
+  function ensureAircraftViews(snap) {
+    if (INSPECT !== null) return;
+    const n = (snap.acs || []).length;
+    // 切换场景后同一编号可能换了阵营（例如 2v2 的 2 号是蓝方，4v4 的
+    // 2 号是红方）；阵营不一致时重建视图，避免地面线/投影圈沿用旧颜色。
+    if (aircraftViews.some((v, i) => snap.acs[i] && v.team !== snap.acs[i].team)) {
+      for (const view of aircraftViews) {
+        view.group.visible = false;
+        view.groundLine.visible = false;
+        view.ring.visible = false;
+      }
+      aircraftViews.length = 0;
+    }
+    while (aircraftViews.length < n) {
+      const i = aircraftViews.length;
+      const team = snap.acs[i] ? snap.acs[i].team : i % 2;
+      aircraftViews.push(new AircraftView(team));
+      while (stageLights.length < aircraftViews.length) addStageLight();
+    }
+    aircraftViews.forEach((view, i) => {
+      view.group.visible = i < n;
+      if (i >= n) {
+        view.groundLine.visible = false;
+        view.ring.visible = false;
+      }
+    });
+  }
 
   // ---------- 航迹：渐变宽飘带 ----------
   // 复刻 render._draw_trail_ribbon：飘带宽度沿机体 y 轴展开、屏幕厚度约
@@ -3106,7 +3202,7 @@ ${shader.fragmentShader}`;
                               f(p0.z, p1.z, p2.z, p3.z));
   }
 
-  const trailViews = [0, 1].map((team) => {
+  function makeTrailView(team) {
     const geo = new THREE.BufferGeometry();
     const mat = new THREE.ShaderMaterial({
       vertexShader: trailVert,
@@ -3138,7 +3234,15 @@ ${shader.fragmentShader}`;
       geo, mesh, team, segCount: 0,
       arrowGeo: ageo, arrowLine, arrowCount: 0,
     };
-  });
+  }
+  const trailViews = [makeTrailView(0), makeTrailView(1)];
+  function ensureTrailViews(snap) {
+    const n = (snap.trails || []).length;
+    while (trailViews.length < n) {
+      const ac = snap.acs[trailViews.length];
+      trailViews.push(makeTrailView(ac ? ac.team : 0));
+    }
+  }
   const ARROW_EVERY = 25;
 
   // 视觉机尾偏移：飘带整体沿机体轴后移到喷口、再下移到喷口高度。
@@ -3148,14 +3252,10 @@ ${shader.fragmentShader}`;
     const view = aircraftViews[i];
     const ac = snap.acs ? snap.acs[i] : null;
     if (!view || !ac) return null;
+    // 机尾偏移按模型局部米数乘当前视觉倍率，才能贴住放大后的机尾。
     const eye = w2t(snap.camera.eye);
-    const center = new THREE.Vector3(snap.camera.cx, snap.camera.cz, -snap.camera.cy);
-    const focal = (window.innerHeight / 2.0)
-      / Math.tan((snap.fov || 50.0) * Math.PI / 360.0);
-    const centerAc = ac.alive ? w2t(ac.pos) : new THREE.Vector3();
-    const depthAc = Math.max(1.0, eye.distanceTo(centerAc));
-    const targetPx = 46.0 * clamp(8000.0 / depthAc, 2.0, 3.0);
-    const k = targetPx * depthAc / (focal * REF_LENGTH);
+    const k = INSPECT !== null ? 1.0
+      : modelScale(eye.distanceTo(w2t(ac.pos)), view.modelLen, snap.fov);
     const sp = Math.sin(ac.psi);
     const cp = Math.cos(ac.psi);
     const st = Math.sin(ac.theta);
@@ -3177,10 +3277,27 @@ ${shader.fragmentShader}`;
   }
 
   function updateTrails(snap) {
-    for (let i = 0; i < 2; i += 1) {
+    ensureTrailViews(snap);
+    for (let i = snap.acs.length; i < trailViews.length; i += 1) {
+      trailViews[i].mesh.visible = false;
+      trailViews[i].arrowLine.visible = false;
+    }
+    for (let i = 0; i < snap.acs.length; i += 1) {
       const src = snap.trails[i] || { points: [] };
       const pts = src.points || [];
       const view = trailViews[i];
+      const ac = snap.acs ? snap.acs[i] : null;
+      // 坠毁后整条航迹（飘带 + 方向箭标）一并隐藏，不留残余点。
+      if (!ac || !ac.alive) {
+        view.mesh.visible = false;
+        view.arrowLine.visible = false;
+        continue;
+      }
+      const team = ac.team;
+      view.team = team;
+      view.mesh.material.uniforms.uColor.value.set(
+        rgbHex(mix([198, 202, 208], RGB.TEAM[team], 0.25)),
+      );
       if (pts.length < 2) {
         view.mesh.visible = false;
         view.arrowLine.visible = false;
@@ -3191,8 +3308,7 @@ ${shader.fragmentShader}`;
 
       const now = snap.t;
       const axes = src.axes || [];
-      const ac = snap.acs ? snap.acs[i] : null;
-      const ml = (ac && ac.alive) ? (ac.model_len || REF_LENGTH) : REF_LENGTH;
+      const ml = ac.model_len || REF_LENGTH;
       const eye = w2t(snap.camera.eye);
       const center = new THREE.Vector3(snap.camera.cx, snap.camera.cz, -snap.camera.cy);
       const forward = center.clone().sub(eye).normalize();
@@ -3201,11 +3317,9 @@ ${shader.fragmentShader}`;
       // 后端每 60 m 才记录一个航迹采样点，末点可能在机体后方很远。
       // 历史点保持真实飞行轨迹，只把末尾追加的“当前点”放到视觉机尾；
       // 若把所有历史点都按切线后移，转弯时整条飘带会扭成穿过机体的折线。
-      const centerAc = (ac && ac.alive) ? w2t(ac.pos) : new THREE.Vector3();
-      const depthAc = Math.max(1.0, eye.distanceTo(centerAc));
-      const targetPx = 46.0 * clamp(8000.0 / depthAc, 2.0, 3.0);
-      const k = targetPx * depthAc / (focal * REF_LENGTH);
-      const back = ml * 0.5 * k;
+      // 飘带末端按当前视觉倍率后移到机尾。
+      const back = ml * 0.5 * (INSPECT !== null ? 1.0
+        : modelScale(eye.distanceTo(w2t(ac.pos)), ml, snap.fov));
       const P = pts.map((p) => w2t(p));
       const axisW = axes.map((ax) => w2t(ax));
       const times = pts.map((p) => (p[3] === undefined ? now : p[3]));
@@ -3350,7 +3464,7 @@ ${shader.fragmentShader}`;
 
       // 方向箭头：与 render 一致，每 ARROW_EVERY 个采样点放一个人字形箭标，
       // 朝向沿该段航迹，尺寸按相机距离换算成约 12 px，远近观感稳定。
-      const arrowBase = mix([236, 238, 242], RGB.TEAM[i], 0.18);
+      const arrowBase = mix([236, 238, 242], RGB.TEAM[team], 0.18);
       const camDist = (snap.camera && snap.camera.dist) || 6000.0;
       const size = clamp(12.0 * camDist / focal, 18.0, 420.0);
       const arrowPos = [];
@@ -3422,16 +3536,6 @@ ${shader.fragmentShader}`;
     return tex;
   }
 
-  const texFire = makeSpriteTexture((ctx, s) => {
-    ctx.translate(s / 2, s / 2);
-    ctx.beginPath();
-    ctx.moveTo(0, -s * 0.22); ctx.lineTo(s * 0.22, 0);
-    ctx.lineTo(0, s * 0.22); ctx.lineTo(-s * 0.22, 0);
-    ctx.closePath();
-    ctx.fillStyle = "#f2f2f4"; ctx.fill();
-    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.stroke();
-  });
-
   const texStar = makeSpriteTexture((ctx, s) => {
     ctx.translate(s / 2, s / 2);
     ctx.beginPath();
@@ -3443,16 +3547,6 @@ ${shader.fragmentShader}`;
     ctx.closePath();
     ctx.fillStyle = "#f3efe6"; ctx.fill();
     ctx.strokeStyle = "#8b9096"; ctx.lineWidth = 2; ctx.stroke();
-  });
-
-  const texHighG = makeSpriteTexture((ctx, s) => {
-    ctx.translate(s / 2, s / 2);
-    ctx.beginPath();
-    ctx.moveTo(0, -s * 0.28); ctx.lineTo(s * 0.28, 0);
-    ctx.lineTo(0, s * 0.28); ctx.lineTo(-s * 0.28, 0);
-    ctx.closePath();
-    ctx.fillStyle = "#b9bec5"; ctx.fill();
-    ctx.strokeStyle = "#6e7278"; ctx.lineWidth = 2; ctx.stroke();
   });
 
   const texRing = makeSpriteTexture((ctx, s) => {
@@ -3478,26 +3572,16 @@ ${shader.fragmentShader}`;
     return points;
   }
 
-  const firePoints = [makePoints(texFire, 11), makePoints(texFire, 11)];
-  scene.add(firePoints[0], firePoints[1]);
-  const launchPoints = makePoints(texStar, 16);
-  scene.add(launchPoints);
-  const highgPoints = makePoints(texHighG, 16);
-  scene.add(highgPoints);
   const predEndPoints = [makePoints(texRing, 15), makePoints(texRing, 15)];
+  function ensurePredEndPoints(snap) {
+    const n = (snap.acs || []).length;
+    while (predEndPoints.length < n) {
+      const p = makePoints(texRing, 15);
+      predEndPoints.push(p);
+      scene.add(p);
+    }
+  }
   scene.add(predEndPoints[0], predEndPoints[1]);
-
-  const chaffGeo = new THREE.BufferGeometry();
-  const chaffPoints = new THREE.Points(chaffGeo, new THREE.PointsMaterial({
-    size: 6, sizeAttenuation: false, color: 0xced0d6,
-    transparent: true, opacity: 0.9, depthWrite: false,
-  }));
-  const flareGeo = new THREE.BufferGeometry();
-  const flarePoints = new THREE.Points(flareGeo, new THREE.PointsMaterial({
-    size: 8, sizeAttenuation: false, color: 0xffaa46,
-    transparent: true, opacity: 0.95, depthWrite: false,
-  }));
-  scene.add(chaffPoints, flarePoints);
 
   function setPointsPositions(points, arr) {
     const geo = points.geometry;
@@ -3549,17 +3633,16 @@ ${shader.fragmentShader}`;
   let cmLastT = -1.0;
 
   // 把真实干扰物位置映射到机体的视觉机尾坐标系。
-  function cmDisplayPos(eff, snap, eye, focal) {
+  function cmDisplayPos(eff, snap, eye) {
     const ac = snap.acs ? snap.acs[eff.owner] : null;
     if (!ac || !ac.alive) return eff.raw.clone();
     const center = w2t(ac.pos);
-    const depth = Math.max(1.0, eye.distanceTo(center));
-    const targetPx = 46.0 * clamp(8000.0 / depth, 2.0, 3.0);
-    const k = targetPx * depth / (focal * REF_LENGTH);
     const ml = ac.model_len || REF_LENGTH;
     const sp = Math.sin(ac.psi), cp = Math.cos(ac.psi);
     const st = Math.sin(ac.theta), ct = Math.cos(ac.theta);
     const xb = [ct * cp, ct * sp, st];
+    const k = INSPECT !== null ? 1.0
+      : modelScale(eye.distanceTo(center), ml, snap.fov);
     const back = ml * 0.5 * k;
     const tail = new THREE.Vector3(
       center.x - xb[0] * back,
@@ -3702,7 +3785,7 @@ ${shader.fragmentShader}`;
   }
 
   function updateChaffEffect(eff, age, snap, eye, focal) {
-    const center = cmDisplayPos(eff, snap, eye, focal);
+    const center = cmDisplayPos(eff, snap, eye);
     const pxWorld = Math.max(1.0, eye.distanceTo(center)) / focal;
     const p = clamp(age / CHAFF_LIFE, 0, 1);
     const fadeIn = clamp(age / 0.16, 0, 1);
@@ -3725,7 +3808,7 @@ ${shader.fragmentShader}`;
   }
 
   function updateFlareEffect(eff, age, snap, eye, focal) {
-    const center = cmDisplayPos(eff, snap, eye, focal);
+    const center = cmDisplayPos(eff, snap, eye);
     const pxWorld = Math.max(1.0, eye.distanceTo(center)) / focal;
     const p = clamp(age / FLARE_LIFE, 0, 1);
     const fadeOut = clamp((1.0 - p) / 0.32, 0, 1);
@@ -3837,23 +3920,22 @@ ${shader.fragmentShader}`;
       if (o.material && !missileShared.has(o.material)) o.material.dispose();
     }
     const ms = snap.missiles || [];
-    for (const f of missileFlames) f.visible = false;
-    const focal = (window.innerHeight / 2.0)
-      / Math.tan(camera.fov * Math.PI / 360.0);
-
+    // missileFlames 按导弹在快照中的序号稀疏填充，可能留有空洞，
+    // 不能直接 for..of（会拿到 undefined）。
+    for (let k = 0; k < missileFlames.length; k += 1) {
+      const f = missileFlames[k];
+      if (f) f.visible = false;
+    }
     ms.forEach((m, idx) => {
       const p = w2t(m.pos);
       const d = missileDir(m);
       const geo = MISSILE_GEOS[m.name];
-      // 导弹尺寸直接复用载机的可视化缩放系数 k：机体为看得清会被放大到
-      // 92–138 px，导弹用同一个 k 放大，弹长/机长就严格等于真实比例。
-      // k 的算法与 AircraftView.update 完全一致（同一视深基准）。
-      const eye = (snap.camera && snap.camera.eye) ? w2t(snap.camera.eye) : camera.position;
+      // 导弹与载机使用同一倍率，弹长/机长保持真实比例；检视模式用 1:1。
       const ac = snap.acs ? snap.acs[m.owner] : null;
-      const refPos = ac ? w2t(ac.pos) : p;
-      const depth = Math.max(1.0, eye.distanceTo(refPos));
-      const targetPx = 46.0 * clamp(8000.0 / depth, 2.0, 3.0);
-      const s = targetPx * depth / (focal * REF_LENGTH);
+      const eye = (snap.camera && snap.camera.eye) ? w2t(snap.camera.eye) : camera.position;
+      const ml = (ac && ac.model_len) || REF_LENGTH;
+      const depth = Math.max(1.0, eye.distanceTo(ac ? w2t(ac.pos) : p));
+      const s = INSPECT === null ? modelScale(depth, ml, snap.fov) : 1.0;
       if (geo) {
         // 模型按真实弹长导出：弹头在局部原点、弹尾朝 +Z，直接把弹头放在
         // 快照位置，弹体沿 -d 向后延伸。
@@ -3906,12 +3988,16 @@ ${shader.fragmentShader}`;
   }
 
   function updatePredictions(snap) {
+    ensurePredEndPoints(snap);
+    for (let i = snap.acs.length; i < predEndPoints.length; i += 1) {
+      setPointsPositions(predEndPoints[i], []);
+    }
     while (predictionGroup.children.length) {
       const o = predictionGroup.children.pop();
       if (o.geometry) o.geometry.dispose();
       if (o.material) o.material.dispose();
     }
-    for (let i = 0; i < 2; i += 1) {
+    for (let i = 0; i < snap.acs.length; i += 1) {
       const pts = (snap.predictions || [])[i] || [];
       const ends = [];
       if (pts.length < 2) {
@@ -3926,12 +4012,16 @@ ${shader.fragmentShader}`;
       const g = new THREE.BufferGeometry();
       g.setAttribute("position", new THREE.Float32BufferAttribute(vidx, 3));
       predictionGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({
-        color: new THREE.Color(rgbHex(mix(RGB.TEAM[i], RGB.SCENE_BG, 0.35))),
+        color: new THREE.Color(rgbHex(mix(
+          RGB.TEAM[snap.acs[i] ? snap.acs[i].team : (i % 2)],
+          RGB.SCENE_BG, 0.35,
+        ))),
         transparent: true, opacity: 0.8,
       })));
       const end = w2t(pts[pts.length - 1]);
       ends.push(end.x, end.y, end.z);
-      predEndPoints[i].material.color.set(C.team[i]);
+      const team = snap.acs[i] ? snap.acs[i].team : (i % 2);
+      predEndPoints[i].material.color.set(C.team[team]);
       setPointsPositions(predEndPoints[i], ends);
     }
   }
@@ -3957,47 +4047,11 @@ ${shader.fragmentShader}`;
         color: 0xffecaa, transparent: true, opacity: 0.55,
       }));
       gunfireGroup.add(glow);
-      const flash = makePoints(texFire, 20, 0xffd678);
-      setPointsPositions(flash, [a.x, a.y, a.z]);
-      gunfireGroup.add(flash);
     }
   }
 
   function updateMarks(snap) {
-    const marks = snap.marks || {};
-    // 航迹标记跟随飘带的视觉偏移：开火点按所属队伍、发射点与高 G 点
-    // 按 owner 取同一机体的机尾偏移，否则会停在真实机体坐标上。
-    const offsets = [visualEngineOffset(0, snap), visualEngineOffset(1, snap)];
-    for (let i = 0; i < 2; i += 1) {
-      const arr = [];
-      for (const p of marks.fire?.[i] || []) {
-        const v = applyEngineOffset(w2t(p), offsets[i]);
-        arr.push(v.x, v.y, v.z);
-      }
-      setPointsPositions(firePoints[i], arr);
-    }
-    const launch = [];
-    for (const m of marks.launch || []) {
-      const v = applyEngineOffset(w2t(m.pos), offsets[m.owner] || null);
-      launch.push(v.x, v.y, v.z);
-    }
-    setPointsPositions(launchPoints, launch);
-    const highg = [];
-    for (const m of marks.highg || []) {
-      const v = applyEngineOffset(w2t(m.pos), offsets[m.owner] || null);
-      highg.push(v.x, v.y, v.z);
-    }
-    setPointsPositions(highgPoints, highg);
-
-    const chaff = [];
-    const flare = [];
-    for (const cm of snap.counters || []) {
-      const v = w2t(cm.pos);
-      if (cm.kind === "chaff") chaff.push(v.x, v.y, v.z);
-      else flare.push(v.x, v.y, v.z);
-    }
-    setPointsPositions(chaffPoints, chaff);
-    setPointsPositions(flarePoints, flare);
+    // 发射点、箔条与热诱弹不再画点标记；干扰物只保留云团/火球动效。
     syncCounterEffects(snap);
   }
 
@@ -5050,11 +5104,13 @@ ${shader.fragmentShader}`;
   function updateAttitude(snap) {
     // 采集时 HUD 整体隐藏，姿态仪（以及它独立的 WebGL 上下文）无需渲染。
     if (CAPTURE) return;
+    const pair = focusPair(snap);
     for (let i = 0; i < 2; i += 1) {
-      const ac = snap.acs[i];
+      const ac = snap.acs[pair[i]];
+      if (!ac) continue;
       const part = attitudeParts[i];
-      part.name.textContent = ac.name;
-      part.name.style.color = C.team[i];
+      part.name.textContent = ac.callsign || ac.name;
+      part.name.style.color = C.team[ac.team];
       drawAttitude(part, ac);
       const thr = ac.alive ? clamp(ac.throttle, 0, 1) : 0;
       const ab = ac.alive ? clamp(ac.ab, 0, 1) : 0;
@@ -5123,23 +5179,51 @@ ${shader.fragmentShader}`;
     ctx.restore();
   }
 
+  // 远距（BVR）替代符号：细长的扁平箭头，指向当前航向。
+  const _arrowDir = new THREE.Vector3();
+  function drawAircraftArrow(ctx, x, y, ac, color) {
+    const cp = Math.cos(ac.psi), sp = Math.sin(ac.psi);
+    const ct = Math.cos(ac.theta), st = Math.sin(ac.theta);
+    // 世界系机头方向 → 视图系；取其在屏幕平面上的方向角。
+    _arrowDir.set(ct * cp, st, -ct * sp).transformDirection(camera.matrixWorldInverse);
+    const ang = Math.atan2(-_arrowDir.y, _arrowDir.x);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(ang);
+    ctx.beginPath();
+    ctx.moveTo(12.0, 0.0);
+    ctx.lineTo(-2.0, 3.0);
+    ctx.lineTo(-10.0, 1.2);
+    ctx.lineTo(-7.0, 0.0);
+    ctx.lineTo(-10.0, -1.2);
+    ctx.lineTo(-2.0, -3.0);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.restore();
+  }
+
   function drawLabels() {
     labelsCtx.setTransform(labelsDpr, 0, 0, labelsDpr, 0, 0);
     labelsCtx.clearRect(0, 0, labelsW, labelsH);
     if (!snapshot) return;
 
-    for (let i = 0; i < 2; i += 1) {
+    for (let i = 0; i < snapshot.acs.length; i += 1) {
       const ac = snapshot.acs ? snapshot.acs[i] : null;
       if (!ac || !ac.alive) continue;
       const s = projectScreen(w2t(ac.pos));
       if (!s) continue;
       const hud = ac.hud || {};
-      const parts = [hud.tactic, hud.primitive].filter((v) => v);
+      const parts = [ac.callsign || ac.name, hud.tactic, hud.primitive]
+        .filter((v) => v);
       if (!parts.length) continue;
-      drawBracket(labelsCtx, s.x, s.y, 24.0, C.team[i]);
+      const color = C.team[ac.team === undefined ? (i % 2) : ac.team];
+      const view = aircraftViews[i];
+      if (view && view.farMarker) drawAircraftArrow(labelsCtx, s.x, s.y, ac, color);
+      else drawBracket(labelsCtx, s.x, s.y, 24.0, color);
       // 标签贴在机体右侧；靠右边缘时自动翻到左侧，避免被窗口裁掉。
       const flip = s.x > labelsW - 230;
-      drawTag(parts.join(" · "), s.x + (flip ? -34 : 34), s.y - 24, C.team[i], 13, flip);
+      drawTag(parts.join(" · "), s.x + (flip ? -34 : 34), s.y - 24, color, 13, flip);
     }
 
     for (const m of snapshot.missiles || []) {
@@ -5151,11 +5235,13 @@ ${shader.fragmentShader}`;
 
   // ---------- 布局 ----------
   let stationsVisible = false;
+  // 多机（>2 架）时收起雷达/屏显/武器/姿态四块面板，改由顶部列表承载核心信息。
+  let multiMode = false;
 
   function layoutAll() {
     const w = window.innerWidth;
     const h = window.innerHeight;
-    stationsVisible = w >= 1180 && h >= 700;
+    stationsVisible = !multiMode && w >= 1180 && h >= 700;
     stationsEl.style.display = stationsVisible ? "block" : "none";
     if (stationsVisible) {
       for (let i = 0; i < 2; i += 1) {
@@ -5179,6 +5265,7 @@ ${shader.fragmentShader}`;
   let localZoom = 1.0;
   let camPos = new THREE.Vector3();
   let camTarget = new THREE.Vector3();
+  let overviewMode = false;
 
   const STAGE_UP = new THREE.Vector3(0, 1, 0);
   const stageDir = new THREE.Vector3();
@@ -5210,10 +5297,21 @@ ${shader.fragmentShader}`;
     }
   }
 
+  function focusPair(snap) {
+    const acs = snap.acs || [];
+    if (acs.length <= 2) return [0, 1];
+    const first = (team) => {
+      const alive = acs.findIndex((a) => a.team === team && a.alive);
+      return alive >= 0 ? alive : acs.findIndex((a) => a.team === team);
+    };
+    return [Math.max(0, first(0)), Math.max(0, first(1))];
+  }
+
   function updateScene(snap) {
+    ensureAircraftViews(snap);
     buildFloor(snap.arena, snap.z_floor);
     const cameraPos = w2t(snap.camera.eye);
-    for (let i = 0; i < 2; i += 1) {
+    for (let i = 0; i < snap.acs.length; i += 1) {
       const ac = snap.acs[i];
       const view = aircraftViews[i];
       view.setModel(ac.model, ac.engines || [], ac.model_len);
@@ -5232,13 +5330,29 @@ ${shader.fragmentShader}`;
   }
 
   function updateHud(snap) {
+    // 多机布局切换：面板显隐只在状态变化时改，避免每帧重排。
+    const multi = snap.acs.length > 2;
+    if (multi !== multiMode) {
+      multiMode = multi;
+      layoutAll();
+    }
+    multiPanelEl.classList.toggle("hidden", !multi);
+    attitudeEl.classList.toggle("hidden", multi);
+    rosterEl.classList.toggle("hidden", multi);
+    // 多机时顶部列表居中占位，场景/编队面板下移，避免压住名册。
+    scenarioPanelEl.classList.toggle("multi", multi);
+    updateScenarioBrief(snap);
+    if (multi) updateMultiPanel(snap);
+
     const msl = snap.missiles || [];
     if (msl.length) {
       missileStatusEl.classList.remove("hidden");
       let html = "";
       for (const m of msl) {
-        const tgt = snap.acs[m.target] ? snap.acs[m.target].name : "-";
-        html += `<div class="ms-row"><span class="dot" style="background:${C.team[m.owner]}"></span>`
+        const tgt = snap.acs[m.target] ? (snap.acs[m.target].callsign || snap.acs[m.target].name) : "-";
+        const owner = snap.acs[m.owner];
+        const color = owner ? owner.team_color : C.team[0];
+        html += `<div class="ms-row"><span class="dot" style="background:${color}"></span>`
           + `<span>${m.name} → ${tgt}   ${String(Math.round(m.speed)).padStart(4, " ")} m/s</span></div>`;
       }
       missileStatusEl.innerHTML = html;
@@ -5246,7 +5360,7 @@ ${shader.fragmentShader}`;
       missileStatusEl.classList.add("hidden");
     }
     bottomBarEl.textContent = snap.bottom.text;
-    bottomHintEl.textContent = "SPACE pause    R reset    F follow    drag / wheel camera";
+    bottomHintEl.textContent = "SPACE pause    R reset    F follow    O overview    drag / wheel camera";
     pausedEl.classList.toggle("hidden", !snap.paused);
     if (snap.result) {
       resultEl.classList.remove("hidden");
@@ -5257,11 +5371,17 @@ ${shader.fragmentShader}`;
       resultEl.classList.add("hidden");
     }
     if (stationsVisible) {
+      const pair = focusPair(snap);
       for (let i = 0; i < 2; i += 1) {
-        stationViews[i].update(snap.acs[i], snap);
+        const ac = snap.acs[pair[i]];
+        if (ac) stationViews[i].update(ac, snap);
       }
     }
-    updateAttitude(snap);
+    if (!multi) {
+      updateAttitude(snap);
+      updateRoster(snap);
+    }
+    updateEventLog(snap);
     updateControls(snap);
   }
 
@@ -5270,8 +5390,8 @@ ${shader.fragmentShader}`;
     btnPause.textContent = snap.paused ? "RESUME (SPACE)" : "PAUSE (SPACE)";
     const follow = snap.camera.follow;
     let label = "FOLLOW: OFF";
-    if (follow === 0 || follow === 1) {
-      label = `FOLLOW: ${snap.acs[follow].name}`;
+    if (follow !== null && follow !== undefined && snap.acs[follow]) {
+      label = `FOLLOW: ${snap.acs[follow].callsign || snap.acs[follow].name}`;
     }
     document.getElementById("btn-follow").textContent = label;
   }
@@ -5348,7 +5468,29 @@ ${shader.fragmentShader}`;
   function updateCameraFrame() {
     if (!snapshot) return;
     if (updateInspectCamera()) return;
-    const c = snapshot.camera;
+    let c = snapshot.camera;
+    if (overviewMode && snapshot.acs.length) {
+      const alive = snapshot.acs.filter((a) => a.alive);
+      const use = alive.length ? alive : snapshot.acs;
+      const cx = use.reduce((s, a) => s + a.pos[0], 0) / use.length;
+      const cy = use.reduce((s, a) => s + a.pos[1], 0) / use.length;
+      const cz = use.reduce((s, a) => s + a.pos[2], 0) / use.length;
+      const xs = use.map((a) => a.pos[0]);
+      const ys = use.map((a) => a.pos[1]);
+      const zs = use.map((a) => a.pos[2]);
+      const span = Math.max(
+        Math.max(...xs) - Math.min(...xs),
+        Math.max(...ys) - Math.min(...ys),
+        (Math.max(...zs) - Math.min(...zs)) * 2.0,
+        1800.0,
+      );
+      c = {
+        ...c,
+        cx, cy, cz,
+        dist: Math.max(2600.0, span * 1.7),
+        pitch: Math.max(c.pitch, 0.72),
+      };
+    }
     const target = new THREE.Vector3(c.cx, c.cz, -c.cy);
     const pitch = clamp(c.pitch + localPitch, 0.05, 1.45);
     const yaw = c.yaw + localYaw;
@@ -5406,9 +5548,126 @@ ${shader.fragmentShader}`;
         body: JSON.stringify(body),
       });
     } catch (err) {
-      console.error("控制请求失败", err);
+      logError("控制请求失败", err);
     }
   }
+
+  // ---------- 多机名册 / 事件日志 / 场景选择 ----------
+  const rosterEl = document.getElementById("roster-panel");
+  const multiPanelEl = document.getElementById("multi-panel");
+  const eventLogEl = document.getElementById("event-log");
+  const scenarioPanelEl = document.getElementById("scenario-panel");
+  const scenarioSelect = document.getElementById("scenario-select");
+  const briefEl = document.getElementById("scenario-brief");
+  let briefHtml = null;
+
+  // 场景背景 + 本局抽到的编队（红蓝各一行）。
+  function updateScenarioBrief(snap) {
+    const sides = { attacker: "进攻", defender: "防守" };
+    const head = (snap.formations || []).map((f) => {
+      const idx = (snap.team_names || []).indexOf(f.team);
+      const color = C.team[idx] || C.sub;
+      return `<b style="color:${color}">${escHtml(f.team)}</b>`
+        + ` ${sides[f.side] || ""} · ${escHtml(f.label)}`;
+    }).join(" ｜ ");
+    const html = [head, snap.brief ? escHtml(snap.brief) : ""]
+      .filter(Boolean).join("<br>");
+    if (html === briefHtml) return;
+    briefHtml = html;
+    briefEl.innerHTML = html;
+  }
+
+  function escHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;");
+  }
+
+  function updateRoster(snap) {
+    const rows = snap.roster || [];
+    rosterEl.innerHTML = rows.map((r) => {
+      const frac = clamp(r.hp_frac || 0, 0, 1);
+      const alive = r.alive ? "" : " dead";
+      return `<div class="roster-row${alive}" data-i="${r.i}" title="${escHtml(r.rank || "")}">`
+        + `<span class="chip" style="background:${r.team_color}"></span>`
+        + `<span class="cs" style="color:${r.team_color}">${escHtml(r.callsign || r.name)}</span>`
+        + `<span class="typ">${escHtml(r.name)}</span>`
+        + `<span class="hpbar"><i style="width:${Math.round(frac * 100)}%;background:${r.team_color}"></i></span>`
+        + `<span class="hp">${Math.round(r.hp)}</span></div>`;
+    }).join("");
+    rosterEl.querySelectorAll(".roster-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        localYaw = localPitch = 0;
+        cameraReady = false;
+        postControl({ action: "follow", follow: Number(el.dataset.i) });
+      });
+    });
+  }
+
+  // 多机核心信息列表：呼号 / 机型 / 血量 / 速度 / 高度 / 导弹 / 燃油。
+  // 点击任意一行等同于“跟随该呼号”。
+  function updateMultiPanel(snap) {
+    const follow = snap.camera ? snap.camera.follow : null;
+    const head = '<div class="mp-head"><span></span><span>CALLSIGN</span><span>TYPE</span>'
+      + '<span>HP</span><span></span><span>SPD m/s</span><span>ALT km</span>'
+      + '<span>MISSILE</span><span>FUEL</span></div>';
+    const rows = (snap.acs || []).map((ac, i) => {
+      const dead = ac.alive ? "" : " dead";
+      const sel = (follow === i) ? " follow" : "";
+      const hpFrac = Math.round(clamp(ac.hp_frac || 0, 0, 1) * 100);
+      const radar = (ac.missiles && ac.missiles[0]) ? ac.missiles[0].count : 0;
+      const ir = (ac.missiles && ac.missiles[1]) ? ac.missiles[1].count : 0;
+      const alt = ((ac.alt === undefined ? ac.pos[2] : ac.alt) / 1000).toFixed(1);
+      return `<div class="mp-row${dead}${sel}" data-i="${i}">`
+        + `<span class="mp-dot" style="background:${ac.team_color}"></span>`
+        + `<span style="color:${ac.team_color}">${escHtml(ac.callsign || ac.name)}</span>`
+        + `<span>${escHtml(ac.name)}</span>`
+        + `<span class="mp-hpbar"><i style="width:${hpFrac}%;background:${ac.team_color}"></i></span>`
+        + `<span class="mp-num">${Math.round(ac.hp || 0)}</span>`
+        + `<span class="mp-num">${Math.round(ac.speed || 0)}</span>`
+        + `<span class="mp-num">${alt}</span>`
+        + `<span class="mp-num">R${radar}/I${ir}</span>`
+        + `<span class="mp-num">${Math.round(clamp(ac.fuel_frac || 0, 0, 1) * 100)}%</span>`
+        + "</div>";
+    }).join("");
+    multiPanelEl.innerHTML = head + rows;
+    multiPanelEl.querySelectorAll(".mp-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        localYaw = localPitch = 0;
+        cameraReady = false;
+        postControl({ action: "follow", follow: Number(el.dataset.i) });
+      });
+    });
+  }
+
+  function updateEventLog(snap) {
+    const rows = (snap.log || []).slice(-6).reverse();
+    eventLogEl.innerHTML = '<div class="log-head">EVENT LOG</div>' + (
+      rows.length
+        ? rows.map(([t, text]) => (
+          `<div class="log-row"><span>${Number(t).toFixed(0)}s</span>${escHtml(text)}</div>`
+        )).join("")
+        // 开局前几十秒还没有发射/击杀事件，给一行占位，避免面板看起来不存在。
+        : '<div class="log-row empty">—</div>'
+    );
+  }
+
+  fetch("/api/scenarios").then((r) => r.json()).then((data) => {
+    scenarioSelect.innerHTML = data.scenarios.map((s) => (
+      `<option value="${escHtml(s.id)}"${s.id === data.current ? " selected" : ""}>`
+      + `${escHtml(s.id)} · ${s.aircraft} 机</option>`
+    )).join("");
+  }).catch((err) => logWarn("场景列表加载失败", err));
+
+  document.getElementById("btn-scenario").addEventListener("click", () => {
+    if (!scenarioSelect.value) return;
+    snapshot = null;
+    cameraReady = false;
+    localYaw = localPitch = 0;
+    localZoom = 1.0;
+    postControl({ action: "scenario", scenario: scenarioSelect.value });
+  });
 
   document.getElementById("btn-pause").addEventListener("click", () => {
     if (!snapshot) return;
@@ -5420,18 +5679,21 @@ ${shader.fragmentShader}`;
     cameraReady = false;
     postControl({ action: "reset" });
   });
-  document.getElementById("btn-follow").addEventListener("click", () => {
+  function cycleFollow() {
     let follow = null;
     if (snapshot) {
+      const n = snapshot.acs.length;
       const cur = snapshot.camera.follow;
-      if (cur === null || cur === undefined) follow = 0;
-      else if (cur === 0) follow = 1;
-      else follow = null;
+      follow = (cur === null || cur === undefined)
+        ? 0
+        : (cur + 1 >= n ? null : cur + 1);
     }
     localYaw = localPitch = 0;
     cameraReady = false;
     postControl({ action: "follow", follow });
-  });
+  }
+
+  document.getElementById("btn-follow").addEventListener("click", cycleFollow);
   window.addEventListener("keydown", (e) => {
     if (e.repeat) return;
     if (e.code === "Space") {
@@ -5443,16 +5705,10 @@ ${shader.fragmentShader}`;
       cameraReady = false;
       postControl({ action: "reset" });
     } else if (e.code === "KeyF") {
-      let follow = null;
-      if (snapshot) {
-        const cur = snapshot.camera.follow;
-        if (cur === null || cur === undefined) follow = 0;
-        else if (cur === 0) follow = 1;
-        else follow = null;
-      }
-      localYaw = localPitch = 0;
+      cycleFollow();
+    } else if (e.code === "KeyO") {
+      overviewMode = !overviewMode;
       cameraReady = false;
-      postControl({ action: "follow", follow });
     }
   });
   window.addEventListener("resize", () => {
@@ -5487,12 +5743,12 @@ ${shader.fragmentShader}`;
         updateHud(snapshot);
       });
     } catch (err) {
-      console.error("快照解析失败", err);
+      logError("快照解析失败", err);
     }
   };
   stream.onerror = () => {
     // EventSource 会自动重连；这里只留一条日志，避免控制台刷屏。
-    console.warn("SSE 连接断开，正在重连…");
+    logWarn("SSE 连接断开，正在重连…");
   };
 
   // ---------- 1080p 采集 ----------
@@ -5528,7 +5784,7 @@ ${shader.fragmentShader}`;
       fetch(`/api/capture?name=${encodeURIComponent(CAPTURE.name)}&i=${idx}&ext=jpg`, {
         method: "POST",
         body: blob,
-      }).catch((err) => console.error("帧上传失败", err));
+      }).catch((err) => logError("帧上传失败", err));
     }, "image/jpeg", 0.92);
 
     capState.i += 1;
@@ -5546,8 +5802,8 @@ ${shader.fragmentShader}`;
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name: CAPTURE.name, fps: realFps }),
           }).then((r) => r.json())
-            .then((d) => console.log("采集完成", d))
-            .catch((err) => console.error("编码请求失败", err));
+            .then((d) => logInfo("采集完成", d))
+            .catch((err) => logError("编码请求失败", err));
         }, 1600);
       }
     }
@@ -5576,7 +5832,7 @@ ${shader.fragmentShader}`;
       rec.onstop = async () => {
         recTrack = null;
         const blob = new Blob(chunks, { type: "video/webm" });
-        console.log("录制字节 " + blob.size);
+        logInfo("录制字节 " + blob.size);
         try {
           await fetch(`/api/capture/upload?name=${encodeURIComponent(CAPTURE.name)}`, {
             method: "POST", body: blob,
@@ -5586,9 +5842,9 @@ ${shader.fragmentShader}`;
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ name: CAPTURE.name }),
           });
-          console.log("录制完成 " + JSON.stringify(await r.json()));
+          logInfo("录制完成 " + JSON.stringify(await r.json()));
         } catch (err) {
-          console.error("录制上传失败", err);
+          logError("录制上传失败", err);
         }
       };
       rec.start(1000);
@@ -5608,13 +5864,14 @@ ${shader.fragmentShader}`;
       try {
         snapshot = await fetch("/api/state").then((r) => r.json());
       } catch (err) {
-        console.error("初始快照获取失败", err);
+        logError("初始快照获取失败", err);
         return;
       }
     }
     capReady = true;
     // 暂停服务端墙钟推进，改由本循环按帧定量步进。
     await postControl({ action: "pause" });
+    capLog(`准备从 t=${CAPTURE.skip.toFixed(0)}s 开始采集`);
     if (CAPTURE.delay > 0) await sleep(CAPTURE.delay * 1000);
 
     const dt = 1.0 / CAPTURE.fps;
@@ -5629,14 +5886,16 @@ ${shader.fragmentShader}`;
         snap = await fetch("/api/capture/step", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ dt, reset: i === 0 }),
+          body: JSON.stringify({
+            dt: (i === 0 ? CAPTURE.skip : 0.0) + dt, reset: i === 0,
+          }),
         }).then((r) => r.json());
       } catch (err) {
-        console.error("步进失败", err);
+        logError("步进失败", err);
         break;
       }
       if (!snap || !snap.acs) {
-        console.error("步进无快照", snap);
+        logError("步进无快照", snap);
         break;
       }
       snapshot = snap;
@@ -5655,22 +5914,27 @@ ${shader.fragmentShader}`;
             { method: "POST", body: blob },
           );
         } catch (err) {
-          console.error("帧上传失败", err);
+          logError("帧上传失败", err);
         }
       }
       if ((i + 1) % 50 === 0) {
-        console.log(`步进采集 ${i + 1}/${CAPTURE.frames}`);
+        logInfo(`步进采集 ${i + 1}/${CAPTURE.frames}`);
+        capLog(`采集中 ${i + 1}/${CAPTURE.frames}`);
       }
     }
+    capLog(`编码中 ${CAPTURE.frames}/${CAPTURE.frames}`);
     try {
       const r = await fetch("/api/capture/encode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: CAPTURE.name, fps: CAPTURE.fps }),
       });
-      console.log("步进采集完成 " + JSON.stringify(await r.json()));
+      const d = await r.json();
+      logInfo("步进采集完成 " + JSON.stringify(d));
+      capLog(`采集完成\n${d.path || CAPTURE.name}`);
     } catch (err) {
-      console.error("编码请求失败", err);
+      logError("编码请求失败", err);
+      capLog("编码失败");
     }
   }
 

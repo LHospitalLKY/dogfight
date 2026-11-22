@@ -516,6 +516,224 @@ html, body {
   transform: translateY(1px);
 }
 
+/* P4 多机观战：名册 / 事件日志 / 场景选择 */
+#scenario-panel {
+  position: absolute;
+  left: 18px;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+/* 多机：顶部中央是 8 行名册，场景面板下移到名册下方 */
+#scenario-panel.multi {
+  top: 200px;
+}
+
+#scenario-panel .scenario-row {
+  display: flex;
+  gap: 6px;
+}
+
+/* 场景背景与开场抽到的编队 */
+#scenario-brief {
+  max-width: 430px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #9eaaba;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+}
+
+#scenario-brief:empty {
+  display: none;
+}
+
+#scenario-panel select,
+#scenario-panel button {
+  font-family: inherit;
+  font-size: 12px;
+  color: #eef3fa;
+  background: rgba(23, 24, 28, 0.92);
+  border: 1px solid rgba(72, 75, 84, 0.9);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+
+#scenario-panel select {
+  max-width: 300px;
+}
+
+/* 多机核心信息列表：替代雷达 / 屏显 / 武器 / 姿态四块面板，放在 HUD 顶部 */
+#multi-panel {
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  min-width: 820px;
+  padding: 7px 10px 8px;
+  border-radius: 8px;
+  background: rgba(9, 20, 16, 0.58);
+  border: 1px solid rgba(120, 140, 158, 0.38);
+  -webkit-backdrop-filter: blur(10px) saturate(150%);
+  backdrop-filter: blur(10px) saturate(150%);
+  box-shadow:
+    0 4px 18px rgba(0, 0, 0, 0.30),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  pointer-events: auto;
+  font-size: 11px;
+  color: #dbe3ee;
+  box-sizing: border-box;
+}
+
+#multi-panel .mp-head,
+#multi-panel .mp-row {
+  display: grid;
+  grid-template-columns: 10px 90px 64px 78px 40px 60px 58px 78px 44px;
+  gap: 8px;
+  align-items: center;
+  padding: 2px;
+}
+
+#multi-panel .mp-head {
+  color: #7d8a9b;
+  letter-spacing: 1px;
+  padding-bottom: 3px;
+}
+
+#multi-panel .mp-row {
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+#multi-panel .mp-row:hover { background: rgba(255, 255, 255, 0.07); }
+#multi-panel .mp-row.follow { background: rgba(92, 178, 255, 0.13); }
+#multi-panel .mp-row.dead { opacity: 0.38; text-decoration: line-through; }
+
+#multi-panel .mp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+#multi-panel .mp-hpbar {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#multi-panel .mp-hpbar i {
+  display: block;
+  height: 100%;
+}
+
+#multi-panel .mp-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#roster-panel {
+  position: absolute;
+  right: 18px;
+  top: 16px;
+  width: 268px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  background: rgba(12, 14, 18, 0.78);
+  border: 1px solid rgba(72, 75, 84, 0.65);
+  border-radius: 7px;
+  pointer-events: auto;
+}
+
+.roster-row {
+  display: grid;
+  grid-template-columns: 8px 74px 66px 1fr 34px;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 3px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.roster-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.roster-row.dead {
+  opacity: 0.42;
+  text-decoration: line-through;
+}
+
+.roster-row .chip {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.roster-row .cs {
+  color: #eef3fa;
+}
+
+.roster-row .typ {
+  color: #8e97a6;
+}
+
+.roster-row .hpbar {
+  height: 5px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.roster-row .hpbar i {
+  display: block;
+  height: 100%;
+}
+
+.roster-row .hp {
+  text-align: right;
+  color: #b9c2d0;
+}
+
+#event-log {
+  position: absolute;
+  left: 18px;
+  bottom: 58px;
+  width: 430px;
+  font-size: 11px;
+  color: #aab4c3;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+#event-log .log-head {
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: #6f7988;
+  padding-bottom: 2px;
+}
+
+#event-log .log-row {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+#event-log .log-row.empty {
+  color: #6f7988;
+}
+
+#event-log .log-row span {
+  color: #6f7988;
+  min-width: 40px;
+}
+
 .hidden {
   display: none !important;
 }

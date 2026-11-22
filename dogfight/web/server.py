@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -33,6 +34,7 @@ CAPTURE_DIR = WEB / "captures"
 # 导入 dogfight.view 会读取 OBJ、做体素简化（启动花几秒属正常）；这里只取
 # 模型数据与少量纯函数，仅用于 three.js 观战端。
 from dogfight.app import main  # noqa: E402
+from dogfight.config import formations  # noqa: E402
 from dogfight.view import theme  # noqa: E402
 from dogfight import view  # noqa: E402
 from dogfight.assets import load_catalog  # noqa: E402
@@ -43,6 +45,10 @@ from dogfight.core.sim import (  # noqa: E402
 )
 
 SNAPSHOT_HZ = 24.0
+# 航迹只保留近段：前端按 12 s 做淡出，服务端留 20 s 足够。
+# 快照每帧都带整条航迹，若不裁剪，多机长时间对战后单个快照会膨胀到
+# MB 级（24 Hz 重复推送），浏览器与网络都会被拖垮。
+TRAIL_KEEP = 20.0
 REF_LENGTH = view.REF_LENGTH
 MISSILE_RCS = view.MISSILE_RCS
 
@@ -314,18 +320,21 @@ class TrailRecorder:
         self.engine = engine
         self.reset()
 
-    def reset(self) -> None:
-        self.trails = [[], []]
-        self.axes = [[], []]
-        self.ts = [[], []]
-        self.fire_marks = [[], []]
+    def reset(self, n: int | None = None) -> None:
+        if n is None:
+            world = getattr(self.engine, "world", None)
+            n = len(world.acs) if world is not None else 2
+        self.trails = [[] for _ in range(n)]
+        self.axes = [[] for _ in range(n)]
+        self.ts = [[] for _ in range(n)]
+        self.fire_marks = [[] for _ in range(n)]
         self.launch_marks = []
         self.highg_marks = []
         self._seen_missiles = set()
-        self._highg_state = [False, False]
-        self._last_highg = [-1e9, -1e9]
-        self._last_sample = [None, None]
-        self._last_shot = [None, None]
+        self._highg_state = [False] * n
+        self._last_highg = [-1e9] * n
+        self._last_sample = [None] * n
+        self._last_shot = [None] * n
         self.missile_trails = {}
 
     def record(self, world, agents) -> None:
@@ -340,6 +349,12 @@ class TrailRecorder:
                 self.axes[i].append(yb)
                 self.ts[i].append(world.t)
                 self._last_sample[i] = p
+                # 时间窗裁剪：三个数组同步丢弃过老的点，长度始终一致。
+                ts = self.ts[i]
+                while ts and ts[0] < world.t - TRAIL_KEEP:
+                    del ts[0]
+                    del self.trails[i][0]
+                    del self.axes[i][0]
             if ac.firing:
                 last_shot = self._last_shot[i]
                 if last_shot is None or math.dist(last_shot, p) >= view.SHOT_SPACING:
@@ -409,9 +424,14 @@ class CameraState:
             cx = sum(ac.x for ac in alive) / k
             cy = sum(ac.y for ac in alive) / k
             cz = sum(ac.z for ac in alive) / k
-            a, b = world.acs
-            sep_xy = math.hypot(b.x - a.x, b.y - a.y)
-            span = max(sep_xy, abs(b.z - a.z) * 2.0, 1400.0)
+            # 多机取全队包围盒跨度；1v1 时与原来的两机间距完全一致。
+            xs = [ac.x for ac in alive]
+            ys = [ac.y for ac in alive]
+            zs = [ac.z for ac in alive]
+            span = max(
+                max(xs) - min(xs), max(ys) - min(ys),
+                (max(zs) - min(zs)) * 2.0, 1400.0,
+            )
             target_dist = clamp(span * self.span_factor, 2200.0, 320000.0)
         if self.ready and not instant:
             self.dist += (target_dist - self.dist) * 0.06
@@ -432,10 +452,15 @@ class CameraState:
                 self.yaw += clamp(wrap_pi(desired - self.yaw), -0.06, 0.06)
                 self.pitch += (math.radians(16.0) - self.pitch) * 0.02
         else:
-            a, b = world.acs
-            sep_xy = math.hypot(b.x - a.x, b.y - a.y)
-            if sep_xy > 500.0:
-                desired = math.atan2(b.y - a.y, b.x - a.x) + math.pi / 2.0 - 0.35
+            # 无跟随时朝两队质心连线看；1v1 时就是原两机连线。
+            t0 = [ac for ac in alive if ac.team == 0] or alive
+            t1 = [ac for ac in alive if ac.team == 1] or alive
+            x0 = sum(ac.x for ac in t0) / len(t0)
+            y0 = sum(ac.y for ac in t0) / len(t0)
+            x1 = sum(ac.x for ac in t1) / len(t1)
+            y1 = sum(ac.y for ac in t1) / len(t1)
+            if math.hypot(x1 - x0, y1 - y0) > 500.0:
+                desired = math.atan2(y1 - y0, x1 - x0) + math.pi / 2.0 - 0.35
                 if instant:
                     self.yaw = desired
                 else:
@@ -494,12 +519,34 @@ def _lock_state(ac):
     return (86, 170, 118), "SEARCH"
 
 
+def _primary_foe(world, i: int) -> int:
+    """本机的主目标：团队分配目标优先，其次最近的存活敌机。"""
+    ac = world.acs[i]
+    t = int(getattr(ac, "assigned_target", -1))
+    if (
+        0 <= t < len(world.acs)
+        and t != i
+        and world.acs[t].alive
+        and world.acs[t].team != ac.team
+    ):
+        return t
+    best, best_d = -1, 1e30
+    for j, other in enumerate(world.acs):
+        if j == i or not other.alive or other.team == ac.team:
+            continue
+        d = (other.x - ac.x) ** 2 + (other.y - ac.y) ** 2 + (other.z - ac.z) ** 2
+        if d < best_d:
+            best, best_d = j, d
+    return best
+
+
 def _gun_fall_point(world, i):
     """当前机头指向下的机炮弹道落点。"""
     ac = world.acs[i]
-    foe = world.acs[1 - i]
+    j = _primary_foe(world, i)
     spec = ac.spec
-    if foe.alive:
+    if j >= 0:
+        foe = world.acs[j]
         dist = math.sqrt(
             (foe.x - ac.x) ** 2 + (foe.y - ac.y) ** 2 + (foe.z - ac.z) ** 2
         )
@@ -547,17 +594,22 @@ def _missile_threat(world, i):
 
 def _scope(world, i, agent) -> dict:
     ac = world.acs[i]
-    foe = world.acs[1 - i]
+    j = _primary_foe(world, i)
+    foe = world.acs[j] if j >= 0 else None
     lock_color, lock_text = _lock_state(ac)
-    d = math.dist((ac.x, ac.y, ac.z), (foe.x, foe.y, foe.z))
+    if foe is not None:
+        d = math.dist((ac.x, ac.y, ac.z), (foe.x, foe.y, foe.z))
+        rel = wrap_pi(math.atan2(foe.y - ac.y, foe.x - ac.x) - ac.psi)
+    else:
+        d = 1e9
+        rel = 0.0
     if ac.contact >= CONTACT_TRACK and d < 1e8:
         rng = clamp(d * 1.35, 4000.0, max(ac.spec.radar_range, 40000.0))
     else:
         rng = max(ac.spec.radar_range, 40000.0) * 0.6
 
-    rel = wrap_pi(math.atan2(foe.y - ac.y, foe.x - ac.x) - ac.psi)
     target = None
-    if ac.contact >= CONTACT_TRACK and foe.alive:
+    if ac.contact >= CONTACT_TRACK and foe is not None and foe.alive:
         target = {
             "az": rel,
             "rr": clamp(d / rng, 0.0, 0.96),
@@ -624,7 +676,7 @@ def _scope(world, i, agent) -> dict:
         "labels": [round(rng * f / 1000.0) for f in (0.5, 1.0)],
         "rel": rel,
         "contact": ac.contact,
-        "foe_alive": foe.alive,
+        "foe_alive": bool(foe is not None and foe.alive),
         "target": target,
         "detect": detect,
         "blips": blips,
@@ -640,13 +692,19 @@ def _scope(world, i, agent) -> dict:
 
 def _hud(world, i, agent) -> dict:
     ac = world.acs[i]
-    foe = world.acs[1 - i]
+    j = _primary_foe(world, i)
+    foe = world.acs[j] if j >= 0 else None
     lock_color, lock_text = _lock_state(ac)
     psi, theta, phi = view.attitude_of(ac)
-    dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
-    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-    rel = wrap_pi(math.atan2(dy, dx) - ac.psi)
-    elev = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
+    if foe is not None:
+        dx, dy, dz = foe.x - ac.x, foe.y - ac.y, foe.z - ac.z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        rel = wrap_pi(math.atan2(dy, dx) - ac.psi)
+        elev = math.degrees(math.atan2(dz, math.hypot(dx, dy)))
+    else:
+        dist = 1e9
+        rel = 0.0
+        elev = 0.0
     threat = _missile_threat(world, i)
     fall = _gun_fall_point(world, i)
     rx, ry, rz = fall[0] - ac.x, fall[1] - ac.y, fall[2] - ac.z
@@ -665,7 +723,7 @@ def _hud(world, i, agent) -> dict:
         "rel_rad": rel,
         "elev": elev,
         "dist": dist,
-        "foe_alive": foe.alive,
+        "foe_alive": bool(foe is not None and foe.alive),
         "contact": ac.contact,
         "rwr": bool(ac.rwr),
         "rwr_az": ac.rwr_az,
@@ -735,14 +793,41 @@ def _result(world):
                        else "time-up, HP even"),
         }
     idx = 0 if world.result == "red" else 1
-    loser = world.acs[1 - idx].spec.name
+    # 1v1 保持原有文案；多机给出队伍存活数与剩余血量。
+    if len(world.acs) == 2:
+        loser = world.acs[1 - idx].spec.name
+        detail = {
+            "kill": f"{loser} shot down",
+            "boundary": f"{loser} out of bounds",
+            "timeout": "time-up, HP advantage",
+        }.get(world.reason_code, "")
+        return {
+            "title": f"{world.acs[idx].spec.name} WINS",
+            "color": _hex(theme.TEAM_COLORS[idx]),
+            "detail": detail,
+        }
+    loser = 1 - idx
+    total = sum(1 for ac in world.acs if ac.team == loser)
+    alive = sum(1 for ac in world.acs if ac.team == loser and ac.alive)
+    hp = sum(
+        ac.hp / max(ac.spec.hp_max, 1.0)
+        for ac in world.acs if ac.team == loser
+    )
+    winner_total = sum(1 for ac in world.acs if ac.team == idx)
+    winner_alive = sum(1 for ac in world.acs if ac.team == idx and ac.alive)
     detail = {
-        "kill": f"{loser} shot down",
-        "boundary": f"{loser} out of bounds",
-        "timeout": "time-up, HP advantage",
+        "kill": f"{world.team_names[loser]} 全灭",
+        "boundary": f"{world.team_names[loser]} 越界",
+        "timeout": "超时判定",
     }.get(world.reason_code, "")
+    detail += (
+        f" · {world.team_names[idx]} {winner_alive}/{winner_total} 存活"
+        f" · {world.team_names[loser]} {alive}/{total} 存活"
+    )
+    if world.reason_code == "timeout":
+        detail += f" · 剩余血量 {max(0.0, hp / max(total, 1)) * 100:.0f}%"
     return {
-        "title": f"{world.acs[idx].spec.name} WINS",
+        "title": f"{world.team_names[idx]} WINS",
         "color": _hex(theme.TEAM_COLORS[idx]),
         "detail": detail,
     }
@@ -764,8 +849,10 @@ def _ac_snapshot(world, i, agent, engines, recorder) -> dict:
     return {
         "i": i,
         "name": ac.spec.name,
-        "team": i,
-        "team_color": _hex(theme.TEAM_COLORS[i]),
+        "callsign": ac.callsign,
+        "rank": ac.rank,
+        "team": int(ac.team),
+        "team_color": _hex(theme.TEAM_COLORS[ac.team]),
         "alive": bool(ac.alive),
         "pos": _p((ac.x, ac.y, ac.z)),
         "psi": psi,
@@ -831,6 +918,21 @@ def _ac_snapshot(world, i, agent, engines, recorder) -> dict:
     }
 
 
+def _formation_info(world) -> list[dict]:
+    """前端展示用：每队本局抽到的编队与战术角色。"""
+    ids = getattr(world, "formation_ids", ())
+    sides = getattr(world, "sides", ())
+    info = []
+    for i, fid in enumerate(ids):
+        info.append({
+            "team": world.team_names[i] if i < len(world.team_names) else "",
+            "id": fid,
+            "label": formations.LABELS.get(fid, fid),
+            "side": sides[i] if i < len(sides) else "",
+        })
+    return info
+
+
 class SimEngine:
     """独立线程推进内核，维护最近一帧快照与版本号。"""
 
@@ -839,6 +941,10 @@ class SimEngine:
                  scenario=None, radar_policy: dict[str, str] | None = None) -> None:
         self.scenario = scenario or main.resolve_scenario()
         self.seconds = seconds
+        # 命令行显式 --seconds 时，切换场景后仍沿用；否则取新场景的时限。
+        self.seconds_override = (
+            None if seconds == self.scenario.time_limit else seconds
+        )
         self.seed = seed
         self.baseline = baseline
         self.dof = dof
@@ -866,15 +972,31 @@ class SimEngine:
     def _new_world(self) -> None:
         self.world = main.build_world(
             self.seconds, self.dof, awacs=self.awacs, scenario=self.scenario,
+            # 开局掷骰子选编队：每局重新抽；指定 --seed 时结果可复现。
+            formation_seed=(
+                self.seed if self.seed is not None
+                else random.randrange(1 << 30)
+            ),
         )
         self.agents = main.build_agents(
             self.baseline, seed=self.seed,
             scenario=self.scenario, radar_policy=self.radar_policy,
         )
+        # 多机场景接入团队决策：中队长目标分配、战术选择与克制发射。
+        # 1v1 与纯追踪基线不启用，保持原有平衡与可复现性。
+        self.brain = None
+        if (
+            self.scenario.rules.team_brain
+            and not self.scenario.is_duel
+            and not self.baseline
+        ):
+            from dogfight.tactics.team import TeamBrain
+
+            self.brain = TeamBrain(self.world)
         self.steps_per_decision = round(
             1.0 / (self.scenario.decision_hz * self.world.dt)
         )
-        self.actions = [Action() for _ in range(len(self.scenario.teams))]
+        self.actions = [Action() for _ in range(len(self.world.acs))]
         self.accumulator = 0.0
         self.steps = 0
         self.recorder.reset()
@@ -894,10 +1016,32 @@ class SimEngine:
 
     def _build_snapshot(self, dt: float) -> dict:
         world = self.world
-        a, b = world.acs
-        dist = math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
-        d_alt = b.z - a.z
-        d_e = a.energy - b.energy
+        n = len(world.acs)
+        if n == 2:
+            a, b = world.acs
+            dist = math.sqrt(
+                (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2
+            )
+            d_alt = b.z - a.z
+            d_e = a.energy - b.energy
+        else:
+            red = [ac for ac in world.acs if ac.team == 0 and ac.alive]
+            blue = [ac for ac in world.acs if ac.team == 1 and ac.alive]
+            dist = min(
+                (math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+                 for a in red for b in blue),
+                default=0.0,
+            )
+            d_alt = (
+                sum(ac.z for ac in red) / len(red)
+                - sum(ac.z for ac in blue) / len(blue)
+                if red and blue else 0.0
+            )
+            d_e = (
+                sum(ac.energy for ac in red) / len(red)
+                - sum(ac.energy for ac in blue) / len(blue)
+                if red and blue else 0.0
+            )
         dist_s = self._smooth("dist", dist, dt)
         dalt_s = self._smooth("dalt", d_alt, dt)
         models = export_meta["aircraft"]
@@ -907,10 +1051,10 @@ class SimEngine:
                          models.get(world.acs[i].spec.name,
                                     fallback_model)["engines"],
                          self.recorder)
-            for i in range(2)
+            for i in range(n)
         ]
         trails = []
-        for i in range(2):
+        for i in range(n):
             pts = self.recorder.trails[i]
             axes = self.recorder.axes[i]
             ts = self.recorder.ts[i]
@@ -997,7 +1141,7 @@ class SimEngine:
                             "flame", "throttle", "ab", "fuel_frac", "model_len",
                             "hp_frac")
             }
-            for i in range(2)
+            for i in range(n)
         ]
         return {
             "t": round(world.t, 3),
@@ -1027,6 +1171,29 @@ class SimEngine:
             },
             "attitude": attitude,
             "counters": counters,
+            "team_names": list(world.team_names),
+            "brief": getattr(world, "brief", ""),
+            "formations": _formation_info(world),
+            "roster": [
+                {
+                    "i": k,
+                    "callsign": acs[k]["callsign"],
+                    "name": acs[k]["name"],
+                    "team": acs[k]["team"],
+                    "team_color": acs[k]["team_color"],
+                    "alive": acs[k]["alive"],
+                    "hp": acs[k]["hp"],
+                    "hp_max": acs[k]["hp_max"],
+                    "hp_frac": acs[k]["hp_frac"],
+                    "role": acs[k]["hud"].get("tactic", ""),
+                    "rank": acs[k]["rank"],
+                }
+                for k in range(n)
+            ],
+            "log": [
+                [round(float(t), 1), str(text)]
+                for t, text in world.events[-10:]
+            ],
             "bottom": {
                 "t": round(world.t, 1),
                 "dist": round(dist_s, 0),
@@ -1035,6 +1202,14 @@ class SimEngine:
                 "text": (
                     f"T {world.t:5.1f}s    DIST {dist_s:5.0f}m    "
                     f"dALT {dalt_s:+5.0f}m    dE {d_e:6.0f} J/kg"
+                    if n == 2 else
+                    f"T {world.t:5.1f}s    {world.team_names[0]} "
+                    f"{sum(1 for ac in world.acs if ac.team == 0 and ac.alive)}"
+                    f"/{sum(1 for ac in world.acs if ac.team == 0)}    "
+                    f"{world.team_names[1]} "
+                    f"{sum(1 for ac in world.acs if ac.team == 1 and ac.alive)}"
+                    f"/{sum(1 for ac in world.acs if ac.team == 1)}    "
+                    f"NEAREST {dist_s:4.0f}m    dE {d_e:6.0f} J/kg"
                 ),
             },
         }
@@ -1053,10 +1228,14 @@ class SimEngine:
                         self.accumulator += min(frame_dt, 0.1)
                         while self.accumulator >= world.dt:
                             if self.steps % self.steps_per_decision == 0:
+                                if self.brain is not None:
+                                    self.brain.plan()
                                 self.actions = [
                                     ag.act(world.observe(i))
                                     for i, ag in enumerate(self.agents)
                                 ]
+                                if self.brain is not None:
+                                    self.brain.filter_actions(self.actions)
                             world.step(self.actions)
                             self.recorder.record(world, self.agents)
                             self.accumulator -= world.dt
@@ -1101,10 +1280,14 @@ class SimEngine:
                 if world.result is not None:
                     break
                 if self.steps % self.steps_per_decision == 0:
+                    if self.brain is not None:
+                        self.brain.plan()
                     self.actions = [
                         ag.act(world.observe(i))
                         for i, ag in enumerate(self.agents)
                     ]
+                    if self.brain is not None:
+                        self.brain.filter_actions(self.actions)
                 world.step(self.actions)
                 self.recorder.record(world, self.agents)
                 self.steps += 1
@@ -1115,8 +1298,28 @@ class SimEngine:
 
     def set_follow(self, follow) -> None:
         with self.lock:
-            self.follow = follow
-            self.camera.follow = follow
+            if follow is not None and not (0 <= int(follow) < len(self.world.acs)):
+                raise ValueError("follow 超出当前场景的机体编号")
+            self.follow = None if follow is None else int(follow)
+            self.camera.follow = self.follow
+            self.snapshot = self._build_snapshot(0.0)
+            self.version += 1
+            self.lock.notify_all()
+
+    def set_scenario(self, name: str) -> None:
+        """切换场景并重开一局（供 Web 端场景选择器使用）。"""
+        sc = main.resolve_scenario(name)
+        with self.lock:
+            self.scenario = sc
+            self.seconds = (
+                sc.time_limit if self.seconds_override is None
+                else self.seconds_override
+            )
+            self.follow = None
+            self.camera.follow = None
+            self._new_world()
+            self.paused = False
+            self.offline = False
             self.snapshot = self._build_snapshot(0.0)
             self.version += 1
             self.lock.notify_all()
@@ -1198,6 +1401,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             _v, snap = ENGINE.latest()
             self._json(snap)
+            return
+        if path == "/api/scenarios":
+            scenarios = [
+                {
+                    "id": sc.id,
+                    "aircraft": sc.aircraft_count,
+                    "is_duel": sc.is_duel,
+                    "teams": [t.name for t in sc.teams],
+                    "counts": [len(t.slots) for t in sc.teams],
+                    "time_limit": sc.time_limit,
+                }
+                for sc in main.get_bundle().scenarios.values()
+            ]
+            scenarios.sort(key=lambda s: (s["aircraft"], s["id"]))
+            self._json({"current": ENGINE.scenario.id, "scenarios": scenarios})
             return
         if path == "/api/stream":
             self._stream()
@@ -1429,9 +1647,12 @@ class Handler(BaseHTTPRequestHandler):
                 value = body.get("follow", None)
                 if value is not None:
                     value = int(value)
-                    if value not in (0, 1):
-                        raise ValueError("follow 只能是 0 / 1 / null")
                 ENGINE.set_follow(value)
+            elif action == "scenario":
+                name = body.get("scenario")
+                if not isinstance(name, str) or not name:
+                    raise ValueError("scenario 必须是场景 id")
+                ENGINE.set_scenario(name)
             else:
                 raise ValueError("unknown action")
         except (TypeError, ValueError) as exc:

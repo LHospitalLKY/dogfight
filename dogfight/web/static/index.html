@@ -14,9 +14,19 @@
   <canvas id="labels"></canvas>
 
   <div id="hud">
+    <div id="multi-panel" class="hidden"></div>
     <div id="attitude-panel"></div>
     <div id="missile-status" class="hidden"></div>
     <div id="stations"></div>
+    <div id="scenario-panel">
+      <div class="scenario-row">
+        <select id="scenario-select" title="场景"></select>
+        <button id="btn-scenario" type="button">LOAD</button>
+      </div>
+      <div id="scenario-brief"></div>
+    </div>
+    <div id="roster-panel"></div>
+    <div id="event-log"></div>
     <div id="bottom-hint"></div>
     <div id="bottom-bar"></div>
     <div id="paused-label" class="hidden">PAUSED</div>

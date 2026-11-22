@@ -21,7 +21,10 @@ def _validate(config_dir: str | Path) -> int:
     print(f"武器 {len(bundle.weapons)}：{', '.join(sorted(bundle.weapons))}")
     print(f"机体 {len(bundle.aircraft)}：{', '.join(sorted(bundle.aircraft))}")
     for scenario in bundle.scenarios.values():
-        names = " vs ".join(team.aircraft.spec.name for team in scenario.teams)
+        names = " vs ".join(
+            "+".join(slot.entry.spec.name for slot in team.slots)
+            for team in scenario.teams
+        )
         print(f"场景 {scenario.id}: {names}，{scenario.time_limit:.0f} s")
     print("配置校验通过")
     return 0
@@ -42,9 +45,18 @@ def _dump(scenario_ref: str) -> int:
         "teams": [
             {
                 "name": team.name,
+                "mission": team.mission,
                 "radar_policy": team.radar_policy,
-                "agent": dataclasses.asdict(team.aircraft.agent),
-                "aircraft": dataclasses.asdict(team.aircraft.spec),
+                "aircraft": [
+                    {
+                        "callsign": slot.callsign,
+                        "role": slot.role,
+                        "rank": slot.rank,
+                        "agent": dataclasses.asdict(slot.entry.agent),
+                        "spec": dataclasses.asdict(slot.entry.spec),
+                    }
+                    for slot in team.slots
+                ],
             }
             for team in scenario.teams
         ],

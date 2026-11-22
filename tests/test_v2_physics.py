@@ -15,8 +15,9 @@ import math
 import pytest
 
 from dogfight.app.main import (
-    AIM120C, AIM9X, F16V_SPEC, R73, R77_1, SU57_SPEC, build_world,
+    AIM120C, AIM9X, F16V_SPEC, R73, R77_1, SU57_SPEC, build_world, get_bundle,
 )
+from dogfight.tactics.agents import pursuit_action
 from dogfight.core.sim import (
     Action,
     G,
@@ -461,3 +462,40 @@ def test_w07_high_altitude_no_breakup():
     assert a.alive
     warnings = [e for e in w.events if "验证高度上限" in e[1]]
     assert len(warnings) == 1
+
+
+def test_pure_pursuit_uses_available_load():
+    """纯追踪应能拉出可用过载，而不是被限制在持续过载附近。"""
+    sc = get_bundle().scenario("j16-j15t")
+    w = build_world(scenario=sc, seed=3)
+    obs = dataclasses.replace(
+        w.observe(0),
+        off_az=math.radians(60.0),
+        own_gamma=0.0,
+        own_gamma_rate=0.0,
+        own_bank=math.radians(80.0),
+        los_el=0.0,
+    )
+    act = pursuit_action(obs, obs.off_az, 0.0, max_load=True)
+    assert act.n > obs.own_n_sustain * 1.4
+    limited = pursuit_action(obs, obs.off_az, 0.0, max_load=False)
+    assert limited.n <= max(obs.own_n_sustain * 1.25, 2.0) + 1e-6
+
+
+def test_pure_pursuit_no_push_while_turning_to_target():
+    """目标在侧方且偏下时，应保持坡度拉杆，不能在推杆/拉杆间来回翻。"""
+    sc = get_bundle().scenario("j16-j15t")
+    w = build_world(scenario=sc, seed=3)
+    obs = dataclasses.replace(
+        w.observe(0),
+        off_az=math.radians(120.0),
+        los_el=math.radians(-40.0),
+        own_gamma=math.radians(2.0),
+        own_gamma_rate=math.radians(4.0),
+        own_bank=math.radians(80.0),
+    )
+    act = pursuit_action(
+        obs, obs.off_az, obs.los_el - obs.own_gamma, state={},
+    )
+    assert act.n > 0.5
+    assert abs(act.bank) > 0.5

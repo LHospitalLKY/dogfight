@@ -258,11 +258,20 @@ def aim_action(
     # PUSH_HOLD_DECISIONS 个决策周期。门限取 0 时，a 在 Ps 边界附近抖动一下
     # 就整帧翻到推杆，连续两帧又翻回来，J-15T 在纯追踪里就是这样抖的。
     hold = state.get("push_hold", 0) if state is not None else 0
+    # 推杆判定带滞回：只有需求明显为负（a < PUSH_ENTER）才进入推杆，并锁定
+    # PUSH_HOLD_DECISIONS 个决策周期。门限取 0 时，a 在 Ps 边界附近抖动一下
+    # 就整帧翻到推杆，连续两帧又翻回来，J-15T 在纯追踪里就是这样抖的。
+    #
+    # 目标在侧方/后侧时不推杆：此时压大坡度拉杆既是唯一的转向手段，也能
+    # 以 n·cosφ 产生下俯（φ>90° 在指令层做不到，翼平推杆又会把已建立的
+    # 坡度打回 0）。旧逻辑只看 a < PUSH_ENTER，就会在“大坡度拉杆”和
+    # “翼平负过载”之间反复横跳，表现为俯仰 ±、坡度 0↔86° 的抖动。
+    az_near = abs(wrap_pi(az_error)) < math.radians(50.0)
     pushing = (
         a < PUSH_ENTER
         and (
             obs.own_gamma > math.radians(8.0)
-            or vel_el_error < math.radians(-20.0)
+            or (vel_el_error < math.radians(-20.0) and az_near)
         )
     ) or hold > 0
     if state is not None:
@@ -318,6 +327,7 @@ def pursuit_action(
     gain: float = 1.2,
     throttle: float = 1.0,
     state: dict | None = None,
+    max_load: bool = False,
 ) -> Action:
     """追踪类原语（纯追踪/提前量/滞后追踪）：带阻尼的指向控制。
 
@@ -326,6 +336,10 @@ def pursuit_action(
     再推杆掉头”的 1 s 周期摆振；反过来 a≈0 时，零点几度的方位误差又能把
     坡度顶到 80° 以上，升力全转到水平，机头迅速下坠再反向压回来。
     这里对俯仰误差限幅、总过载按可维持过载收口，并在需要大推杆时翼平。
+
+    `max_load=True` 时放宽到“可用过载”（受升力/结构限制），用于纯追踪：
+    追尾时如果只拉持续过载，转弯半径会比目标大一大截，永远指不上；
+    速度掉下来后 own_n_avail 本身会下降，不需要再额外收口。
     """
     el = clamp(el, -math.radians(4.0), math.radians(4.0))
     act = aim_action(obs, az, el, gain=gain, throttle=throttle, state=state)
@@ -336,6 +350,8 @@ def pursuit_action(
         if state is None or state.get("push_frames", 0) >= 2:
             act.bank = 0.0
     cap = max(min(obs.own_n_avail, max(obs.own_n_sustain * 1.25, 2.0)), 1.0)
+    if max_load:
+        cap = max(obs.own_n_avail, 1.0)
     if act.n > cap:
         act.n = cap
     return act
@@ -1199,7 +1215,7 @@ class TacticalAgent:
         # 旧实现把防御原语本身也放进可抢占集合，于是“防御→进攻→防御”
         # 每 0.1 s 都能整档切换：破 S 只飞了两个决策周期就被换回平盘，
         # 屏幕上标着破 S、实际却是平飞；盘旋类原语也会被反向滚 140° 打断。
-        emergency = ("RECOVER", "UNLOAD")
+        emergency = ("RECOVER", "UNLOAD", "EXTEND")
         bypass = want in emergency or (
             want in self.DEFENSE_SET and self.primitive not in self.DEFENSE_SET
         )
@@ -1431,6 +1447,7 @@ class TacticalAgent:
         for tactic in (
             self._tactic_recover,
             self._tactic_survive,
+            self._tactic_team_disengage,
             self._tactic_search,
             self._tactic_press,
             self._tactic_guns,
@@ -1514,7 +1531,31 @@ class TacticalAgent:
             or obs.z_margin_high < high_need
         ):
             return "RECOVER", "RECOVER"
+        # 团队垂直分工：高位掩护机低于队形最低高度时主动爬升回位。
+        # 只在没有近距威胁时执行，避免在缠斗中强行脱离。
+        if (
+            obs.team_min_alt > 0.0
+            and obs.own_alt < obs.team_min_alt
+            and not obs.team_disengage
+            and obs.incoming_missile_dist > self.MISSILE_BREAK_DIST
+            and obs.dist > 2500.0
+        ):
+            return "RECOVER", "RECOVER"
         return None
+
+    def _tactic_team_disengage(
+        self, sit: _Situation, obs: Observation,
+    ) -> tuple[str, str] | None:
+        """团队脱离重整：按长机指令拉开距离，边脱离边爬升。
+
+        放在恢复/生存之后：贴地拉起和导弹规避仍然优先；没有即时威胁时
+        才执行脱离，避免“为了重整反而撞地/吃弹”。
+        """
+        if not obs.team_disengage:
+            return None
+        if obs.incoming_missile_dist <= self.MISSILE_EVADE_DIST:
+            return None
+        return "DISENGAGE", "EXTEND"
 
     def _tactic_survive(
         self, sit: _Situation, obs: Observation,
@@ -2674,7 +2715,8 @@ class TacticalAgent:
             "HIGH_G_BARREL": self._high_g_barrel,
             "BEAM": self._beam,
             "PURE": lambda o: pursuit_action(
-                o, o.off_az, o.los_el - o.own_gamma, state=self._aim_state,
+                o, o.off_az, o.los_el - o.own_gamma,
+                state=self._aim_state, max_load=True,
             ),
             "LEAD": lambda o: pursuit_action(
                 o, *lead_point(o, 1.0), state=self._aim_state,
@@ -2811,6 +2853,12 @@ class TacticalAgent:
         speed = max(obs.own_speed, 60.0)
         pull_out = obs.own_gamma < math.radians(-15.0)
         urgent = obs.z_margin_low < max(1200.0, 3.5 * speed)
+        team_climb = (
+            obs.team_min_alt > 0.0 and obs.own_alt < obs.team_min_alt
+        )
+        # 垂直分工的爬升角比“贴地保底”更陡：高位掩护需要真正回到 6 km 以上，
+        # 而不是 +2° 蹭高度。速度足够时才拉，否则先平飞加速（见函数末尾）。
+        team_gamma = math.radians(8.0) if team_climb else math.radians(5.0)
         if urgent and pull_out:
             # 低空大俯角：先翼平、按可用过载全力拉起。此时再把升力分给
             # “飞向空域中心”的坡度，竖直分量只剩 n·cosφ，就是压不出
@@ -2836,14 +2884,14 @@ class TacticalAgent:
             # 真的接近边界（与 _tactic_recover 同一口径）：转回空域中心。
             # 用 6 g 的协调盘旋——6 g 正好是持续耐受上限，长时间拉也不会
             # 累积疲劳；高度余量同时不足时顺带 5° 浅爬升。
-            climb = math.radians(5.0) if urgent else 0.0
+            climb = team_gamma if urgent else 0.0
             n = min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN)
             return level_turn(obs, sign, n, gamma_target=climb)
         if urgent:
             # 高度余量不足但离边界还很远：翼平拉起，不把升力分给方位。
             # 转弯的侧向分量换不来高度，只会让拉起更慢、掉速更多。
             n = min(obs.own_n_avail, self.n_pos_tol, G_SUSTAIN)
-            return level_turn(obs, 0.0, n, gamma_target=math.radians(5.0))
+            return level_turn(obs, 0.0, n, gamma_target=team_gamma)
         # 边界还远、只是高度余量不足：仍然朝空域中心转（不转的话双方会
         # 各自直线飞散，几十秒内谁都不再交战），但把过载从 3.2 g 收到
         # 2 g，并让目标航迹角由能量状态决定。
@@ -2853,8 +2901,11 @@ class TacticalAgent:
         # 430 m/s 掉到 300。速度低于角点速度时先平飞加速，回到角点速度
         # 再以 +2° 补高度。
         climb = 0.0 if obs.own_speed_frac < self.BRAKE_CORNER_FRAC else (
-            math.radians(2.0)
+            math.radians(8.0) if team_climb else math.radians(2.0)
         )
+        # 垂直分工爬升时不绕圈：把升力全部给高度，边界由 edge_margin 兜底。
+        if team_climb and obs.edge_margin >= max(3000.0, 45.0 * speed):
+            sign = 0.0
         return level_turn(obs, sign, 2.0, gamma_target=climb)
 
     def _lure(self, obs: Observation) -> Action:
@@ -3092,8 +3143,8 @@ class TacticalAgent:
         )
         act = aim_action(
             obs,
-            obs.off_az + self._open_side * self._open_offset,
-            self._open_climb_cur - obs.own_gamma,
+            obs.off_az + self._open_side * self._open_offset + obs.team_offset_az,
+            self._open_climb_cur + obs.team_alt_offset_rad - obs.own_gamma,
             gain=1.2,
             throttle=self._open_throttle,
         )
@@ -3803,6 +3854,10 @@ class TacticalAgent:
         # 掉头时会先拉 7 g 把速度换成高度，再挂着机头慢慢掉回来，看起来
         # 就是“逃跑时不断爬升、同时掉速”。
         gamma = math.radians(-5.0)
+        if obs.team_min_alt > 0.0 and obs.own_alt < obs.team_min_alt:
+            # 脱离重整时“边退边爬”：只拉 6°，保留速度；爬升角再大就会
+            # 把能量全换成高度，反而失去再进入的资本。
+            gamma = math.radians(6.0)
         if obs.own_mil_endurance < self.BINGO_ENDURANCE:
             # Bingo（低油量脱离）期间保持平飞，不再下高：下高只会把飞机
             # 一路压进恢复门限，切回 RECOVER 拉起几米又切回 EXTEND，

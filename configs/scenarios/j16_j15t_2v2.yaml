@@ -1,0 +1,72 @@
+# 2v2 多机对抗（P1 + 简化 P2 的首个可运行样例）：J-16 双机 vs J-15T 双机。
+# 双方各 2 架，同队横向间隔 3 km；无预警机支援，雷达 auto。
+# 代码开发阶段固定用这两型验证多机链路，稳定后再换其他机型做测试验证。
+# 红方 J-16 双机进攻，蓝方 J-15T 双机防守。
+id: j16-j15t-2v2
+brief: 红方 J-16 双机前出扫荡，蓝方 J-15T 双机担任舰队防空值班；80 km 对头进入。
+time_limit_s: 600
+physics_dt_s: 0.008333333333333333   # 1/120 s
+decision_hz: 10
+
+initial:
+  spacing_m: 40000          # 每队距空域中心 40 km，总间距 80 km
+  altitude_m: 10000
+  y_offset_m: 100
+  lane_m: 3000              # 同队两机的横向间隔
+  floor_m: 1500
+  ceiling_m: 30000
+  arena_m: 200000
+
+teams:
+  - name: red
+    side: attacker
+    formation_group: [echelon, fighting_wing, spread]
+    mission: sweep
+    radar_policy: auto
+    aircraft:
+      - id: J-16
+        callsign: Flanker1
+        role: fighter
+        rank: flight_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-16
+        callsign: Flanker2
+        role: fighter
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+  - name: blue
+    side: defender
+    formation_group: [echelon, spread]
+    mission: intercept
+    radar_policy: auto
+    aircraft:
+      - id: J-15T
+        callsign: Shark1
+        role: interceptor
+        rank: flight_lead
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+      - id: J-15T
+        callsign: Shark2
+        role: interceptor
+        rank: wingman
+        loadout:
+          ir: {weapon: PL-10, count: 4}
+          radar: {weapon: PL-15, count: 4}
+          countermeasures: {chaff: 30, flare: 24}
+
+awacs: false
+
+rules:
+  roe: weapons_free        # weapons_hold 时全场禁止开火
+  team_brain: true         # 目标分配、火力去重、双机支援
+  no_fire_zones: []        # 例：- {x: 0, y: 0, radius_m: 5000}
+# seed 由实验脚本逐局传入；不在场景里固定，避免覆盖随机化。
